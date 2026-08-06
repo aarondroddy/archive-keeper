@@ -210,3 +210,17 @@ Before any applied run, confirm `/mnt/MyCloud1`, `/mnt/MyCloud2`, and
 `/mnt/MyCloud3` are real mounted NAS filesystems—not empty local mount-point
 directories. Keep the original `rmlint.json`, the journal database, and the
 decisions database backed up until the quarantine has been reviewed.
+
+## Documentation
+
+- [Installation](docs/INSTALL.md)
+- [Usage](docs/USAGE.md)
+- [Safety model](docs/SAFETY.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+
+> [!WARNING]
+> Archive Keeper is pre-release software that can move large numbers of files.
+> Inspect the plan, run a limited pilot, and prove restoration before applying
+> it to production data.
