@@ -1,0 +1,494 @@
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+from .core import (
+    ArchiveKeeperError,
+    Journal,
+    choose_keeper,
+    export_plan_csv,
+    files_match,
+    human_bytes,
+    load_rmlint_groups,
+    mount_root_for,
+    path_is_within,
+    quarantine_destination,
+)
+
+
+DEFAULT_REPORT = Path("~/rmlint-mycloud-scan/rmlint.json").expanduser()
+DEFAULT_STATE = Path("~/.local/state/archive-keeper/journal.sqlite3").expanduser()
+DEFAULT_DECISIONS = Path("~/.local/state/archive-keeper/decisions.sqlite3").expanduser()
+DEFAULT_ROOTS = [Path("/mnt/MyCloud1"), Path("/mnt/MyCloud2"), Path("/mnt/MyCloud3")]
+
+
+def path_list(values):
+    return [Path(v).expanduser().resolve(strict=False) for v in (values or [])]
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="archive-keeper",
+        description="Safe, resumable quarantine workflow for rmlint duplicate reports.",
+    )
+    parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    parser.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS, help="Saved keeper overrides and favorites.")
+    parser.add_argument(
+        "--mount-root", action="append", dest="mount_roots",
+        help="Allowed NAS root. Repeat for each root. Defaults to /mnt/MyCloud1..3."
+    )
+    parser.add_argument(
+        "--prefer", action="append", default=[],
+        help="Root preference, highest priority first. Repeat as needed."
+    )
+    parser.add_argument(
+        "--protect", action="append", default=[],
+        help="Never quarantine files beneath this root. Repeat as needed."
+    )
+    parser.add_argument(
+        "--exclude", action="append", default=[],
+        help="Skip entire duplicate entries beneath this root. Repeat as needed."
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("preferred-root", "rmlint-original", "oldest", "newest", "shortest-path"),
+        default="preferred-root",
+    )
+    parser.add_argument(
+        "--quarantine-name", default=".ArchiveKeeper",
+        help="Directory created independently on each NAS root."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("analyze", help="Summarize the duplicate report without touching files.")
+
+    tui = sub.add_parser("tui", help="Open the lightweight interactive review console.")
+    tui.add_argument(
+        "--output", type=Path,
+        default=Path("~/rmlint-mycloud-scan/archive-keeper-plan.csv").expanduser()
+    )
+
+    rich = sub.add_parser("review", help="Open the full-screen visual review interface.")
+    rich.add_argument("--output", type=Path, default=Path("~/rmlint-mycloud-scan/archive-keeper-plan.csv").expanduser())
+
+    search = sub.add_parser("search", help="Fuzzy-search duplicate groups by path or filename.")
+    search.add_argument("query")
+    search.add_argument("--limit", type=int, default=50)
+
+    inspect = sub.add_parser("inspect", help="Show metadata and preview for a duplicate group.")
+    inspect.add_argument("group_id", type=int)
+
+    decide = sub.add_parser("keep", help="Manually choose the keeper for a duplicate group.")
+    decide.add_argument("group_id", type=int)
+    decide.add_argument("path", type=Path)
+
+    folders = sub.add_parser("folders", help="Summarize duplicate space by folder.")
+    folders.add_argument("--depth", type=int, default=4)
+    folders.add_argument("--limit", type=int, default=50)
+
+    plan = sub.add_parser("plan", help="Write a reviewable CSV plan.")
+    plan.add_argument(
+        "--output", type=Path,
+        default=Path("~/rmlint-mycloud-scan/archive-keeper-plan.csv").expanduser()
+    )
+
+    run = sub.add_parser("quarantine", help="Move duplicate copies into quarantine.")
+    run.add_argument("--run-id", help="Resume or name a run.")
+    run.add_argument(
+        "--apply", action="store_true",
+        help="Actually move files. Without this flag, performs a dry run."
+    )
+    run.add_argument(
+        "--deep-verify", action="store_true",
+        help="SHA-256 both keeper and duplicate before each move. Slowest, safest."
+    )
+    run.add_argument(
+        "--limit", type=int, default=0,
+        help="Process at most this many moves; 0 means no limit."
+    )
+    run.add_argument(
+        "--min-free-gib", type=float, default=1.0,
+        help="Require this much free space on each NAS. Rename moves need almost no extra space."
+    )
+
+    restore = sub.add_parser("restore", help="Restore files moved by a run.")
+    restore.add_argument("run_id")
+    restore.add_argument("--apply", action="store_true")
+    restore.add_argument("--overwrite", action="store_true")
+
+    status = sub.add_parser("status", help="Show journaled runs.")
+    status.add_argument("--run-id")
+
+    return parser
+
+
+def configured(args):
+    roots = path_list(args.mount_roots) if args.mount_roots else DEFAULT_ROOTS
+    roots = [r.resolve(strict=False) for r in roots]
+    preferred = path_list(args.prefer) if args.prefer else roots
+    return roots, preferred, path_list(args.protect), path_list(args.exclude)
+
+
+def analyze(args):
+    groups = load_rmlint_groups(args.report.expanduser())
+    files = sum(len(g.files) for g in groups)
+    recoverable = sum(g.recoverable_bytes for g in groups)
+    largest = sorted(groups, key=lambda g: g.recoverable_bytes, reverse=True)[:10]
+    print(f"Duplicate groups : {len(groups):,}")
+    print(f"Files in groups  : {files:,}")
+    print(f"Recoverable max  : {human_bytes(recoverable)}")
+    print("\nLargest groups:")
+    for g in largest:
+        print(
+            f"  group {g.group_id:>6}: {len(g.files):>5} copies × "
+            f"{human_bytes(g.size):>12} = {human_bytes(g.recoverable_bytes)}"
+        )
+    return 0
+
+
+def plan(args):
+    import csv
+    from .decisions import DecisionStore
+    from .review import resolve_keeper
+    roots, preferred, protected, excluded = configured(args)
+    groups = load_rmlint_groups(args.report.expanduser())
+    output = args.output.expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    store = DecisionStore(args.decisions_db)
+    try:
+        with output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["group_id", "action", "size", "keeper", "path", "reason"])
+            for group in groups:
+                keeper = resolve_keeper(group, preferred, protected, args.strategy, store)
+                manual = store.get_keeper(group.group_id) is not None
+                for item in group.files:
+                    if item.path == keeper.path:
+                        writer.writerow([group.group_id, "KEEP", item.size, keeper.path, item.path, "manual override" if manual else args.strategy])
+                        continue
+                    excluded_hit = any(path_is_within(item.path, r) for r in excluded)
+                    protected_hit = any(path_is_within(item.path, r) for r in protected)
+                    action = "SKIP" if excluded_hit or protected_hit else "QUARANTINE"
+                    reason = "excluded root" if excluded_hit else "protected root" if protected_hit else ("manual keeper override" if manual else args.strategy)
+                    writer.writerow([group.group_id, action, item.size, keeper.path, item.path, reason])
+    finally:
+        store.close()
+    print(f"Wrote plan: {output}")
+    return 0
+
+
+def _is_excluded(path, roots):
+    return any(path_is_within(path, root) for root in roots)
+
+
+def quarantine(args):
+    report = args.report.expanduser().resolve(strict=False)
+    roots, preferred, protected, excluded = configured(args)
+    groups = load_rmlint_groups(report)
+    run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    journal = Journal(args.state_db.expanduser())
+    journal.create_run(run_id, report, "apply" if args.apply else "dry-run")
+    from .decisions import DecisionStore
+    from .review import resolve_keeper
+    decisions = DecisionStore(args.decisions_db)
+
+    planned = moved = skipped = failed = bytes_moved = 0
+    try:
+        for group in groups:
+            keeper = resolve_keeper(group, preferred, protected, args.strategy, decisions)
+            keeper_root = mount_root_for(keeper.path, roots)
+            if keeper_root is None:
+                for item in group.files:
+                    if item.path != keeper.path:
+                        journal.record_action(
+                            run_id, group.group_id, keeper.path, item.path, item.path,
+                            item.size, "skipped", "keeper is outside allowed mount roots"
+                        )
+                        skipped += 1
+                continue
+
+            for item in group.files:
+                if item.path == keeper.path:
+                    continue
+                if args.limit and planned >= args.limit:
+                    journal.set_run_status(run_id, "paused")
+                    print(f"Stopped at --limit={args.limit}; resume with --run-id {run_id}")
+                    print_summary(run_id, planned, moved, skipped, failed, bytes_moved)
+                    return 0
+                planned += 1
+
+                old_status = journal.action_status(run_id, item.path)
+                if old_status in ("moved", "restored", "skipped"):
+                    skipped += 1
+                    continue
+
+                source_root = mount_root_for(item.path, roots)
+                if source_root is None:
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, item.path,
+                        item.size, "skipped", "source is outside allowed mount roots"
+                    )
+                    skipped += 1
+                    continue
+                if _is_excluded(item.path, excluded):
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, item.path,
+                        item.size, "skipped", "excluded root"
+                    )
+                    skipped += 1
+                    continue
+                if _is_excluded(item.path, protected):
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, item.path,
+                        item.size, "skipped", "protected root"
+                    )
+                    skipped += 1
+                    continue
+                if not item.path.exists():
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, item.path,
+                        item.size, "failed", "source missing"
+                    )
+                    failed += 1
+                    continue
+                if not keeper.path.exists():
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, item.path,
+                        item.size, "failed", "keeper missing"
+                    )
+                    failed += 1
+                    continue
+
+                ok, verify_message = files_match(
+                    keeper.path, item.path, deep_verify=args.deep_verify
+                )
+                if not ok:
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, item.path,
+                        item.size, "failed", verify_message
+                    )
+                    failed += 1
+                    continue
+
+                usage = shutil.disk_usage(source_root)
+                needed = int(args.min_free_gib * 1024**3)
+                if usage.free < needed:
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, item.path,
+                        item.size, "failed",
+                        f"free space below threshold: {human_bytes(usage.free)}"
+                    )
+                    failed += 1
+                    continue
+
+                destination = quarantine_destination(
+                    item.path, source_root, args.quarantine_name, run_id
+                )
+                if destination.exists():
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, destination,
+                        item.size, "failed", "quarantine destination already exists"
+                    )
+                    failed += 1
+                    continue
+
+                if not args.apply:
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, destination,
+                        item.size, "planned", verify_message
+                    )
+                    continue
+
+                try:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    # os.replace is atomic when source and destination are on the same filesystem.
+                    os.replace(item.path, destination)
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, destination,
+                        item.size, "moved", verify_message
+                    )
+                    moved += 1
+                    bytes_moved += item.size
+                    if moved % 100 == 0:
+                        print(
+                            f"\rMoved {moved:,} files ({human_bytes(bytes_moved)})",
+                            end="", flush=True
+                        )
+                except OSError as exc:
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, destination,
+                        item.size, "failed", str(exc)
+                    )
+                    failed += 1
+
+        journal.set_run_status(run_id, "complete" if args.apply else "dry-run-complete")
+        if moved:
+            print()
+        print_summary(run_id, planned, moved, skipped, failed, bytes_moved)
+        if not args.apply:
+            print("\nDry run only. Add --apply after reviewing the CSV plan and settings.")
+        return 1 if failed else 0
+    except KeyboardInterrupt:
+        journal.set_run_status(run_id, "interrupted")
+        print(f"\nInterrupted safely. Resume with --run-id {run_id}")
+        return 130
+    finally:
+        decisions.close()
+        journal.close()
+
+
+def restore(args):
+    journal = Journal(args.state_db.expanduser())
+    restored = skipped = failed = 0
+    try:
+        rows = list(journal.iter_actions(args.run_id, ("moved",)))
+        if not rows:
+            print(f"No moved files found for run {args.run_id}")
+            return 0
+        for group_id, keeper, source, destination, size, status, message in rows:
+            source = Path(source)
+            destination = Path(destination)
+            if not destination.exists():
+                journal.record_action(
+                    args.run_id, group_id, Path(keeper), source, destination,
+                    size, "failed", "quarantined file missing during restore"
+                )
+                failed += 1
+                continue
+            if source.exists() and not args.overwrite:
+                print(f"SKIP exists: {source}")
+                skipped += 1
+                continue
+            if not args.apply:
+                print(f"WOULD RESTORE: {destination} -> {source}")
+                continue
+            try:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                if source.exists() and args.overwrite:
+                    source.unlink()
+                os.replace(destination, source)
+                journal.record_action(
+                    args.run_id, group_id, Path(keeper), source, destination,
+                    size, "restored", ""
+                )
+                restored += 1
+            except OSError as exc:
+                journal.record_action(
+                    args.run_id, group_id, Path(keeper), source, destination,
+                    size, "failed", f"restore failed: {exc}"
+                )
+                failed += 1
+        if args.apply and failed == 0:
+            journal.set_run_status(args.run_id, "restored")
+        print(f"Restored: {restored:,}; skipped: {skipped:,}; failed: {failed:,}")
+        if not args.apply:
+            print("Dry run only. Add --apply to restore.")
+        return 1 if failed else 0
+    finally:
+        journal.close()
+
+
+def status(args):
+    journal = Journal(args.state_db.expanduser())
+    try:
+        rows = journal.summary(args.run_id)
+        if not rows:
+            print("No runs found.")
+            return 0
+        for run_id, created_at, report_path, mode, run_status, counts, bytes_moved in rows:
+            timestamp = dt.datetime.fromtimestamp(created_at).isoformat(timespec="seconds")
+            print(f"{run_id}  {timestamp}  {mode}  {run_status}")
+            print(f"  moved={counts.get('moved',0):,} planned={counts.get('planned',0):,} "
+                  f"skipped={counts.get('skipped',0):,} failed={counts.get('failed',0):,} "
+                  f"restored={counts.get('restored',0):,}")
+            print(f"  moved bytes={human_bytes(bytes_moved)}")
+            print(f"  report={report_path}")
+        return 0
+    finally:
+        journal.close()
+
+
+def print_summary(run_id, planned, moved, skipped, failed, bytes_moved):
+    print(f"Run ID        : {run_id}")
+    print(f"Considered    : {planned:,}")
+    print(f"Moved         : {moved:,}")
+    print(f"Skipped       : {skipped:,}")
+    print(f"Failed        : {failed:,}")
+    print(f"Quarantined   : {human_bytes(bytes_moved)}")
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "analyze":
+            return analyze(args)
+        if args.command == "tui":
+            from .tui import run_tui
+            return run_tui(args, configured, export_plan_csv)
+        if args.command == "plan":
+            return plan(args)
+        if args.command == "quarantine":
+            return quarantine(args)
+        if args.command == "restore":
+            return restore(args)
+        if args.command == "status":
+            return status(args)
+        if args.command == "review":
+            from .rich_tui import run_rich_tui
+            return run_rich_tui(args, configured)
+        if args.command == "search":
+            from .review import fuzzy_groups
+            groups = load_rmlint_groups(args.report.expanduser())
+            for group in fuzzy_groups(groups, args.query, args.limit):
+                print(f"{group.group_id:>6}  {len(group.files):>4} copies  {human_bytes(group.recoverable_bytes):>12}  {group.files[0].path}")
+            return 0
+        if args.command == "inspect":
+            from .decisions import DecisionStore
+            from .review import duplicate_graph, keeper_reasons, render_preview, resolve_keeper
+            roots, preferred, protected, excluded = configured(args)
+            groups = load_rmlint_groups(args.report.expanduser())
+            group = next((g for g in groups if g.group_id == args.group_id), None)
+            if not group:
+                raise ArchiveKeeperError(f"Unknown group ID: {args.group_id}")
+            store = DecisionStore(args.decisions_db)
+            keeper = resolve_keeper(group, preferred, protected, args.strategy, store)
+            print(duplicate_graph(group, keeper))
+            print("\nWhy this keeper:")
+            for reason in keeper_reasons(keeper, group, preferred, protected, args.strategy): print(f"  • {reason}")
+            print("\nMetadata / preview:\n" + render_preview(keeper.path))
+            store.close()
+            return 0
+        if args.command == "keep":
+            from .decisions import DecisionStore
+            groups = load_rmlint_groups(args.report.expanduser())
+            group = next((g for g in groups if g.group_id == args.group_id), None)
+            if not group:
+                raise ArchiveKeeperError(f"Unknown group ID: {args.group_id}")
+            target = args.path.expanduser().resolve(strict=False)
+            if target not in [f.path for f in group.files]:
+                raise ArchiveKeeperError("The selected path is not in that duplicate group.")
+            store = DecisionStore(args.decisions_db); store.set_keeper(group.group_id, target); store.close()
+            print(f"Group {group.group_id}: keeper set to {target}")
+            return 0
+        if args.command == "folders":
+            from .review import folder_summary
+            groups = load_rmlint_groups(args.report.expanduser())
+            for folder, (count, size) in folder_summary(groups, args.depth)[:args.limit]:
+                print(f"{count:>8,} files  {human_bytes(size):>12}  {folder}")
+            return 0
+        parser.error("unknown command")
+    except ArchiveKeeperError as exc:
+        print(f"archive-keeper: error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
