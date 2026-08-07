@@ -5,7 +5,9 @@ import datetime as dt
 import json
 import os
 import shutil
+import sqlite3
 import sys
+import secrets
 from pathlib import Path
 
 from .core import (
@@ -17,6 +19,7 @@ from .core import (
     human_bytes,
     load_rmlint_groups,
     mount_root_for,
+    normalize_path,
     path_is_within,
     quarantine_destination,
 )
@@ -27,9 +30,11 @@ DEFAULT_STATE = Path("~/.local/state/archive-keeper/journal.sqlite3").expanduser
 DEFAULT_DECISIONS = Path("~/.local/state/archive-keeper/decisions.sqlite3").expanduser()
 DEFAULT_ROOTS = [Path("/mnt/MyCloud1"), Path("/mnt/MyCloud2"), Path("/mnt/MyCloud3")]
 
+MOUNTED_COMMANDS = {"analyze", "tui", "review", "search", "inspect", "keep", "folders", "plan", "quarantine"}
+
 
 def path_list(values):
-    return [Path(v).expanduser().resolve(strict=False) for v in (values or [])]
+    return [normalize_path(v) for v in (values or [])]
 
 
 def build_parser():
@@ -54,7 +59,7 @@ def build_parser():
     )
     parser.add_argument(
         "--exclude", action="append", default=[],
-        help="Skip entire duplicate entries beneath this root. Repeat as needed."
+        help="Never move a duplicate copy beneath this root. Other copies in the group are still processed. Repeat as needed."
     )
     parser.add_argument(
         "--strategy",
@@ -64,6 +69,11 @@ def build_parser():
     parser.add_argument(
         "--quarantine-name", default=".ArchiveKeeper",
         help="Directory created independently on each NAS root."
+    )
+    parser.add_argument(
+        "--mount-policy", choices=("auto", "check", "ignore"), default="auto",
+        help=("Storage-root handling before commands run: auto checks and mounts missing roots "
+              "through /etc/fstab; check only verifies; ignore bypasses the safeguard.")
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -131,13 +141,24 @@ def build_parser():
 
 def configured(args):
     roots = path_list(args.mount_roots) if args.mount_roots else DEFAULT_ROOTS
-    roots = [r.resolve(strict=False) for r in roots]
+    roots = [normalize_path(r) for r in roots]
     preferred = path_list(args.prefer) if args.prefer else roots
     return roots, preferred, path_list(args.protect), path_list(args.exclude)
 
 
+def _progress(message: str) -> None:
+    print(f"Archive Keeper: {message}", flush=True)
+
+
+def _load_groups(args, *, show_progress: bool = True):
+    return load_rmlint_groups(
+        args.report.expanduser(),
+        progress=_progress if show_progress else None,
+    )
+
+
 def analyze(args):
-    groups = load_rmlint_groups(args.report.expanduser())
+    groups = _load_groups(args)
     files = sum(len(g.files) for g in groups)
     recoverable = sum(g.recoverable_bytes for g in groups)
     largest = sorted(groups, key=lambda g: g.recoverable_bytes, reverse=True)[:10]
@@ -158,7 +179,7 @@ def plan(args):
     from .decisions import DecisionStore
     from .review import resolve_keeper
     roots, preferred, protected, excluded = configured(args)
-    groups = load_rmlint_groups(args.report.expanduser())
+    groups = _load_groups(args)
     output = args.output.expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     store = DecisionStore(args.decisions_db)
@@ -191,8 +212,8 @@ def _is_excluded(path, roots):
 def quarantine(args):
     report = args.report.expanduser().resolve(strict=False)
     roots, preferred, protected, excluded = configured(args)
-    groups = load_rmlint_groups(report)
-    run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    groups = load_rmlint_groups(report, progress=_progress)
+    run_id = args.run_id or f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
     journal = Journal(args.state_db.expanduser())
     journal.create_run(run_id, report, "apply" if args.apply else "dry-run")
     from .decisions import DecisionStore
@@ -217,15 +238,22 @@ def quarantine(args):
             for item in group.files:
                 if item.path == keeper.path:
                     continue
-                if args.limit and planned >= args.limit:
+                if args.limit and moved >= args.limit:
                     journal.set_run_status(run_id, "paused")
                     print(f"Stopped at --limit={args.limit}; resume with --run-id {run_id}")
                     print_summary(run_id, planned, moved, skipped, failed, bytes_moved)
                     return 0
-                planned += 1
-
                 old_status = journal.action_status(run_id, item.path)
                 if old_status in ("moved", "restored", "skipped"):
+                    skipped += 1
+                    continue
+
+                explicit_action = decisions.get_action(group.group_id, item.path)
+                if explicit_action == "UNDECIDED":
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, item.path,
+                        item.size, "skipped", "marked undecided in reviewer"
+                    )
                     skipped += 1
                     continue
 
@@ -251,6 +279,30 @@ def quarantine(args):
                     )
                     skipped += 1
                     continue
+
+                destination = quarantine_destination(
+                    item.path, source_root, args.quarantine_name, run_id
+                )
+                if old_status == "moving":
+                    if not item.path.exists() and destination.exists():
+                        journal.record_action(
+                            run_id, group.group_id, keeper.path, item.path, destination,
+                            item.size, "moved", "reconciled interrupted move"
+                        )
+                        moved += 1
+                        bytes_moved += item.size
+                        continue
+                    if item.path.exists() and not destination.exists():
+                        # The rename did not happen; safely retry below.
+                        pass
+                    else:
+                        journal.record_action(
+                            run_id, group.group_id, keeper.path, item.path, destination,
+                            item.size, "failed", "ambiguous interrupted move state"
+                        )
+                        failed += 1
+                        continue
+
                 if not item.path.exists():
                     journal.record_action(
                         run_id, group.group_id, keeper.path, item.path, item.path,
@@ -288,9 +340,6 @@ def quarantine(args):
                     failed += 1
                     continue
 
-                destination = quarantine_destination(
-                    item.path, source_root, args.quarantine_name, run_id
-                )
                 if destination.exists():
                     journal.record_action(
                         run_id, group.group_id, keeper.path, item.path, destination,
@@ -299,6 +348,7 @@ def quarantine(args):
                     failed += 1
                     continue
 
+                planned += 1
                 if not args.apply:
                     journal.record_action(
                         run_id, group.group_id, keeper.path, item.path, destination,
@@ -308,6 +358,10 @@ def quarantine(args):
 
                 try:
                     destination.parent.mkdir(parents=True, exist_ok=True)
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, destination,
+                        item.size, "moving", verify_message
+                    )
                     # os.replace is atomic when source and destination are on the same filesystem.
                     os.replace(item.path, destination)
                     journal.record_action(
@@ -356,10 +410,7 @@ def restore(args):
             source = Path(source)
             destination = Path(destination)
             if not destination.exists():
-                journal.record_action(
-                    args.run_id, group_id, Path(keeper), source, destination,
-                    size, "failed", "quarantined file missing during restore"
-                )
+                print(f"MISSING quarantine file: {destination}", file=sys.stderr)
                 failed += 1
                 continue
             if source.exists() and not args.overwrite:
@@ -371,8 +422,8 @@ def restore(args):
                 continue
             try:
                 source.parent.mkdir(parents=True, exist_ok=True)
-                if source.exists() and args.overwrite:
-                    source.unlink()
+                if source.exists() and source.is_dir():
+                    raise OSError(f"restore destination is a directory: {source}")
                 os.replace(destination, source)
                 journal.record_action(
                     args.run_id, group_id, Path(keeper), source, destination,
@@ -403,7 +454,7 @@ def status(args):
             print("No runs found.")
             return 0
         for run_id, created_at, report_path, mode, run_status, counts, bytes_moved in rows:
-            timestamp = dt.datetime.fromtimestamp(created_at).isoformat(timespec="seconds")
+            timestamp = dt.datetime.fromtimestamp(created_at, tz=dt.timezone.utc).astimezone().isoformat(timespec="seconds")
             print(f"{run_id}  {timestamp}  {mode}  {run_status}")
             print(f"  moved={counts.get('moved',0):,} planned={counts.get('planned',0):,} "
                   f"skipped={counts.get('skipped',0):,} failed={counts.get('failed',0):,} "
@@ -428,6 +479,10 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command in MOUNTED_COMMANDS:
+            from .mounts import ensure_mounts
+            roots, _preferred, _protected, _excluded = configured(args)
+            ensure_mounts(roots, args.mount_policy)
         if args.command == "analyze":
             return analyze(args)
         if args.command == "tui":
@@ -446,7 +501,7 @@ def main(argv=None):
             return run_rich_tui(args, configured)
         if args.command == "search":
             from .review import fuzzy_groups
-            groups = load_rmlint_groups(args.report.expanduser())
+            groups = _load_groups(args)
             for group in fuzzy_groups(groups, args.query, args.limit):
                 print(f"{group.group_id:>6}  {len(group.files):>4} copies  {human_bytes(group.recoverable_bytes):>12}  {group.files[0].path}")
             return 0
@@ -454,7 +509,7 @@ def main(argv=None):
             from .decisions import DecisionStore
             from .review import duplicate_graph, keeper_reasons, render_preview, resolve_keeper
             roots, preferred, protected, excluded = configured(args)
-            groups = load_rmlint_groups(args.report.expanduser())
+            groups = _load_groups(args)
             group = next((g for g in groups if g.group_id == args.group_id), None)
             if not group:
                 raise ArchiveKeeperError(f"Unknown group ID: {args.group_id}")
@@ -462,30 +517,35 @@ def main(argv=None):
             keeper = resolve_keeper(group, preferred, protected, args.strategy, store)
             print(duplicate_graph(group, keeper))
             print("\nWhy this keeper:")
-            for reason in keeper_reasons(keeper, group, preferred, protected, args.strategy): print(f"  • {reason}")
+            for reason in keeper_reasons(keeper, group, preferred, protected, args.strategy):
+                print(f"  • {reason}")
             print("\nMetadata / preview:\n" + render_preview(keeper.path))
             store.close()
             return 0
         if args.command == "keep":
             from .decisions import DecisionStore
-            groups = load_rmlint_groups(args.report.expanduser())
+            groups = _load_groups(args)
             group = next((g for g in groups if g.group_id == args.group_id), None)
             if not group:
                 raise ArchiveKeeperError(f"Unknown group ID: {args.group_id}")
-            target = args.path.expanduser().resolve(strict=False)
+            target = normalize_path(args.path)
             if target not in [f.path for f in group.files]:
                 raise ArchiveKeeperError("The selected path is not in that duplicate group.")
-            store = DecisionStore(args.decisions_db); store.set_keeper(group.group_id, target); store.close()
+            store = DecisionStore(args.decisions_db)
+            try:
+                store.set_keeper(group.group_id, target)
+            finally:
+                store.close()
             print(f"Group {group.group_id}: keeper set to {target}")
             return 0
         if args.command == "folders":
             from .review import folder_summary
-            groups = load_rmlint_groups(args.report.expanduser())
+            groups = _load_groups(args)
             for folder, (count, size) in folder_summary(groups, args.depth)[:args.limit]:
                 print(f"{count:>8,} files  {human_bytes(size):>12}  {folder}")
             return 0
         parser.error("unknown command")
-    except ArchiveKeeperError as exc:
+    except (ArchiveKeeperError, OSError, RuntimeError, sqlite3.Error) as exc:
         print(f"archive-keeper: error: {exc}", file=sys.stderr)
         return 2
 

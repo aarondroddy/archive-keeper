@@ -9,7 +9,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 
 class ArchiveKeeperError(RuntimeError):
@@ -52,11 +52,21 @@ def human_bytes(value: int) -> str:
     return f"{value} B"
 
 
+def normalize_path(path: Path | str) -> Path:
+    """Normalize a path lexically without touching the filesystem.
+
+    Path.resolve(strict=False) can still issue metadata lookups on network
+    filesystems. Archive Keeper uses report paths as data until an operation
+    explicitly needs to validate a live file.
+    """
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
 def _entry_path(entry: dict) -> Optional[Path]:
     value = entry.get("path") or entry.get("name")
     if not value:
         return None
-    return Path(os.path.abspath(os.path.expanduser(str(value))))
+    return normalize_path(value)
 
 
 def _entry_size(entry: dict) -> int:
@@ -79,12 +89,9 @@ def _entry_mtime(entry: dict) -> float:
                 return value
             except (TypeError, ValueError):
                 pass
-    path = _entry_path(entry)
-    if path:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            pass
+    # Do not fall back to path.stat() here. A report may contain hundreds of
+    # thousands of paths on SMB/CIFS shares, and one stalled metadata request
+    # can block the entire analysis. Live validation is deliberately lazy.
     return 0.0
 
 
@@ -96,7 +103,7 @@ def _entry_checksum(entry: dict) -> Optional[str]:
     return None
 
 
-def load_rmlint_groups(report_path: Path) -> list[DuplicateGroup]:
+def load_rmlint_groups(report_path: Path, progress: Callable[[str], None] | None = None) -> list[DuplicateGroup]:
     """
     Parse the standard rmlint JSON output.
 
@@ -107,6 +114,8 @@ def load_rmlint_groups(report_path: Path) -> list[DuplicateGroup]:
     Duplicate groups are delimited by entries marked is_original=true.
     This parser also supports explicit group fields when present.
     """
+    if progress:
+        progress(f"Loading rmlint report: {report_path}")
     try:
         with report_path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -120,8 +129,10 @@ def load_rmlint_groups(report_path: Path) -> list[DuplicateGroup]:
     if not isinstance(data, list):
         raise ArchiveKeeperError("Expected rmlint report to contain a top-level JSON list.")
 
+    if progress:
+        progress(f"Parsing {len(data):,} JSON records without touching NAS files...")
     file_entries: list[dict] = []
-    for item in data:
+    for index, item in enumerate(data, 1):
         if not isinstance(item, dict):
             continue
         path = _entry_path(item)
@@ -134,6 +145,8 @@ def load_rmlint_groups(report_path: Path) -> list[DuplicateGroup]:
         }:
             continue
         file_entries.append(item)
+        if progress and index % 100_000 == 0:
+            progress(f"Parsed {index:,} / {len(data):,} JSON records...")
 
     if not file_entries:
         raise ArchiveKeeperError(
@@ -141,9 +154,9 @@ def load_rmlint_groups(report_path: Path) -> list[DuplicateGroup]:
         )
 
     # Prefer explicit group identifiers when available.
-    explicit_keys = ("group", "group_id", "duplicate_group", "digest")
+    explicit_keys = ("group", "group_id", "duplicate_group")
     explicit_key = next(
-        (key for key in explicit_keys if any(key in e for e in file_entries)), None
+        (key for key in explicit_keys if all(key in e for e in file_entries)), None
     )
 
     raw_groups: list[list[dict]] = []
@@ -168,9 +181,11 @@ def load_rmlint_groups(report_path: Path) -> list[DuplicateGroup]:
         if current:
             raw_groups.append(current)
 
+    if progress:
+        progress(f"Building duplicate groups from {len(file_entries):,} file records...")
     groups: list[DuplicateGroup] = []
     gid = 1
-    for entries in raw_groups:
+    for group_index, entries in enumerate(raw_groups, 1):
         if len(entries) < 2:
             continue
         files: list[DuplicateFile] = []
@@ -195,9 +210,13 @@ def load_rmlint_groups(report_path: Path) -> list[DuplicateGroup]:
         if len(files) >= 2:
             groups.append(DuplicateGroup(group_id=gid, files=files))
             gid += 1
+        if progress and group_index % 25_000 == 0:
+            progress(f"Built {len(groups):,} duplicate groups...")
 
     if not groups:
         raise ArchiveKeeperError("The report contained no duplicate groups with 2+ files.")
+    if progress:
+        progress(f"Loaded {len(groups):,} duplicate groups. Live file checks deferred until needed.")
     return groups
 
 
@@ -210,7 +229,7 @@ def _safe_int(value) -> Optional[int]:
 
 def path_is_within(path: Path, root: Path) -> bool:
     try:
-        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        normalize_path(path).relative_to(normalize_path(root))
         return True
     except ValueError:
         return False
@@ -291,7 +310,7 @@ def mount_root_for(path: Path, configured_roots: list[Path]) -> Optional[Path]:
 def quarantine_destination(
     source: Path, mount_root: Path, quarantine_name: str, run_id: str
 ) -> Path:
-    rel = source.resolve(strict=False).relative_to(mount_root.resolve(strict=False))
+    rel = normalize_path(source).relative_to(normalize_path(mount_root))
     return mount_root / quarantine_name / run_id / rel
 
 
@@ -299,7 +318,7 @@ class Journal:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path))
+        self.conn = sqlite3.connect(str(db_path), timeout=10.0)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(
@@ -333,10 +352,16 @@ class Journal:
         self.conn.close()
 
     def create_run(self, run_id: str, report_path: Path, mode: str):
+        row = self.conn.execute("SELECT mode FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if row and row[0] != mode:
+            raise ArchiveKeeperError(
+                f"Run {run_id!r} already exists in {row[0]!r} mode; choose a new --run-id."
+            )
         self.conn.execute(
             "INSERT OR IGNORE INTO runs(run_id,created_at,report_path,mode,status) VALUES(?,?,?,?,?)",
             (run_id, time.time(), str(report_path), mode, "running"),
         )
+        self.conn.execute("UPDATE runs SET status='running' WHERE run_id=?", (run_id,))
         self.conn.commit()
 
     def set_run_status(self, run_id: str, status: str):

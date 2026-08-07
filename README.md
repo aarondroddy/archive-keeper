@@ -1,11 +1,16 @@
-# Archive Keeper 1.4.0
+# Archive Keeper 1.6.1
 
 Archive Keeper turns an existing `rmlint.json` scan into a safe, reviewable,
 resumable deduplication workflow. It never runs `rmlint.sh` and never deletes
 files directly: duplicates are moved into a per-NAS quarantine tree and every
 action is journaled for restoration.
 
-## 1.4.0 highlights
+## 1.6.1 highlights
+
+- Fast, filesystem-free report parsing: analysis no longer stats every NAS path.
+- Visible loading and group-building progress messages.
+- Clearer copy rows with filename-first, distinguishing parent paths.
+- Live NAS checks remain lazy and are revalidated before file operations.
 
 - Full-screen visual review interface powered by Python’s built-in curses library.
 - Fuzzy search across duplicate paths and filenames.
@@ -210,3 +215,25 @@ Before any applied run, confirm `/mnt/MyCloud1`, `/mnt/MyCloud2`, and
 `/mnt/MyCloud3` are real mounted NAS filesystems—not empty local mount-point
 directories. Keep the original `rmlint.json`, the journal database, and the
 decisions database backed up until the quarantine has been reviewed.
+
+## Documentation
+
+- [Installation](docs/INSTALL.md)
+- [Usage](docs/USAGE.md)
+- [Safety model](docs/SAFETY.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+
+> [!WARNING]
+> Archive Keeper is pre-release software that can move large numbers of files.
+> Inspect the plan, run a limited pilot, and prove restoration before applying
+> it to production data.
+
+## Automatic mount safety
+
+Before commands that inspect or act on report paths, Archive Keeper checks every configured
+`--mount-root`. The default `--mount-policy auto` attempts `sudo mount <root>`, which uses the
+matching `/etc/fstab` entry. If any root remains unavailable, Archive Keeper stops before
+reviewing or moving files. Use `--mount-policy check` to verify without mounting, or
+`--mount-policy ignore` only for deliberate offline report inspection.

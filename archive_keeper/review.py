@@ -7,7 +7,7 @@ import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .core import DuplicateFile, DuplicateGroup, choose_keeper, human_bytes, path_is_within
+from .core import DuplicateFile, DuplicateGroup, choose_keeper, normalize_path, human_bytes, path_is_within
 from .decisions import DecisionStore
 from .metadata import inspect_path
 
@@ -34,8 +34,9 @@ def resolve_keeper(group: DuplicateGroup, preferred: list[Path], protected: list
     if decisions:
         selected = decisions.get_keeper(group.group_id)
         if selected:
+            selected = normalize_path(selected)
             for item in group.files:
-                if item.path == selected:
+                if normalize_path(item.path) == selected:
                     return item
     return choose_keeper(group, preferred, protected, strategy)
 
