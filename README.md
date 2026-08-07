@@ -1,11 +1,14 @@
-# Archive Keeper 1.6.1
+# Archive Keeper 1.6.2
 
 Archive Keeper turns an existing `rmlint.json` scan into a safe, reviewable,
 resumable deduplication workflow. It never runs `rmlint.sh` and never deletes
 files directly: duplicates are moved into a per-NAS quarantine tree and every
 action is journaled for restoration.
 
-## 1.6.1 highlights
+## 1.6.2 highlights
+
+- Fix reviewer crash when comparing selected copies with the current keeper.
+- Preserve the 1.6.1 lazy NAS validation and progress behavior.
 
 - Fast, filesystem-free report parsing: analysis no longer stats every NAS path.
 - Visible loading and group-building progress messages.
