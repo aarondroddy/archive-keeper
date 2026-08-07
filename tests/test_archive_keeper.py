@@ -198,6 +198,16 @@ class ArchiveKeeperTests(unittest.TestCase):
         fake = SimpleNamespace(decisions=SimpleNamespace(get_action=lambda group_id, path: None))
 
         self.assertEqual(ReviewUI.action_for(fake, group, keeper, keeper), "KEEP")
+
+        alias = DuplicateFile(
+            Path("/mnt/MyCloud1/subdir/../a.mp4"),
+            10, 0.0, None, None, False, None, 1
+        )
+        self.assertEqual(
+            ReviewUI.action_for(fake, group, alias, keeper),
+            "KEEP"
+        )
+
         self.assertEqual(ReviewUI.action_for(fake, group, copy, keeper), "QUARANTINE")
 
     def test_mount_check_fails_closed(self):
