@@ -113,7 +113,7 @@ class ReviewUI:
         return self.preview_cache[key]
 
     def action_for(self, group, item, keeper) -> str:
-        if item.normalize_path(path) == keeper.normalize_path(path):
+        if normalize_path(item.path) == normalize_path(keeper.path):
             return "KEEP"
         return self.decisions.get_action(group.group_id, item.path) or "QUARANTINE"
 
@@ -158,7 +158,7 @@ class ReviewUI:
             return
         left = max(46, min(72, w // 2))
         recoverable = sum(g.recoverable_bytes for g in self.groups)
-        title = f" Archive Keeper 1.6.1 | {len(self.groups):,} groups | {human_bytes(recoverable)} max recoverable "
+        title = f" Archive Keeper 1.6.2 | {len(self.groups):,} groups | {human_bytes(recoverable)} max recoverable "
         self.stdscr.addnstr(0, 0, title.ljust(w), w - 1, curses.A_REVERSE)
         self.stdscr.addnstr(1, 0, f"Search: {self.query or '[none]'} | Mode: {self.mode}", w - 1)
         self.stdscr.vline(2, left, curses.ACS_VLINE, h - 4)
@@ -246,7 +246,7 @@ class ReviewUI:
                 elif key == ord('x'):
                     selected = self.current_file()
                     keeper = resolve_keeper(group, self.preferred, self.protected, self.args.strategy, self.decisions)
-                    if selected.normalize_path(path) == keeper.normalize_path(path):
+                    if normalize_path(selected.path) == normalize_path(keeper.path):
                         self.message = "Choose another keeper before quarantining the current keeper."
                     else:
                         self.decisions.set_action(group.group_id, selected.path, "QUARANTINE")
@@ -254,7 +254,7 @@ class ReviewUI:
                 elif key == ord('u'):
                     selected = self.current_file()
                     keeper = resolve_keeper(group, self.preferred, self.protected, self.args.strategy, self.decisions)
-                    if selected.normalize_path(path) == keeper.normalize_path(path):
+                    if normalize_path(selected.path) == normalize_path(keeper.path):
                         self.message = "The keeper cannot be undecided. Choose another keeper first."
                     else:
                         self.decisions.set_action(group.group_id, selected.path, "UNDECIDED")

@@ -187,6 +187,19 @@ class ArchiveKeeperTests(unittest.TestCase):
             self.assertEqual(len(groups), 1)
             self.assertEqual(groups[0].files[0].mtime, 0.0)
 
+    def test_tui_action_for_compares_duplicate_paths(self):
+        from types import SimpleNamespace
+        from archive_keeper.rich_tui import ReviewUI
+        from archive_keeper.core import DuplicateFile
+
+        keeper = DuplicateFile(Path("/mnt/MyCloud1/a.mp4"), 10, 0.0, None, None, True, None, 1)
+        copy = DuplicateFile(Path("/mnt/MyCloud2/a.mp4"), 10, 0.0, None, None, False, None, 1)
+        group = SimpleNamespace(group_id=1)
+        fake = SimpleNamespace(decisions=SimpleNamespace(get_action=lambda group_id, path: None))
+
+        self.assertEqual(ReviewUI.action_for(fake, group, keeper, keeper), "KEEP")
+        self.assertEqual(ReviewUI.action_for(fake, group, copy, keeper), "QUARANTINE")
+
     def test_mount_check_fails_closed(self):
         from archive_keeper.mounts import ensure_mounts
         with tempfile.TemporaryDirectory() as td:

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.2
+
+- Fixed `DuplicateFile` reviewer crash caused by calling `normalize_path` as an instance method.
+- Added regression coverage for keeper/action comparison.
+
 ## 1.6.1
 
 - Removed implicit live `stat()` and path-resolution calls while parsing rmlint JSON.
