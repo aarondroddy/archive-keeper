@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.4
+
+- Added item/total progress, percentage, elapsed time, ETA, current path, and running result counters for quarantine and restore operations.
+- Added terminal-aware progress output: live-updating status on TTYs and timestamped lines when redirected to a file/log.
+- Added percentage detail to report parsing and duplicate-group construction progress.
+
+## 1.6.3
+
+- Moved quarantine live-file verification into a short-lived helper process so a stalled CIFS request cannot freeze the main Archive Keeper CLI.
+- Added `--verify-timeout` (30 seconds by default) for bounded per-candidate verification.
+- Quarantine now prints the exact file being verified and records verification timeouts distinctly.
+- Kept all mutation logic in the parent process: timed-out verifier workers cannot move or alter files.
+- Fixed `--limit` so dry runs stop after the requested number of quarantine candidates instead of only counting files actually moved.
+
+
 ## 1.6.2
 
 - Fixed `DuplicateFile` reviewer crash caused by calling `normalize_path` as an instance method.

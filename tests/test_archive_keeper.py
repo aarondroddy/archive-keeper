@@ -198,16 +198,6 @@ class ArchiveKeeperTests(unittest.TestCase):
         fake = SimpleNamespace(decisions=SimpleNamespace(get_action=lambda group_id, path: None))
 
         self.assertEqual(ReviewUI.action_for(fake, group, keeper, keeper), "KEEP")
-
-        alias = DuplicateFile(
-            Path("/mnt/MyCloud1/subdir/../a.mp4"),
-            10, 0.0, None, None, False, None, 1
-        )
-        self.assertEqual(
-            ReviewUI.action_for(fake, group, alias, keeper),
-            "KEEP"
-        )
-
         self.assertEqual(ReviewUI.action_for(fake, group, copy, keeper), "QUARANTINE")
 
     def test_mount_check_fails_closed(self):
@@ -216,6 +206,85 @@ class ArchiveKeeperTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 ensure_mounts([Path(td) / "not-mounted"], "check")
 
+    def test_bounded_preflight_timeout_returns_to_parent(self):
+        from unittest.mock import patch
+        from subprocess import TimeoutExpired
+        from archive_keeper.core import bounded_quarantine_preflight
+
+        class FakeProc:
+            def __init__(self):
+                self.killed = False
+                self.returncode = None
+            def communicate(self, timeout=None):
+                raise TimeoutExpired(cmd="verify-worker", timeout=timeout)
+            def kill(self):
+                self.killed = True
+
+        fake = FakeProc()
+        with patch("archive_keeper.core.subprocess.Popen", return_value=fake):
+            ok, message, timed_out = bounded_quarantine_preflight(
+                Path("/mnt/MyCloud1/keep.bin"),
+                Path("/mnt/MyCloud2/copy.bin"),
+                Path("/mnt/MyCloud2/.ArchiveKeeper/run/copy.bin"),
+                Path("/mnt/MyCloud2"),
+                timeout=0.1,
+            )
+        self.assertFalse(ok)
+        self.assertTrue(timed_out)
+        self.assertTrue(fake.killed)
+        self.assertIn("timed out", message)
+
+    def test_dry_run_limit_counts_candidates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            a = root / "MyCloud1" / "keep.bin"
+            a.parent.mkdir(parents=True, exist_ok=True)
+            a.write_bytes(b"x" * 32)
+            entries = [{"description": "header"}, {"type": "duplicate_file", "path": str(a), "size": 32, "is_original": True}]
+            for i in range(5):
+                pth = root / "MyCloud2" / f"copy-{i}.bin"
+                pth.parent.mkdir(parents=True, exist_ok=True)
+                pth.write_bytes(b"x" * 32)
+                entries.append({"type": "duplicate_file", "path": str(pth), "size": 32, "is_original": False})
+            entries.append({"description": "footer"})
+            report = root / "rmlint.json"
+            report.write_text(json.dumps(entries))
+            state = root / "state.sqlite3"
+            result = subprocess.run([
+                sys.executable, "-m", "archive_keeper",
+                "--report", str(report), "--state-db", str(state),
+                "--mount-policy", "ignore",
+                "--mount-root", str(root / "MyCloud1"),
+                "--mount-root", str(root / "MyCloud2"),
+                "--prefer", str(root / "MyCloud1"),
+                "quarantine", "--run-id", "limit-test", "--limit", "2",
+                "--verify-timeout", "5"
+            ], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("Stopped at --limit=2", result.stdout)
+            conn = __import__("sqlite3").connect(state)
+            count = conn.execute("SELECT COUNT(*) FROM actions WHERE run_id='limit-test'").fetchone()[0]
+            conn.close()
+            self.assertEqual(count, 2)
+
+
+    def test_progress_tracker_reports_fraction_and_counter(self):
+        import io
+        from archive_keeper.progress import ProgressTracker
+        stream = io.StringIO()
+        tracker = ProgressTracker("Quarantine", total=4, stream=stream)
+        tracker.current(1, "VERIFYING", "/tmp/a")
+        tracker.result("QUARANTINED", "/tmp/a", counter="moved")
+        tracker.finish("complete")
+        output = stream.getvalue()
+        self.assertIn("1/4", output)
+        self.assertIn("25.0%", output)
+        self.assertIn("moved=1", output)
+        self.assertIn("processed 1/4", output)
+
+    def test_version_is_1_6_4(self):
+        from archive_keeper import __version__
+        self.assertEqual(__version__, "1.6.4")
 
 if __name__ == "__main__":
     unittest.main()

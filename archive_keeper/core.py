@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -146,7 +148,7 @@ def load_rmlint_groups(report_path: Path, progress: Callable[[str], None] | None
             continue
         file_entries.append(item)
         if progress and index % 100_000 == 0:
-            progress(f"Parsed {index:,} / {len(data):,} JSON records...")
+            progress(f"Parsed {index:,} / {len(data):,} JSON records ({index / len(data) * 100:.1f}%)...")
 
     if not file_entries:
         raise ArchiveKeeperError(
@@ -211,7 +213,7 @@ def load_rmlint_groups(report_path: Path, progress: Callable[[str], None] | None
             groups.append(DuplicateGroup(group_id=gid, files=files))
             gid += 1
         if progress and group_index % 25_000 == 0:
-            progress(f"Built {len(groups):,} duplicate groups...")
+            progress(f"Built {len(groups):,} duplicate groups from {group_index:,} / {len(raw_groups):,} raw groups ({group_index / len(raw_groups) * 100:.1f}%)...")
 
     if not groups:
         raise ArchiveKeeperError("The report contained no duplicate groups with 2+ files.")
@@ -298,6 +300,65 @@ def files_match(a: Path, b: Path, deep_verify: bool = False) -> tuple[bool, str]
     if deep_verify:
         return (sha256_file(a) == sha256_file(b), "sha256 verification")
     return True, "size verified; report trusted"
+
+
+
+
+def bounded_quarantine_preflight(
+    keeper: Path,
+    source: Path,
+    destination: Path,
+    source_root: Path,
+    *,
+    deep_verify: bool = False,
+    min_free_bytes: int = 0,
+    timeout: float = 30.0,
+) -> tuple[bool, str, bool]:
+    """Run live NAS validation outside the main Archive Keeper process.
+
+    Returns ``(ok, message, timed_out)``. Potentially blocking CIFS metadata and
+    file reads happen in a short-lived helper process so the main CLI stays
+    responsive if the kernel wedges a request in uninterruptible I/O sleep.
+    """
+    cmd = [
+        sys.executable, "-m", "archive_keeper.verify_worker",
+        "--keeper", str(keeper),
+        "--source", str(source),
+        "--destination", str(destination),
+        "--source-root", str(source_root),
+        "--min-free-bytes", str(int(min_free_bytes)),
+    ]
+    if deep_verify:
+        cmd.append("--deep-verify")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=max(0.1, float(timeout)))
+    except subprocess.TimeoutExpired:
+        # SIGKILL may remain pending while a CIFS request is in D state, but the
+        # parent must not wait for that kernel call to recover. The helper owns
+        # no mutation logic, so timing it out cannot move or alter user files.
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return False, f"verification timed out after {timeout:g}s", True
+
+    payload = (stdout or "").strip().splitlines()
+    if payload:
+        try:
+            data = json.loads(payload[-1])
+            return bool(data.get("ok")), str(data.get("message", "verification failed")), False
+        except json.JSONDecodeError:
+            pass
+    detail = (stderr or stdout or f"worker exited with status {proc.returncode}").strip()
+    return False, f"verification worker error: {detail}", False
 
 
 def mount_root_for(path: Path, configured_roots: list[Path]) -> Optional[Path]:

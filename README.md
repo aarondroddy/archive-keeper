@@ -1,11 +1,22 @@
-# Archive Keeper 1.6.2
+# Archive Keeper 1.6.4
 
 Archive Keeper turns an existing `rmlint.json` scan into a safe, reviewable,
 resumable deduplication workflow. It never runs `rmlint.sh` and never deletes
 files directly: duplicates are moved into a per-NAS quarantine tree and every
 action is journaled for restoration.
 
-## 1.6.2 highlights
+## 1.6.4 highlights
+
+- Added a reusable progress tracker for long multi-file operations.
+- Quarantine now shows current item/total, percentage, elapsed time, ETA, current path, operation, and running result counters.
+- Restore now reports the same item-level progress for dry runs and applied restores.
+- Interactive terminals use a compact live-updating line; redirected output emits timestamped log-friendly progress lines.
+- Report parsing/group-building progress now includes percentages.
+
+- Quarantine verification now runs in an isolated helper process with a per-file timeout, preventing a stalled CIFS metadata/hash request from freezing the main CLI.
+- New `--verify-timeout SECONDS` option (default: 30).
+- Quarantine prints the exact file being verified and reports `TIMEOUT`/`FAILED`/`VERIFIED` status as it goes.
+- `--limit` now correctly limits dry-run candidates as well as applied moves.
 
 - Fix reviewer crash when comparing selected copies with the current keeper.
 - Preserve the 1.6.1 lazy NAS validation and progress behavior.
@@ -148,7 +159,7 @@ archive-keeper \
   --prefer /mnt/MyCloud1 \
   --prefer /mnt/MyCloud2 \
   --prefer /mnt/MyCloud3 \
-  quarantine --run-id pilot-25 --limit 25 --deep-verify
+  quarantine --run-id pilot-25 --limit 25 --deep-verify --verify-timeout 30
 ```
 
 Then apply the same pilot:
@@ -158,7 +169,7 @@ archive-keeper \
   --prefer /mnt/MyCloud1 \
   --prefer /mnt/MyCloud2 \
   --prefer /mnt/MyCloud3 \
-  quarantine --run-id pilot-25 --limit 25 --deep-verify --apply
+  quarantine --run-id pilot-25 --limit 25 --deep-verify --verify-timeout 30 --apply
 ```
 
 ## Restore

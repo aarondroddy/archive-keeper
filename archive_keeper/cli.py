@@ -10,12 +10,14 @@ import sys
 import secrets
 from pathlib import Path
 
+from .progress import ProgressTracker
+
 from .core import (
     ArchiveKeeperError,
     Journal,
     choose_keeper,
     export_plan_csv,
-    files_match,
+    bounded_quarantine_preflight,
     human_bytes,
     load_rmlint_groups,
     mount_root_for,
@@ -124,6 +126,10 @@ def build_parser():
         help="Process at most this many moves; 0 means no limit."
     )
     run.add_argument(
+        "--verify-timeout", type=float, default=30.0,
+        help="Maximum seconds to wait for each live NAS verification (default: 30)."
+    )
+    run.add_argument(
         "--min-free-gib", type=float, default=1.0,
         help="Require this much free space on each NAS. Rename moves need almost no extra space."
     )
@@ -219,8 +225,10 @@ def quarantine(args):
     from .decisions import DecisionStore
     from .review import resolve_keeper
     decisions = DecisionStore(args.decisions_db)
+    progress_total = args.limit if args.limit else sum(max(0, len(g.files) - 1) for g in groups)
+    tracker = ProgressTracker("Quarantine", total=progress_total)
 
-    planned = moved = skipped = failed = bytes_moved = 0
+    planned = moved = skipped = failed = bytes_moved = attempted = 0
     try:
         for group in groups:
             keeper = resolve_keeper(group, preferred, protected, args.strategy, decisions)
@@ -238,8 +246,9 @@ def quarantine(args):
             for item in group.files:
                 if item.path == keeper.path:
                     continue
-                if args.limit and moved >= args.limit:
+                if args.limit and attempted >= args.limit:
                     journal.set_run_status(run_id, "paused")
+                    tracker.finish(f"paused at --limit={args.limit}")
                     print(f"Stopped at --limit={args.limit}; resume with --run-id {run_id}")
                     print_summary(run_id, planned, moved, skipped, failed, bytes_moved)
                     return 0
@@ -283,6 +292,7 @@ def quarantine(args):
                 destination = quarantine_destination(
                     item.path, source_root, args.quarantine_name, run_id
                 )
+                attempted += 1
                 if old_status == "moving":
                     if not item.path.exists() and destination.exists():
                         journal.record_action(
@@ -303,49 +313,30 @@ def quarantine(args):
                         failed += 1
                         continue
 
-                if not item.path.exists():
-                    journal.record_action(
-                        run_id, group.group_id, keeper.path, item.path, item.path,
-                        item.size, "failed", "source missing"
-                    )
-                    failed += 1
-                    continue
-                if not keeper.path.exists():
-                    journal.record_action(
-                        run_id, group.group_id, keeper.path, item.path, item.path,
-                        item.size, "failed", "keeper missing"
-                    )
-                    failed += 1
-                    continue
-
-                ok, verify_message = files_match(
-                    keeper.path, item.path, deep_verify=args.deep_verify
+                needed = int(args.min_free_gib * 1024**3)
+                tracker.current(
+                    attempted,
+                    f"VERIFYING timeout={args.verify_timeout:g}s",
+                    str(item.path),
+                )
+                ok, verify_message, timed_out = bounded_quarantine_preflight(
+                    keeper.path,
+                    item.path,
+                    destination,
+                    source_root,
+                    deep_verify=args.deep_verify,
+                    min_free_bytes=needed,
+                    timeout=args.verify_timeout,
                 )
                 if not ok:
-                    journal.record_action(
-                        run_id, group.group_id, keeper.path, item.path, item.path,
-                        item.size, "failed", verify_message
-                    )
-                    failed += 1
-                    continue
-
-                usage = shutil.disk_usage(source_root)
-                needed = int(args.min_free_gib * 1024**3)
-                if usage.free < needed:
-                    journal.record_action(
-                        run_id, group.group_id, keeper.path, item.path, item.path,
-                        item.size, "failed",
-                        f"free space below threshold: {human_bytes(usage.free)}"
-                    )
-                    failed += 1
-                    continue
-
-                if destination.exists():
+                    status = "timeout" if timed_out else "failed"
                     journal.record_action(
                         run_id, group.group_id, keeper.path, item.path, destination,
-                        item.size, "failed", "quarantine destination already exists"
+                        item.size, status, verify_message
                     )
                     failed += 1
+                    label = "TIMEOUT" if timed_out else "FAILED"
+                    tracker.result(label, verify_message, counter=label.lower())
                     continue
 
                 planned += 1
@@ -354,6 +345,7 @@ def quarantine(args):
                         run_id, group.group_id, keeper.path, item.path, destination,
                         item.size, "planned", verify_message
                     )
+                    tracker.result("VERIFIED / WOULD QUARANTINE", str(item.path), counter="verified")
                     continue
 
                 try:
@@ -370,27 +362,24 @@ def quarantine(args):
                     )
                     moved += 1
                     bytes_moved += item.size
-                    if moved % 100 == 0:
-                        print(
-                            f"\rMoved {moved:,} files ({human_bytes(bytes_moved)})",
-                            end="", flush=True
-                        )
+                    tracker.result("QUARANTINED", str(item.path), counter="moved")
                 except OSError as exc:
                     journal.record_action(
                         run_id, group.group_id, keeper.path, item.path, destination,
                         item.size, "failed", str(exc)
                     )
                     failed += 1
+                    tracker.result("FAILED MOVE", str(exc), counter="failed")
 
         journal.set_run_status(run_id, "complete" if args.apply else "dry-run-complete")
-        if moved:
-            print()
+        tracker.finish("complete" if args.apply else "dry-run complete")
         print_summary(run_id, planned, moved, skipped, failed, bytes_moved)
         if not args.apply:
             print("\nDry run only. Add --apply after reviewing the CSV plan and settings.")
         return 1 if failed else 0
     except KeyboardInterrupt:
         journal.set_run_status(run_id, "interrupted")
+        tracker.finish("interrupted")
         print(f"\nInterrupted safely. Resume with --run-id {run_id}")
         return 130
     finally:
@@ -406,19 +395,24 @@ def restore(args):
         if not rows:
             print(f"No moved files found for run {args.run_id}")
             return 0
-        for group_id, keeper, source, destination, size, status, message in rows:
+        tracker = ProgressTracker("Restore", total=len(rows))
+        for index, (group_id, keeper, source, destination, size, status, message) in enumerate(rows, 1):
+            tracker.current(index, "CHECKING", str(destination))
             source = Path(source)
             destination = Path(destination)
             if not destination.exists():
                 print(f"MISSING quarantine file: {destination}", file=sys.stderr)
                 failed += 1
+                tracker.result("FAILED", "quarantine file missing", counter="failed")
                 continue
             if source.exists() and not args.overwrite:
                 print(f"SKIP exists: {source}")
                 skipped += 1
+                tracker.result("SKIPPED", "destination exists", counter="skipped")
                 continue
             if not args.apply:
                 print(f"WOULD RESTORE: {destination} -> {source}")
+                tracker.result("WOULD RESTORE", str(source), counter="planned")
                 continue
             try:
                 source.parent.mkdir(parents=True, exist_ok=True)
@@ -430,12 +424,15 @@ def restore(args):
                     size, "restored", ""
                 )
                 restored += 1
+                tracker.result("RESTORED", str(source), counter="restored")
             except OSError as exc:
                 journal.record_action(
                     args.run_id, group_id, Path(keeper), source, destination,
                     size, "failed", f"restore failed: {exc}"
                 )
                 failed += 1
+                tracker.result("FAILED", str(exc), counter="failed")
+        tracker.finish("complete" if args.apply else "dry-run complete")
         if args.apply and failed == 0:
             journal.set_run_status(args.run_id, "restored")
         print(f"Restored: {restored:,}; skipped: {skipped:,}; failed: {failed:,}")
