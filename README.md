@@ -261,3 +261,4 @@ Before commands that inspect or act on report paths, Archive Keeper checks every
 matching `/etc/fstab` entry. If any root remains unavailable, Archive Keeper stops before
 reviewing or moving files. Use `--mount-policy check` to verify without mounting, or
 `--mount-policy ignore` only for deliberate offline report inspection.
+
