@@ -313,10 +313,13 @@ def bounded_quarantine_preflight(
     deep_verify: bool = False,
     min_free_bytes: int = 0,
     timeout: float = 30.0,
-) -> tuple[bool, str, bool]:
+) -> tuple[bool, str, bool, str]:
     """Run live NAS validation outside the main Archive Keeper process.
 
-    Returns ``(ok, message, timed_out)``. Potentially blocking CIFS metadata and
+    Returns ``(ok, message, timed_out, outcome)``. ``outcome`` is ``ready``
+    for an ordinary move or ``destination-identical`` when an existing
+    quarantine destination is byte-for-byte identical to the source.
+    Potentially blocking CIFS metadata and
     file reads happen in a short-lived helper process so the main CLI stays
     responsive if the kernel wedges a request in uninterruptible I/O sleep.
     """
@@ -348,17 +351,56 @@ def bounded_quarantine_preflight(
             proc.kill()
         except ProcessLookupError:
             pass
-        return False, f"verification timed out after {timeout:g}s", True
+        return False, f"verification timed out after {timeout:g}s", True, "timeout"
 
     payload = (stdout or "").strip().splitlines()
     if payload:
         try:
             data = json.loads(payload[-1])
-            return bool(data.get("ok")), str(data.get("message", "verification failed")), False
+            return (
+                bool(data.get("ok")),
+                str(data.get("message", "verification failed")),
+                False,
+                str(data.get("outcome", "ready" if data.get("ok") else "failed")),
+            )
         except json.JSONDecodeError:
             pass
     detail = (stderr or stdout or f"worker exited with status {proc.returncode}").strip()
-    return False, f"verification worker error: {detail}", False
+    return False, f"verification worker error: {detail}", False, "worker-error"
+
+
+def bounded_files_identical(a: Path, b: Path, *, timeout: float = 30.0) -> tuple[bool, str, bool]:
+    """SHA-256 compare two live files in a bounded helper process.
+
+    Returns ``(identical, message, timed_out)``. This is used for restore
+    collision reconciliation so a stalled CIFS read cannot freeze the CLI.
+    """
+    cmd = [
+        sys.executable, "-m", "archive_keeper.verify_worker",
+        "--compare-a", str(a),
+        "--compare-b", str(b),
+    ]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=max(0.1, float(timeout)))
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return False, f"comparison timed out after {timeout:g}s", True
+    payload = (stdout or "").strip().splitlines()
+    if payload:
+        try:
+            data = json.loads(payload[-1])
+            return bool(data.get("identical")), str(data.get("message", "comparison failed")), False
+        except json.JSONDecodeError:
+            pass
+    detail = (stderr or stdout or f"worker exited with status {proc.returncode}").strip()
+    return False, f"comparison worker error: {detail}", False
 
 
 def mount_root_for(path: Path, configured_roots: list[Path]) -> Optional[Path]:

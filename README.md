@@ -1,11 +1,17 @@
-# Archive Keeper 1.6.4
+# Archive Keeper 1.6.5
 
 Archive Keeper turns an existing `rmlint.json` scan into a safe, reviewable,
 resumable deduplication workflow. It never runs `rmlint.sh` and never deletes
 files directly: duplicates are moved into a per-NAS quarantine tree and every
 action is journaled for restoration.
 
-## 1.6.4 highlights
+## 1.6.5 highlights
+
+- Reconciles identical quarantine-destination collisions with SHA-256 instead of counting them as failures.
+- Reconciles restore collisions when the original already exists and is SHA-256 identical, removing only the redundant quarantine copy.
+- Leaves different-content collisions untouched in both directions.
+- Reports attempted, moved, restored, reconciled, skipped, and failed outcomes more clearly.
+
 
 - Added a reusable progress tracker for long multi-file operations.
 - Quarantine now shows current item/total, percentage, elapsed time, ETA, current path, operation, and running result counters.

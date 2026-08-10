@@ -222,7 +222,7 @@ class ArchiveKeeperTests(unittest.TestCase):
 
         fake = FakeProc()
         with patch("archive_keeper.core.subprocess.Popen", return_value=fake):
-            ok, message, timed_out = bounded_quarantine_preflight(
+            ok, message, timed_out, outcome = bounded_quarantine_preflight(
                 Path("/mnt/MyCloud1/keep.bin"),
                 Path("/mnt/MyCloud2/copy.bin"),
                 Path("/mnt/MyCloud2/.ArchiveKeeper/run/copy.bin"),
@@ -233,6 +233,7 @@ class ArchiveKeeperTests(unittest.TestCase):
         self.assertTrue(timed_out)
         self.assertTrue(fake.killed)
         self.assertIn("timed out", message)
+        self.assertEqual(outcome, "timeout")
 
     def test_dry_run_limit_counts_candidates(self):
         with tempfile.TemporaryDirectory() as td:
@@ -268,6 +269,126 @@ class ArchiveKeeperTests(unittest.TestCase):
             self.assertEqual(count, 2)
 
 
+    def _base_cli(self, root: Path, report: Path, state: Path):
+        return [
+            sys.executable, "-m", "archive_keeper",
+            "--report", str(report), "--state-db", str(state),
+            "--mount-policy", "ignore",
+            "--mount-root", str(root / "MyCloud1"),
+            "--mount-root", str(root / "MyCloud2"),
+            "--mount-root", str(root / "MyCloud3"),
+            "--prefer", str(root / "MyCloud1"),
+        ]
+
+    def test_quarantine_identical_existing_destination_is_reconciled(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            q = root / "MyCloud2" / ".ArchiveKeeper" / "collision-identical" / "copy.bin"
+            q.parent.mkdir(parents=True, exist_ok=True)
+            q.write_bytes(b.read_bytes())
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "quarantine", "--run-id", "collision-identical", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue(b.exists())
+            self.assertTrue(q.exists())
+            self.assertIn("Reconciled    : 1", result.stdout)
+            self.assertIn("Failed        : 0", result.stdout)
+            conn = __import__("sqlite3").connect(state)
+            status = conn.execute(
+                "SELECT status FROM actions WHERE run_id=? AND source=?",
+                ("collision-identical", str(b.resolve())),
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "reconciled")
+
+    def test_quarantine_different_existing_destination_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            q = root / "MyCloud2" / ".ArchiveKeeper" / "collision-different" / "copy.bin"
+            q.parent.mkdir(parents=True, exist_ok=True)
+            q.write_bytes(b"y" * 1024)
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "quarantine", "--run-id", "collision-different", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+            self.assertTrue(b.exists())
+            self.assertEqual(q.read_bytes(), b"y" * 1024)
+            self.assertIn("Failed        : 1", result.stdout)
+
+    def test_restore_identical_existing_source_reconciles_quarantine_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            base = self._base_cli(root, report, state)
+            result = subprocess.run(
+                base + ["quarantine", "--run-id", "restore-identical", "--limit", "1", "--apply"],
+                text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            q = root / "MyCloud2" / ".ArchiveKeeper" / "restore-identical" / "copy.bin"
+            self.assertFalse(b.exists())
+            self.assertTrue(q.exists())
+            b.write_bytes(q.read_bytes())
+
+            result = subprocess.run(
+                base + ["restore", "restore-identical", "--apply"],
+                text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue(b.exists())
+            self.assertFalse(q.exists())
+            self.assertIn("reconciled: 1", result.stdout)
+            conn = __import__("sqlite3").connect(state)
+            status = conn.execute(
+                "SELECT status FROM actions WHERE run_id=? AND source=?",
+                ("restore-identical", str(b.resolve())),
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "reconciled")
+
+    def test_restore_different_existing_source_leaves_both_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            base = self._base_cli(root, report, state)
+            result = subprocess.run(
+                base + ["quarantine", "--run-id", "restore-different", "--limit", "1", "--apply"],
+                text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            q = root / "MyCloud2" / ".ArchiveKeeper" / "restore-different" / "copy.bin"
+            original_quarantine = q.read_bytes()
+            b.write_bytes(b"z" * 1024)
+
+            result = subprocess.run(
+                base + ["restore", "restore-different", "--apply"],
+                text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(b.read_bytes(), b"z" * 1024)
+            self.assertEqual(q.read_bytes(), original_quarantine)
+            self.assertIn("skipped: 1", result.stdout)
+            conn = __import__("sqlite3").connect(state)
+            status = conn.execute(
+                "SELECT status FROM actions WHERE run_id=? AND source=?",
+                ("restore-different", str(b.resolve())),
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "moved")
+
     def test_progress_tracker_reports_fraction_and_counter(self):
         import io
         from archive_keeper.progress import ProgressTracker
@@ -282,9 +403,9 @@ class ArchiveKeeperTests(unittest.TestCase):
         self.assertIn("moved=1", output)
         self.assertIn("processed 1/4", output)
 
-    def test_version_is_1_6_4(self):
+    def test_version_is_1_6_5(self):
         from archive_keeper import __version__
-        self.assertEqual(__version__, "1.6.4")
+        self.assertEqual(__version__, "1.6.5")
 
 if __name__ == "__main__":
     unittest.main()

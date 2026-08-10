@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.5
+
+- Added SHA-256 reconciliation for quarantine destinations that already exist: identical collisions are recorded as `reconciled` instead of failures, while different-content collisions fail closed and leave both files untouched.
+- Added SHA-256 reconciliation during restore when the original path already exists: identical originals keep their existing file while the redundant quarantine copy is removed and journaled as `reconciled`.
+- Different-content restore collisions remain untouched and are reported as skipped conflicts.
+- Added bounded helper-process hashing for restore collision checks so stalled CIFS reads do not freeze the main CLI.
+- Added `--verify-timeout` to `restore` for bounded collision verification.
+- Corrected quarantine summaries to report `Attempted` separately from `Planned`, and added `Reconciled` counters to progress/status output.
+- Added regression tests for identical and different-content collisions in both quarantine and restore paths.
+
 ## 1.6.4
 
 - Added item/total progress, percentage, elapsed time, ETA, current path, and running result counters for quarantine and restore operations.

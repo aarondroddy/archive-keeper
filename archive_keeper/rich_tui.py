@@ -158,7 +158,7 @@ class ReviewUI:
             return
         left = max(46, min(72, w // 2))
         recoverable = sum(g.recoverable_bytes for g in self.groups)
-        title = f" Archive Keeper 1.6.4 | {len(self.groups):,} groups | {human_bytes(recoverable)} max recoverable "
+        title = f" Archive Keeper 1.6.5 | {len(self.groups):,} groups | {human_bytes(recoverable)} max recoverable "
         self.stdscr.addnstr(0, 0, title.ljust(w), w - 1, curses.A_REVERSE)
         self.stdscr.addnstr(1, 0, f"Search: {self.query or '[none]'} | Mode: {self.mode}", w - 1)
         self.stdscr.vline(2, left, curses.ACS_VLINE, h - 4)

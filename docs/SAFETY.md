@@ -25,3 +25,8 @@ Recommended rollout:
 8. Only then increase scope.
 
 Quarantine is not a backup.
+
+
+## Collision reconciliation
+
+Archive Keeper 1.6.5 fails closed on path collisions. When a quarantine destination or restore destination already exists, Archive Keeper compares the relevant files with SHA-256 before taking any cleanup action. Identical collisions may be reconciled; different-content collisions are left untouched for manual review. Restore reconciliation removes only the redundant quarantine copy after confirming the existing original is identical.

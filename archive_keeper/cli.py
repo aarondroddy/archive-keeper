@@ -18,6 +18,7 @@ from .core import (
     choose_keeper,
     export_plan_csv,
     bounded_quarantine_preflight,
+    bounded_files_identical,
     human_bytes,
     load_rmlint_groups,
     mount_root_for,
@@ -138,6 +139,10 @@ def build_parser():
     restore.add_argument("run_id")
     restore.add_argument("--apply", action="store_true")
     restore.add_argument("--overwrite", action="store_true")
+    restore.add_argument(
+        "--verify-timeout", type=float, default=30.0,
+        help="Maximum seconds to wait when hashing an existing restore destination (default: 30)."
+    )
 
     status = sub.add_parser("status", help="Show journaled runs.")
     status.add_argument("--run-id")
@@ -228,7 +233,7 @@ def quarantine(args):
     progress_total = args.limit if args.limit else sum(max(0, len(g.files) - 1) for g in groups)
     tracker = ProgressTracker("Quarantine", total=progress_total)
 
-    planned = moved = skipped = failed = bytes_moved = attempted = 0
+    planned = moved = reconciled = skipped = failed = bytes_moved = attempted = 0
     try:
         for group in groups:
             keeper = resolve_keeper(group, preferred, protected, args.strategy, decisions)
@@ -250,10 +255,10 @@ def quarantine(args):
                     journal.set_run_status(run_id, "paused")
                     tracker.finish(f"paused at --limit={args.limit}")
                     print(f"Stopped at --limit={args.limit}; resume with --run-id {run_id}")
-                    print_summary(run_id, planned, moved, skipped, failed, bytes_moved)
-                    return 0
+                    print_summary(run_id, attempted, planned, moved, reconciled, skipped, failed, bytes_moved)
+                    return 1 if failed else 0
                 old_status = journal.action_status(run_id, item.path)
-                if old_status in ("moved", "restored", "skipped"):
+                if old_status in ("moved", "restored", "reconciled", "skipped"):
                     skipped += 1
                     continue
 
@@ -319,7 +324,7 @@ def quarantine(args):
                     f"VERIFYING timeout={args.verify_timeout:g}s",
                     str(item.path),
                 )
-                ok, verify_message, timed_out = bounded_quarantine_preflight(
+                ok, verify_message, timed_out, verify_outcome = bounded_quarantine_preflight(
                     keeper.path,
                     item.path,
                     destination,
@@ -337,6 +342,19 @@ def quarantine(args):
                     failed += 1
                     label = "TIMEOUT" if timed_out else "FAILED"
                     tracker.result(label, verify_message, counter=label.lower())
+                    continue
+
+                if verify_outcome == "destination-identical":
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, destination,
+                        item.size, "reconciled", verify_message
+                    )
+                    reconciled += 1
+                    tracker.result(
+                        "RECONCILED / ALREADY QUARANTINED",
+                        str(item.path),
+                        counter="reconciled",
+                    )
                     continue
 
                 planned += 1
@@ -373,7 +391,7 @@ def quarantine(args):
 
         journal.set_run_status(run_id, "complete" if args.apply else "dry-run-complete")
         tracker.finish("complete" if args.apply else "dry-run complete")
-        print_summary(run_id, planned, moved, skipped, failed, bytes_moved)
+        print_summary(run_id, attempted, planned, moved, reconciled, skipped, failed, bytes_moved)
         if not args.apply:
             print("\nDry run only. Add --apply after reviewing the CSV plan and settings.")
         return 1 if failed else 0
@@ -389,7 +407,7 @@ def quarantine(args):
 
 def restore(args):
     journal = Journal(args.state_db.expanduser())
-    restored = skipped = failed = 0
+    restored = reconciled = skipped = failed = 0
     try:
         rows = list(journal.iter_actions(args.run_id, ("moved",)))
         if not rows:
@@ -405,11 +423,50 @@ def restore(args):
                 failed += 1
                 tracker.result("FAILED", "quarantine file missing", counter="failed")
                 continue
+
             if source.exists() and not args.overwrite:
-                print(f"SKIP exists: {source}")
-                skipped += 1
-                tracker.result("SKIPPED", "destination exists", counter="skipped")
+                tracker.current(
+                    index,
+                    f"VERIFYING EXISTING DESTINATION timeout={args.verify_timeout:g}s",
+                    str(source),
+                )
+                identical, compare_message, timed_out = bounded_files_identical(
+                    source, destination, timeout=args.verify_timeout
+                )
+                if identical:
+                    if not args.apply:
+                        print(f"WOULD RECONCILE identical: {destination} -> {source}")
+                        tracker.result("WOULD RECONCILE IDENTICAL", str(source), counter="reconciled")
+                        continue
+                    try:
+                        if not source.exists() or not destination.exists():
+                            raise OSError("file disappeared after identical-file verification")
+                        destination.unlink()
+                        journal.record_action(
+                            args.run_id, group_id, Path(keeper), source, destination,
+                            size, "reconciled", "restore destination already existed and was SHA-256 identical; redundant quarantine copy removed"
+                        )
+                        reconciled += 1
+                        tracker.result("RECONCILED IDENTICAL", str(source), counter="reconciled")
+                    except OSError as exc:
+                        journal.record_action(
+                            args.run_id, group_id, Path(keeper), source, destination,
+                            size, "failed", f"restore reconciliation failed: {exc}"
+                        )
+                        failed += 1
+                        tracker.result("FAILED", str(exc), counter="failed")
+                    continue
+
+                if timed_out:
+                    print(f"SKIP comparison timeout: {source}")
+                    skipped += 1
+                    tracker.result("SKIPPED", compare_message, counter="skipped")
+                else:
+                    print(f"SKIP conflict (different content): {source}")
+                    skipped += 1
+                    tracker.result("SKIPPED CONFLICT", compare_message, counter="skipped")
                 continue
+
             if not args.apply:
                 print(f"WOULD RESTORE: {destination} -> {source}")
                 tracker.result("WOULD RESTORE", str(source), counter="planned")
@@ -435,9 +492,12 @@ def restore(args):
         tracker.finish("complete" if args.apply else "dry-run complete")
         if args.apply and failed == 0:
             journal.set_run_status(args.run_id, "restored")
-        print(f"Restored: {restored:,}; skipped: {skipped:,}; failed: {failed:,}")
+        print(
+            f"Restored: {restored:,}; reconciled: {reconciled:,}; "
+            f"skipped: {skipped:,}; failed: {failed:,}"
+        )
         if not args.apply:
-            print("Dry run only. Add --apply to restore.")
+            print("Dry run only. Add --apply to restore/reconcile.")
         return 1 if failed else 0
     finally:
         journal.close()
@@ -454,7 +514,8 @@ def status(args):
             timestamp = dt.datetime.fromtimestamp(created_at, tz=dt.timezone.utc).astimezone().isoformat(timespec="seconds")
             print(f"{run_id}  {timestamp}  {mode}  {run_status}")
             print(f"  moved={counts.get('moved',0):,} planned={counts.get('planned',0):,} "
-                  f"skipped={counts.get('skipped',0):,} failed={counts.get('failed',0):,} "
+                  f"reconciled={counts.get('reconciled',0):,} skipped={counts.get('skipped',0):,} "
+                  f"failed={counts.get('failed',0):,} timeout={counts.get('timeout',0):,} "
                   f"restored={counts.get('restored',0):,}")
             print(f"  moved bytes={human_bytes(bytes_moved)}")
             print(f"  report={report_path}")
@@ -463,10 +524,12 @@ def status(args):
         journal.close()
 
 
-def print_summary(run_id, planned, moved, skipped, failed, bytes_moved):
+def print_summary(run_id, attempted, planned, moved, reconciled, skipped, failed, bytes_moved):
     print(f"Run ID        : {run_id}")
-    print(f"Considered    : {planned:,}")
+    print(f"Attempted     : {attempted:,}")
+    print(f"Planned       : {planned:,}")
     print(f"Moved         : {moved:,}")
+    print(f"Reconciled    : {reconciled:,}")
     print(f"Skipped       : {skipped:,}")
     print(f"Failed        : {failed:,}")
     print(f"Quarantined   : {human_bytes(bytes_moved)}")

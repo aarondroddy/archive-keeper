@@ -39,3 +39,8 @@ archive-keeper --help
 archive-keeper quarantine --help
 archive-keeper restore --help
 ```
+
+
+## Restore collision verification
+
+Restore checks an already-existing original against its quarantined copy with SHA-256. The comparison is bounded by `--verify-timeout` (30 seconds by default). Identical files can be reconciled during `--apply`; different-content collisions are skipped without overwriting either file.
