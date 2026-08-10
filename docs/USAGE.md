@@ -44,3 +44,8 @@ archive-keeper restore --help
 ## Restore collision verification
 
 Restore checks an already-existing original against its quarantined copy with SHA-256. The comparison is bounded by `--verify-timeout` (30 seconds by default). Identical files can be reconciled during `--apply`; different-content collisions are skipped without overwriting either file.
+
+
+## Visible quarantine directories (1.6.6)
+
+New runs default to `ArchiveKeeper Quarantine` on each configured NAS root. Existing runs keep using the directory recorded by their journal, including legacy `.ArchiveKeeper` trees. Archive Keeper never renames or migrates an existing quarantine automatically. Use `--quarantine-name` only when starting a new run if a custom directory name is desired.

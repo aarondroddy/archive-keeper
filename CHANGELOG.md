@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.6
+
+- Changed the default quarantine directory for new runs from hidden `.ArchiveKeeper` to visible `ArchiveKeeper Quarantine`.
+- Existing journaled runs infer and reuse their original quarantine directory name when resumed, preserving compatibility with pre-1.6.6 `.ArchiveKeeper` runs without migration.
+- Conflicting `--quarantine-name` overrides on an existing run now fail closed instead of splitting one run across multiple quarantine roots.
+- Added regression coverage for the visible default, custom quarantine names, and legacy-run resume behavior.
+
 ## 1.6.5
 
 - Added SHA-256 reconciliation for quarantine destinations that already exist: identical collisions are recorded as `reconciled` instead of failures, while different-content collisions fail closed and leave both files untouched.

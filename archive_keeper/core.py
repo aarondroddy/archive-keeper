@@ -478,6 +478,31 @@ class Journal:
         ).fetchone()
         return row[0] if row else None
 
+    def infer_quarantine_name(self, run_id: str, mount_roots: list[Path]) -> Optional[str]:
+        """Infer the quarantine directory name already journaled for a run.
+
+        This keeps resumed pre-1.6.6 runs on their original hidden `.ArchiveKeeper`
+        tree and avoids silently splitting one run across old and new roots.
+        """
+        rows = self.conn.execute(
+            "SELECT destination FROM actions WHERE run_id=? ORDER BY id LIMIT 100",
+            (run_id,),
+        ).fetchall()
+        for (destination_text,) in rows:
+            destination = normalize_path(Path(destination_text))
+            for mount_root in mount_roots:
+                root = normalize_path(mount_root)
+                if not path_is_within(destination, root):
+                    continue
+                try:
+                    rel = destination.relative_to(root)
+                except ValueError:
+                    continue
+                parts = rel.parts
+                if len(parts) >= 2 and parts[1] == run_id:
+                    return parts[0]
+        return None
+
     def record_action(
         self,
         run_id: str,

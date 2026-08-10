@@ -32,6 +32,8 @@ DEFAULT_REPORT = Path("~/rmlint-mycloud-scan/rmlint.json").expanduser()
 DEFAULT_STATE = Path("~/.local/state/archive-keeper/journal.sqlite3").expanduser()
 DEFAULT_DECISIONS = Path("~/.local/state/archive-keeper/decisions.sqlite3").expanduser()
 DEFAULT_ROOTS = [Path("/mnt/MyCloud1"), Path("/mnt/MyCloud2"), Path("/mnt/MyCloud3")]
+DEFAULT_QUARANTINE_NAME = "ArchiveKeeper Quarantine"
+LEGACY_QUARANTINE_NAME = ".ArchiveKeeper"
 
 MOUNTED_COMMANDS = {"analyze", "tui", "review", "search", "inspect", "keep", "folders", "plan", "quarantine"}
 
@@ -70,8 +72,9 @@ def build_parser():
         default="preferred-root",
     )
     parser.add_argument(
-        "--quarantine-name", default=".ArchiveKeeper",
-        help="Directory created independently on each NAS root."
+        "--quarantine-name", default=None,
+        help=("Quarantine directory created independently on each NAS root. "
+              f"New runs default to {DEFAULT_QUARANTINE_NAME!r}; existing runs reuse their journaled directory name."),
     )
     parser.add_argument(
         "--mount-policy", choices=("auto", "check", "ignore"), default="auto",
@@ -226,7 +229,18 @@ def quarantine(args):
     groups = load_rmlint_groups(report, progress=_progress)
     run_id = args.run_id or f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
     journal = Journal(args.state_db.expanduser())
+    inferred_quarantine_name = journal.infer_quarantine_name(run_id, roots)
+    if args.quarantine_name and inferred_quarantine_name and args.quarantine_name != inferred_quarantine_name:
+        raise ArchiveKeeperError(
+            f"Run {run_id!r} already uses quarantine directory {inferred_quarantine_name!r}; "
+            f"refusing to switch it to {args.quarantine_name!r}."
+        )
+    quarantine_name = args.quarantine_name or inferred_quarantine_name or DEFAULT_QUARANTINE_NAME
     journal.create_run(run_id, report, "apply" if args.apply else "dry-run")
+    if inferred_quarantine_name:
+        _progress(f"Resuming run {run_id} with existing quarantine directory: {quarantine_name}")
+    else:
+        _progress(f"Quarantine directory: {quarantine_name}")
     from .decisions import DecisionStore
     from .review import resolve_keeper
     decisions = DecisionStore(args.decisions_db)
@@ -295,7 +309,7 @@ def quarantine(args):
                     continue
 
                 destination = quarantine_destination(
-                    item.path, source_root, args.quarantine_name, run_id
+                    item.path, source_root, quarantine_name, run_id
                 )
                 attempted += 1
                 if old_status == "moving":

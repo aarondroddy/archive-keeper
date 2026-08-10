@@ -66,6 +66,8 @@ class ArchiveKeeperTests(unittest.TestCase):
             self.assertTrue(a.exists())
             self.assertFalse(b.exists())
             self.assertFalse(c.exists())
+            self.assertTrue((root / "MyCloud2" / "ArchiveKeeper Quarantine" / run_id / "copy.bin").exists())
+            self.assertTrue((root / "MyCloud3" / "ArchiveKeeper Quarantine" / run_id / "copy.bin").exists())
 
             result = subprocess.run(
                 base + ["restore", run_id, "--apply"],
@@ -285,7 +287,7 @@ class ArchiveKeeperTests(unittest.TestCase):
             root = Path(td)
             report, a, b, c = self.make_report(root)
             state = root / "state.sqlite3"
-            q = root / "MyCloud2" / ".ArchiveKeeper" / "collision-identical" / "copy.bin"
+            q = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "collision-identical" / "copy.bin"
             q.parent.mkdir(parents=True, exist_ok=True)
             q.write_bytes(b.read_bytes())
 
@@ -312,7 +314,7 @@ class ArchiveKeeperTests(unittest.TestCase):
             root = Path(td)
             report, a, b, c = self.make_report(root)
             state = root / "state.sqlite3"
-            q = root / "MyCloud2" / ".ArchiveKeeper" / "collision-different" / "copy.bin"
+            q = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "collision-different" / "copy.bin"
             q.parent.mkdir(parents=True, exist_ok=True)
             q.write_bytes(b"y" * 1024)
 
@@ -337,7 +339,7 @@ class ArchiveKeeperTests(unittest.TestCase):
                 text=True, capture_output=True
             )
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            q = root / "MyCloud2" / ".ArchiveKeeper" / "restore-identical" / "copy.bin"
+            q = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "restore-identical" / "copy.bin"
             self.assertFalse(b.exists())
             self.assertTrue(q.exists())
             b.write_bytes(q.read_bytes())
@@ -369,7 +371,7 @@ class ArchiveKeeperTests(unittest.TestCase):
                 text=True, capture_output=True
             )
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            q = root / "MyCloud2" / ".ArchiveKeeper" / "restore-different" / "copy.bin"
+            q = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "restore-different" / "copy.bin"
             original_quarantine = q.read_bytes()
             b.write_bytes(b"z" * 1024)
 
@@ -389,6 +391,67 @@ class ArchiveKeeperTests(unittest.TestCase):
             conn.close()
             self.assertEqual(status, "moved")
 
+    def test_custom_quarantine_name_for_new_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "--quarantine-name", "My Visible Holding",
+                    "quarantine", "--run-id", "custom-name", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue((root / "MyCloud2" / "My Visible Holding" / "custom-name" / "copy.bin").exists())
+
+    def test_legacy_hidden_run_reuses_journaled_name_on_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            base = self._base_cli(root, report, state)
+            result = subprocess.run(
+                base + [
+                    "--quarantine-name", ".ArchiveKeeper",
+                    "quarantine", "--run-id", "legacy-run", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue((root / "MyCloud2" / ".ArchiveKeeper" / "legacy-run" / "copy.bin").exists())
+
+            result = subprocess.run(
+                base + ["quarantine", "--run-id", "legacy-run", "--limit", "1", "--apply"],
+                text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue((root / "MyCloud3" / ".ArchiveKeeper" / "legacy-run" / "copy.bin").exists())
+            self.assertFalse((root / "MyCloud3" / "ArchiveKeeper Quarantine" / "legacy-run").exists())
+            self.assertIn("existing quarantine directory: .ArchiveKeeper", result.stdout)
+
+    def test_existing_run_rejects_conflicting_quarantine_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            base = self._base_cli(root, report, state)
+            first = subprocess.run(
+                base + [
+                    "--quarantine-name", ".ArchiveKeeper",
+                    "quarantine", "--run-id", "conflict-name", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+            second = subprocess.run(
+                base + [
+                    "--quarantine-name", "Other Quarantine",
+                    "quarantine", "--run-id", "conflict-name", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("refusing to switch", second.stderr + second.stdout)
+            self.assertFalse((root / "MyCloud3" / "Other Quarantine" / "conflict-name").exists())
+
     def test_progress_tracker_reports_fraction_and_counter(self):
         import io
         from archive_keeper.progress import ProgressTracker
@@ -403,9 +466,9 @@ class ArchiveKeeperTests(unittest.TestCase):
         self.assertIn("moved=1", output)
         self.assertIn("processed 1/4", output)
 
-    def test_version_is_1_6_5(self):
+    def test_version_is_1_6_6(self):
         from archive_keeper import __version__
-        self.assertEqual(__version__, "1.6.5")
+        self.assertEqual(__version__, "1.6.6")
 
 if __name__ == "__main__":
     unittest.main()
