@@ -15,6 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--min-free-bytes", type=int, default=0)
+    parser.add_argument("--expected-size", type=int)
     parser.add_argument("--deep-verify", action="store_true")
     parser.add_argument("--compare-a", type=Path)
     parser.add_argument("--compare-b", type=Path)
@@ -55,6 +56,47 @@ def main() -> int:
 
     result = {"ok": False, "message": "verification failed", "outcome": "failed"}
     try:
+        try:
+            source_stat = args.source.stat()
+        except FileNotFoundError:
+            # A stale rmlint snapshot may still reference a duplicate that was
+            # already removed by an earlier Archive Keeper run.  Do not call
+            # that a successful cryptographic verification: the source is gone
+            # and cannot be hashed.  Instead, classify it as stale only when the
+            # selected keeper is still a regular file with the size recorded by
+            # the duplicate report, and no new quarantine destination exists.
+            try:
+                keeper_stat = args.keeper.stat()
+                keeper_ok = args.keeper.is_file()
+            except OSError as exc:
+                result["message"] = f"source missing and keeper check failed: {exc}"
+            else:
+                expected = args.expected_size
+                if not keeper_ok:
+                    result["message"] = "source missing and keeper is not a regular file"
+                elif expected is not None and keeper_stat.st_size != expected:
+                    result["message"] = (
+                        f"source missing and keeper size mismatch: "
+                        f"expected {expected}, found {keeper_stat.st_size}"
+                    )
+                elif args.destination.exists():
+                    result["message"] = (
+                        "source missing but quarantine destination exists; "
+                        "state is ambiguous"
+                    )
+                    result["outcome"] = "source-missing-destination-present"
+                else:
+                    result = {
+                        "ok": True,
+                        "message": (
+                            "source already absent; selected keeper exists as a regular file "
+                            "and matches the report size"
+                        ),
+                        "outcome": "source-missing-keeper-valid",
+                    }
+            print(json.dumps(result), flush=True)
+            return 0 if result["ok"] else 2
+
         ok, message = files_match(args.keeper, args.source, deep_verify=args.deep_verify)
         if not ok:
             result["message"] = message

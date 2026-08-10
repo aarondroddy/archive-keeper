@@ -312,6 +312,7 @@ def bounded_quarantine_preflight(
     *,
     deep_verify: bool = False,
     min_free_bytes: int = 0,
+    expected_size: int | None = None,
     timeout: float = 30.0,
 ) -> tuple[bool, str, bool, str]:
     """Run live NAS validation outside the main Archive Keeper process.
@@ -331,6 +332,8 @@ def bounded_quarantine_preflight(
         "--source-root", str(source_root),
         "--min-free-bytes", str(int(min_free_bytes)),
     ]
+    if expected_size is not None:
+        cmd.extend(["--expected-size", str(int(expected_size))])
     if deep_verify:
         cmd.append("--deep-verify")
 

@@ -247,7 +247,7 @@ def quarantine(args):
     progress_total = args.limit if args.limit else sum(max(0, len(g.files) - 1) for g in groups)
     tracker = ProgressTracker("Quarantine", total=progress_total)
 
-    planned = moved = reconciled = skipped = failed = bytes_moved = attempted = 0
+    planned = moved = reconciled = stale = skipped = failed = bytes_moved = attempted = 0
     try:
         for group in groups:
             keeper = resolve_keeper(group, preferred, protected, args.strategy, decisions)
@@ -269,10 +269,10 @@ def quarantine(args):
                     journal.set_run_status(run_id, "paused")
                     tracker.finish(f"paused at --limit={args.limit}")
                     print(f"Stopped at --limit={args.limit}; resume with --run-id {run_id}")
-                    print_summary(run_id, attempted, planned, moved, reconciled, skipped, failed, bytes_moved)
+                    print_summary(run_id, attempted, planned, moved, reconciled, stale, skipped, failed, bytes_moved)
                     return 1 if failed else 0
                 old_status = journal.action_status(run_id, item.path)
-                if old_status in ("moved", "restored", "reconciled", "skipped"):
+                if old_status in ("moved", "restored", "reconciled", "stale", "skipped"):
                     skipped += 1
                     continue
 
@@ -345,6 +345,7 @@ def quarantine(args):
                     source_root,
                     deep_verify=args.deep_verify,
                     min_free_bytes=needed,
+                    expected_size=item.size,
                     timeout=args.verify_timeout,
                 )
                 if not ok:
@@ -368,6 +369,19 @@ def quarantine(args):
                         "RECONCILED / ALREADY QUARANTINED",
                         str(item.path),
                         counter="reconciled",
+                    )
+                    continue
+
+                if verify_outcome == "source-missing-keeper-valid":
+                    journal.record_action(
+                        run_id, group.group_id, keeper.path, item.path, destination,
+                        item.size, "stale", verify_message
+                    )
+                    stale += 1
+                    tracker.result(
+                        "STALE / SOURCE ALREADY ABSENT",
+                        str(item.path),
+                        counter="stale",
                     )
                     continue
 
@@ -405,7 +419,7 @@ def quarantine(args):
 
         journal.set_run_status(run_id, "complete" if args.apply else "dry-run-complete")
         tracker.finish("complete" if args.apply else "dry-run complete")
-        print_summary(run_id, attempted, planned, moved, reconciled, skipped, failed, bytes_moved)
+        print_summary(run_id, attempted, planned, moved, reconciled, stale, skipped, failed, bytes_moved)
         if not args.apply:
             print("\nDry run only. Add --apply after reviewing the CSV plan and settings.")
         return 1 if failed else 0
@@ -528,8 +542,9 @@ def status(args):
             timestamp = dt.datetime.fromtimestamp(created_at, tz=dt.timezone.utc).astimezone().isoformat(timespec="seconds")
             print(f"{run_id}  {timestamp}  {mode}  {run_status}")
             print(f"  moved={counts.get('moved',0):,} planned={counts.get('planned',0):,} "
-                  f"reconciled={counts.get('reconciled',0):,} skipped={counts.get('skipped',0):,} "
-                  f"failed={counts.get('failed',0):,} timeout={counts.get('timeout',0):,} "
+                  f"reconciled={counts.get('reconciled',0):,} stale={counts.get('stale',0):,} "
+                  f"skipped={counts.get('skipped',0):,} failed={counts.get('failed',0):,} "
+                  f"timeout={counts.get('timeout',0):,} "
                   f"restored={counts.get('restored',0):,}")
             print(f"  moved bytes={human_bytes(bytes_moved)}")
             print(f"  report={report_path}")
@@ -538,12 +553,13 @@ def status(args):
         journal.close()
 
 
-def print_summary(run_id, attempted, planned, moved, reconciled, skipped, failed, bytes_moved):
+def print_summary(run_id, attempted, planned, moved, reconciled, stale, skipped, failed, bytes_moved):
     print(f"Run ID        : {run_id}")
     print(f"Attempted     : {attempted:,}")
     print(f"Planned       : {planned:,}")
     print(f"Moved         : {moved:,}")
     print(f"Reconciled    : {reconciled:,}")
+    print(f"Stale         : {stale:,}")
     print(f"Skipped       : {skipped:,}")
     print(f"Failed        : {failed:,}")
     print(f"Quarantined   : {human_bytes(bytes_moved)}")

@@ -466,9 +466,64 @@ class ArchiveKeeperTests(unittest.TestCase):
         self.assertIn("moved=1", output)
         self.assertIn("processed 1/4", output)
 
-    def test_version_is_1_6_6(self):
+    def test_missing_source_with_valid_keeper_is_stale_not_failed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            b.unlink()
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "quarantine", "--run-id", "stale-valid", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("Stale         : 1", result.stdout)
+            self.assertIn("Failed        : 0", result.stdout)
+            self.assertTrue(a.exists())
+            conn = __import__("sqlite3").connect(state)
+            row = conn.execute(
+                "SELECT status,message FROM actions WHERE run_id=? AND source=?",
+                ("stale-valid", str(b.resolve())),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row[0], "stale")
+            self.assertIn("source already absent", row[1])
+
+    def test_missing_source_with_missing_keeper_still_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            a.unlink()
+            b.unlink()
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "quarantine", "--run-id", "stale-no-keeper", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Failed        : 1", result.stdout)
+
+    def test_missing_source_with_wrong_size_keeper_still_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, a, b, c = self.make_report(root)
+            state = root / "state.sqlite3"
+            b.unlink()
+            a.write_bytes(b"x" * 17)
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "quarantine", "--run-id", "stale-bad-keeper", "--limit", "1", "--apply"
+                ], text=True, capture_output=True
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Failed        : 1", result.stdout)
+            self.assertIn("keeper size mismatch", result.stdout)
+
+    def test_version_is_1_6_7(self):
         from archive_keeper import __version__
-        self.assertEqual(__version__, "1.6.6")
+        self.assertEqual(__version__, "1.6.7")
 
 if __name__ == "__main__":
     unittest.main()

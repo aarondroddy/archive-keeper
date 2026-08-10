@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.7
+
+- Classify stale rmlint duplicate candidates as `stale` instead of `failed` when the source is already absent but the selected keeper still exists as a regular file and matches the report size.
+- Missing sources remain hard failures when the keeper is missing, not a regular file, the keeper size differs from the report, or an unexpected quarantine destination makes the state ambiguous.
+- Surface stale counts in quarantine progress, summaries, status output, and resumable journal state.
+
 ## 1.6.6
 
 - Changed the default quarantine directory for new runs from hidden `.ArchiveKeeper` to visible `ArchiveKeeper Quarantine`.

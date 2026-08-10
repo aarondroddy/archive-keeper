@@ -49,3 +49,7 @@ Restore checks an already-existing original against its quarantined copy with SH
 ## Visible quarantine directories (1.6.6)
 
 New runs default to `ArchiveKeeper Quarantine` on each configured NAS root. Existing runs keep using the directory recorded by their journal, including legacy `.ArchiveKeeper` trees. Archive Keeper never renames or migrates an existing quarantine automatically. Use `--quarantine-name` only when starting a new run if a custom directory name is desired.
+
+## 1.6.7 stale-report handling
+
+A duplicate source referenced by an older rmlint snapshot may already be absent after a prior cleanup. Archive Keeper records that candidate as `stale` rather than `failed` only when the selected keeper is still a regular file and matches the size recorded by the report. Missing, mismatched, or ambiguous keeper states remain failures.
