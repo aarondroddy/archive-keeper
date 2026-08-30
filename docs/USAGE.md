@@ -61,6 +61,10 @@ specific unresolved status, and `--limit` for a small first run. Verification
 defaults to 300 seconds per row; `--verify-timeout unlimited` is available only
 when explicitly requested. Retry moves use a no-clobber filesystem operation,
 so an existing or newly appearing destination is never blindly overwritten.
+For a verified different-content destination collision, retry derives a stable
+`__collision-ACTION_ID` alternate filename, preserves the occupied destination,
+and journals the alternate path actually used. If that alternate is also
+occupied by different content, the row remains failed and all files stay put.
 
 
 ## Visible quarantine directories (1.6.6)
@@ -70,3 +74,21 @@ New runs default to `ArchiveKeeper Quarantine` on each configured NAS root. Exis
 ## 1.6.7 stale-report handling
 
 A duplicate source referenced by an older rmlint snapshot may already be absent after a prior cleanup. Archive Keeper records that candidate as `stale` rather than `failed` only when the selected keeper is still a regular file and matches the size recorded by the report. Missing, mismatched, or ambiguous keeper states remain failures.
+
+
+## Sampled verification for very large retry candidates
+
+When full SHA-256 is impractical over slow NAS storage, retry can compare deterministic sampled SHA-256 windows instead:
+
+```bash
+archive-keeper retry RUN_ID --status failed --action-id ACTION_ID --sample-verify
+```
+
+This is read-only by default. Because sampled verification is not equivalent to hashing every byte, applying it requires an additional explicit acknowledgement:
+
+```bash
+archive-keeper retry RUN_ID --status failed --action-id ACTION_ID \
+  --sample-verify --allow-sample-verified --apply
+```
+
+Archive Keeper requires equal file sizes and hashes distinct 16 MiB windows at the start, 25%, 50%, 75%, and end. A mismatch in any sampled window rejects the candidate. Successful moves record `sample SHA-256 verified` in the journal. `--sample-verify` and `--deep-verify` are mutually exclusive.

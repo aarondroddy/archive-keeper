@@ -2,12 +2,14 @@
 
 ## Unreleased
 
+- Add explicit sampled SHA-256 verification for very large retry candidates, with mutation gated by `--allow-sample-verified` and journaled verification provenance.
 - Added read-only-by-default `reconcile` for classifying unresolved journal rows and applying only proven-safe journal reconciliation.
 - Added targeted, read-only-by-default `retry` for existing `failed` and `timeout` journal rows without replaying the original rmlint report.
 - Added retry status filtering, limits, deep verification, a longer 300-second default timeout, and explicit `--verify-timeout unlimited` support.
 - Retry writes `moving` before mutation, resumes interrupted `moving` rows, journals every applied outcome, and never changes the original run's overall status.
 - Added atomic no-clobber moves for retry so a destination appearing after verification cannot be overwritten.
-- Added retry regression coverage for dry runs, status selection, successful moves, interruption recovery, timeouts, and identical/different destination collisions.
+- Retry now resolves genuine different-content destination collisions with a deterministic `__collision-ACTION_ID` alternate filename, preserving the existing destination and journaling the actual alternate path used.
+- Added retry regression coverage for dry runs, status selection, successful moves, interruption recovery, timeouts, collision-safe alternate names, and fail-closed alternate-path conflicts.
 
 ## 1.6.7
 

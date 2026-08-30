@@ -227,10 +227,14 @@ archive-keeper retry full-2026-08 --verify-timeout 300 --apply
 By default, retry selects both `failed` and `timeout` rows. Use repeated
 `--status` options to narrow the selection, `--limit` for a small test, or
 `--verify-timeout unlimited` only when an intentionally unbounded verification
-is acceptable. Existing destinations are never overwritten: identical copies
-are journaled as reconciled while different-content collisions remain failures
-with both files untouched. Interrupted `moving` rows are automatically included
-on the next retry.
+is acceptable. Existing destinations are never overwritten. Identical copies
+are journaled as reconciled. When retry encounters a genuine different-content
+destination collision, it preserves the existing quarantine file and selects a
+deterministic alternate name such as `Peeps__collision-590923.ZIP`; `--apply`
+moves the source there and journals that actual destination. Dry runs show the
+alternate path without changing files or journal state. If the alternate path
+is itself occupied by different content, retry still fails closed. Interrupted
+`moving` rows are automatically included on the next retry.
 
 ## Resume after interruption
 
@@ -297,3 +301,7 @@ Before commands that inspect or act on report paths, Archive Keeper checks every
 matching `/etc/fstab` entry. If any root remains unavailable, Archive Keeper stops before
 reviewing or moving files. Use `--mount-policy check` to verify without mounting, or
 `--mount-policy ignore` only for deliberate offline report inspection.
+
+### Sampled retry verification
+
+For very large files on slow NAS storage, `retry --sample-verify` hashes deterministic 16 MiB windows at the start, 25%, 50%, 75%, and end of equal-sized keeper/source files. This is high-confidence verification, not a full-file cryptographic proof. Applying a sampled-verified retry therefore also requires the explicit `--allow-sample-verified` flag. Journal messages preserve the sampled-verification provenance.

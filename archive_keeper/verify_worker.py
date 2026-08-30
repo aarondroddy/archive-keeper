@@ -17,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-free-bytes", type=int, default=0)
     parser.add_argument("--expected-size", type=int)
     parser.add_argument("--deep-verify", action="store_true")
+    parser.add_argument("--sample-verify", action="store_true")
     parser.add_argument("--compare-a", type=Path)
     parser.add_argument("--compare-b", type=Path)
     return parser
@@ -97,7 +98,10 @@ def main() -> int:
             print(json.dumps(result), flush=True)
             return 0 if result["ok"] else 2
 
-        ok, message = files_match(args.keeper, args.source, deep_verify=args.deep_verify)
+        ok, message = files_match(
+            args.keeper, args.source,
+            deep_verify=args.deep_verify, sample_verify=args.sample_verify,
+        )
         if not ok:
             result["message"] = message
         else:

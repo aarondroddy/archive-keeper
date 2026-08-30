@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import subprocess
@@ -352,7 +353,8 @@ class ArchiveKeeperTests(unittest.TestCase):
             self.assertEqual(statuses[str(failed_source.resolve())], "failed")
             self.assertEqual(statuses[str(timeout_source.resolve())], "moved")
 
-    def test_retry_existing_different_destination_fails_closed(self):
+    def test_retry_existing_different_destination_uses_collision_safe_alternate(self):
+        from archive_keeper.core import collision_destination
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             report, keeper, source, other = self.make_report(root)
@@ -362,15 +364,104 @@ class ArchiveKeeperTests(unittest.TestCase):
             destination.write_bytes(b"different")
             self._seed_retry_action(state, "retry-conflict", 1, keeper, source, destination, "failed")
 
+            conn = __import__("sqlite3").connect(state)
+            action_id = conn.execute(
+                "SELECT id FROM actions WHERE run_id=? AND source=?",
+                ("retry-conflict", str(source.resolve())),
+            ).fetchone()[0]
+            conn.close()
+            alternate = collision_destination(destination, action_id)
+
             result = subprocess.run(
                 self._base_cli(root, report, state) + [
                     "retry", "retry-conflict", "--verify-timeout", "5", "--apply",
                 ], text=True, capture_output=True,
             )
-            self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertFalse(source.exists())
+            self.assertEqual(destination.read_bytes(), b"different")
+            self.assertTrue(alternate.exists())
+            self.assertNotEqual(alternate.read_bytes(), destination.read_bytes())
+            conn = __import__("sqlite3").connect(state)
+            row = conn.execute(
+                "SELECT destination,status,message FROM actions WHERE run_id=? AND source=?",
+                ("retry-conflict", str(source.resolve())),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row[0], str(alternate))
+            self.assertEqual(row[1], "moved")
+            self.assertIn("preserved existing destination", row[2])
+            self.assertIn("Moved          : 1", result.stdout)
+
+    def test_retry_collision_dry_run_reports_alternate_without_mutation(self):
+        from archive_keeper.core import collision_destination
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "retry-conflict-dry" / "copy.bin"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"different")
+            self._seed_retry_action(state, "retry-conflict-dry", 1, keeper, source, destination, "failed")
+            conn = __import__("sqlite3").connect(state)
+            action_id = conn.execute(
+                "SELECT id FROM actions WHERE run_id=? AND source=?",
+                ("retry-conflict-dry", str(source.resolve())),
+            ).fetchone()[0]
+            before = conn.execute(
+                "SELECT destination,status,message FROM actions WHERE run_id=? AND source=?",
+                ("retry-conflict-dry", str(source.resolve())),
+            ).fetchone()
+            conn.close()
+            alternate = collision_destination(destination, action_id)
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "retry-conflict-dry", "--verify-timeout", "5",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertTrue(source.exists())
             self.assertEqual(destination.read_bytes(), b"different")
-            self.assertIn("destination collision", result.stdout)
+            self.assertFalse(alternate.exists())
+            conn = __import__("sqlite3").connect(state)
+            after = conn.execute(
+                "SELECT destination,status,message FROM actions WHERE run_id=? AND source=?",
+                ("retry-conflict-dry", str(source.resolve())),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(after, before)
+            self.assertIn(str(alternate), result.stdout)
+
+    def test_retry_collision_alternate_already_different_fails_closed(self):
+        from archive_keeper.core import collision_destination
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "retry-conflict-alt" / "copy.bin"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"first conflict")
+            self._seed_retry_action(state, "retry-conflict-alt", 1, keeper, source, destination, "failed")
+            conn = __import__("sqlite3").connect(state)
+            action_id = conn.execute(
+                "SELECT id FROM actions WHERE run_id=? AND source=?",
+                ("retry-conflict-alt", str(source.resolve())),
+            ).fetchone()[0]
+            conn.close()
+            alternate = collision_destination(destination, action_id)
+            alternate.write_bytes(b"second conflict")
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "retry-conflict-alt", "--verify-timeout", "5", "--apply",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+            self.assertTrue(source.exists())
+            self.assertEqual(destination.read_bytes(), b"first conflict")
+            self.assertEqual(alternate.read_bytes(), b"second conflict")
+            self.assertIn("alternate destination", result.stdout)
 
     def test_retry_existing_identical_destination_reconciles_without_deleting(self):
         with tempfile.TemporaryDirectory() as td:
@@ -473,6 +564,131 @@ class ArchiveKeeperTests(unittest.TestCase):
                 move_noreplace(source, destination)
             self.assertEqual(source.read_bytes(), b"source")
             self.assertEqual(destination.read_bytes(), b"destination")
+
+
+    def test_verified_copy_noreplace_moves_and_verifies(self):
+        from archive_keeper.core import _verified_copy_noreplace
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            payload = b"verified-copy" * 10000
+            source.write_bytes(payload)
+            _verified_copy_noreplace(source, destination)
+            self.assertFalse(source.exists())
+            self.assertEqual(destination.read_bytes(), payload)
+
+    def test_verified_copy_noreplace_refuses_existing_destination(self):
+        from archive_keeper.core import _verified_copy_noreplace
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            source.write_bytes(b"source")
+            destination.write_bytes(b"existing")
+            with self.assertRaises(FileExistsError):
+                _verified_copy_noreplace(source, destination)
+            self.assertEqual(source.read_bytes(), b"source")
+            self.assertEqual(destination.read_bytes(), b"existing")
+
+    def test_verified_copy_noreplace_hash_mismatch_keeps_source_and_cleans_destination(self):
+        from archive_keeper.core import _verified_copy_noreplace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            source.write_bytes(b"source-data")
+            with patch("archive_keeper.core.sha256_file", side_effect=["a", "b"]):
+                with self.assertRaises(OSError):
+                    _verified_copy_noreplace(source, destination)
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+
+    def test_verified_copy_noreplace_unlink_failure_leaves_both_verified_copies(self):
+        from archive_keeper.core import _verified_copy_noreplace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            payload = b"source-data"
+            source.write_bytes(payload)
+            real_unlink = os.unlink
+
+            def fail_source_unlink(path, *args, **kwargs):
+                if Path(path) == source:
+                    raise OSError(errno.EIO, "simulated unlink EIO")
+                return real_unlink(path, *args, **kwargs)
+
+            with patch("archive_keeper.core.os.unlink", side_effect=fail_source_unlink):
+                with self.assertRaises(OSError):
+                    _verified_copy_noreplace(source, destination)
+            self.assertEqual(source.read_bytes(), payload)
+            self.assertEqual(destination.read_bytes(), payload)
+
+    def test_verified_copy_noreplace_copy_failure_keeps_source_and_cleans_destination(self):
+        from archive_keeper.core import _verified_copy_noreplace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            source.write_bytes(b"source-data")
+            with patch(
+                "archive_keeper.core.shutil.copyfileobj",
+                side_effect=OSError(errno.EIO, "simulated copy EIO"),
+            ):
+                with self.assertRaises(OSError):
+                    _verified_copy_noreplace(source, destination)
+            self.assertEqual(source.read_bytes(), b"source-data")
+            self.assertFalse(destination.exists())
+
+    def test_move_noreplace_link_eio_uses_verified_copy_fallback(self):
+        from archive_keeper.core import move_noreplace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            payload = b"link-eio-fallback" * 2048
+            source.write_bytes(payload)
+
+            class FakeLibc:
+                pass
+
+            with patch("archive_keeper.core.ctypes.CDLL", return_value=FakeLibc()), \
+                 patch("archive_keeper.core.os.link", side_effect=OSError(errno.EIO, "simulated link EIO")):
+                move_noreplace(source, destination)
+
+            self.assertFalse(source.exists())
+            self.assertEqual(destination.read_bytes(), payload)
+
+    def test_move_noreplace_renameat2_eio_uses_verified_copy_fallback(self):
+        from archive_keeper.core import move_noreplace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            payload = b"nas-eio-fallback" * 4096
+            source.write_bytes(payload)
+
+            class FakeRenameat2:
+                argtypes = None
+                restype = None
+                def __call__(self, *args):
+                    return -1
+
+            class FakeLibc:
+                renameat2 = FakeRenameat2()
+
+            with patch("archive_keeper.core.ctypes.CDLL", return_value=FakeLibc()), \
+                 patch("archive_keeper.core.ctypes.get_errno", return_value=errno.EIO):
+                move_noreplace(source, destination)
+
+            self.assertFalse(source.exists())
+            self.assertEqual(destination.read_bytes(), payload)
 
     def test_quarantine_identical_existing_destination_is_reconciled(self):
         with tempfile.TemporaryDirectory() as td:
@@ -716,6 +932,132 @@ class ArchiveKeeperTests(unittest.TestCase):
     def test_version_is_1_6_7(self):
         from archive_keeper import __version__
         self.assertEqual(__version__, "1.6.7")
+
+
+    def test_sampled_sha256_match_detects_match_and_sample_mismatch(self):
+        from archive_keeper.core import sampled_sha256_match
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            a = root / "a.bin"
+            b = root / "b.bin"
+            payload = bytearray((i % 251 for i in range(1024 * 1024)))
+            a.write_bytes(payload)
+            b.write_bytes(payload)
+            ok, message = sampled_sha256_match(a, b, chunk_size=64 * 1024)
+            self.assertTrue(ok, message)
+            self.assertIn("sample SHA-256 verified", message)
+
+            changed = bytearray(payload)
+            changed[len(changed) // 2] ^= 0xFF
+            b.write_bytes(changed)
+            ok, message = sampled_sha256_match(a, b, chunk_size=64 * 1024)
+            self.assertFalse(ok)
+            self.assertIn("sample SHA-256 mismatch", message)
+
+    def test_retry_sample_verify_apply_requires_explicit_allow(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "sample-guard" / "copy.bin"
+            self._seed_retry_action(state, "sample-guard", 1, keeper, source, destination, "failed")
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "sample-guard", "--sample-verify", "--apply",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+            self.assertIn("requires explicit --allow-sample-verified", result.stderr)
+
+    def test_retry_sample_verify_apply_moves_and_journals_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "sample-apply" / "copy.bin"
+            self._seed_retry_action(state, "sample-apply", 1, keeper, source, destination, "failed")
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "sample-apply", "--sample-verify",
+                    "--allow-sample-verified", "--verify-timeout", "5", "--apply",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.exists())
+            conn = __import__("sqlite3").connect(state)
+            row = conn.execute(
+                "SELECT status,message FROM actions WHERE run_id=? AND source=?",
+                ("sample-apply", str(source.resolve())),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row[0], "moved")
+            self.assertIn("sample SHA-256 verified", row[1])
+
+    def test_retry_rejects_combining_deep_and_sample_verify(self):
+        from archive_keeper.cli import build_parser, retry
+        args = build_parser().parse_args([
+            "retry", "run-id", "--deep-verify", "--sample-verify"
+        ])
+        with self.assertRaises(Exception) as ctx:
+            retry(args)
+        self.assertIn("either --deep-verify or --sample-verify", str(ctx.exception))
+
+    def test_retry_action_id_selects_exact_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mount = root / "mnt" / "MyCloud1"
+            mount.mkdir(parents=True)
+            keeper = mount / "keeper.bin"
+            source_a = mount / "a.bin"
+            source_b = mount / "b.bin"
+            keeper.write_bytes(b"same")
+            source_a.write_bytes(b"same")
+            source_b.write_bytes(b"same")
+            state_db = root / "journal.sqlite3"
+            from archive_keeper.core import Journal
+            journal = Journal(state_db)
+            try:
+                journal.create_run("retry-action-id", Path("/tmp/report.json"), "apply")
+                for source in (source_a, source_b):
+                    destination = mount / "ArchiveKeeper Quarantine" / "retry-action-id" / source.name
+                    journal.record_action(
+                        "retry-action-id", 1, keeper, source, destination,
+                        source.stat().st_size, "failed", "seed",
+                    )
+                action_a = journal.action_id("retry-action-id", source_a)
+                action_b = journal.action_id("retry-action-id", source_b)
+            finally:
+                journal.close()
+
+            self.assertIsNotNone(action_a)
+            self.assertIsNotNone(action_b)
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "archive_keeper",
+                    "--state-db", str(state_db),
+                    "--mount-policy", "ignore",
+                    "--mount-root", str(mount),
+                    "retry", "retry-action-id",
+                    "--status", "failed",
+                    "--action-id", str(action_a),
+                    "--min-free-gib", "0",
+                    "--apply",
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(source_a.exists())
+            self.assertTrue(source_b.exists())
+            journal = Journal(state_db)
+            try:
+                statuses = {row[2]: row[5] for row in journal.iter_actions("retry-action-id", ("moved", "failed"))}
+            finally:
+                journal.close()
+            self.assertEqual(statuses[str(source_a.resolve())], "moved")
+            self.assertEqual(statuses[str(source_b.resolve())], "failed")
 
 if __name__ == "__main__":
     unittest.main()

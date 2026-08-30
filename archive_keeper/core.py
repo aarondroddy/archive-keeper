@@ -287,7 +287,69 @@ def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def files_match(a: Path, b: Path, deep_verify: bool = False) -> tuple[bool, str]:
+def sampled_sha256_match(
+    a: Path,
+    b: Path,
+    *,
+    chunk_size: int = 16 * 1024 * 1024,
+) -> tuple[bool, str]:
+    """Compare equal-sized files by hashing deterministic samples.
+
+    Samples are taken from the start, 25%, 50%, 75%, and end of the file.
+    This is a high-confidence verification tier, not a full-file cryptographic
+    proof, so callers must opt in explicitly before using it for mutation.
+    """
+    try:
+        sa = a.stat()
+        sb = b.stat()
+    except OSError as exc:
+        return False, f"sample verification stat failed: {exc}"
+    if not a.is_file() or not b.is_file():
+        return False, "sample verification requires regular files"
+    if sa.st_size != sb.st_size:
+        return False, "sample verification size mismatch"
+    if sa.st_dev == sb.st_dev and sa.st_ino == sb.st_ino:
+        return True, "sample SHA-256 verified: same inode"
+
+    size = sa.st_size
+    if size == 0:
+        return True, "sample SHA-256 verified: empty files"
+    chunk_size = max(1, int(chunk_size))
+    last = max(0, size - min(size, chunk_size))
+    offsets = [0, size // 4, size // 2, (size * 3) // 4, last]
+    # Small files can make sample windows overlap; duplicate offsets add no
+    # information, so hash each distinct position once.
+    offsets = list(dict.fromkeys(offsets))
+
+    def sample_digest(path: Path, offset: int) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            digest.update(handle.read(chunk_size))
+        return digest.hexdigest()
+
+    try:
+        for index, offset in enumerate(offsets, 1):
+            if sample_digest(a, offset) != sample_digest(b, offset):
+                return False, (
+                    f"sample SHA-256 mismatch at sample {index}/{len(offsets)} "
+                    f"offset={offset}"
+                )
+    except OSError as exc:
+        return False, f"sample verification read failed: {exc}"
+
+    return True, (
+        f"sample SHA-256 verified: size={size}; samples={len(offsets)}; "
+        f"chunk={chunk_size} bytes"
+    )
+
+
+def files_match(
+    a: Path,
+    b: Path,
+    deep_verify: bool = False,
+    sample_verify: bool = False,
+) -> tuple[bool, str]:
     try:
         sa = a.stat()
         sb = b.stat()
@@ -299,8 +361,12 @@ def files_match(a: Path, b: Path, deep_verify: bool = False) -> tuple[bool, str]
         return False, "size mismatch"
     if sa.st_dev == sb.st_dev and sa.st_ino == sb.st_ino:
         return True, "same inode"
+    if deep_verify and sample_verify:
+        return False, "cannot combine full SHA-256 and sampled SHA-256 verification"
     if deep_verify:
         return (sha256_file(a) == sha256_file(b), "sha256 verification")
+    if sample_verify:
+        return sampled_sha256_match(a, b)
     return True, "size verified; report trusted"
 
 
@@ -313,6 +379,7 @@ def bounded_quarantine_preflight(
     source_root: Path,
     *,
     deep_verify: bool = False,
+    sample_verify: bool = False,
     min_free_bytes: int = 0,
     expected_size: int | None = None,
     timeout: float | None = 30.0,
@@ -338,6 +405,8 @@ def bounded_quarantine_preflight(
         cmd.extend(["--expected-size", str(int(expected_size))])
     if deep_verify:
         cmd.append("--deep-verify")
+    if sample_verify:
+        cmd.append("--sample-verify")
 
     proc = subprocess.Popen(
         cmd,
@@ -436,14 +505,84 @@ def quarantine_destination(
     return mount_root / quarantine_name / run_id / rel
 
 
-def move_noreplace(source: Path, destination: Path) -> None:
-    """Atomically rename a file without replacing an existing destination.
+def collision_destination(destination: Path, action_id: int) -> Path:
+    """Return a deterministic alternate path for a genuine destination collision.
 
-    Linux ``renameat2(RENAME_NOREPLACE)`` closes the check/rename race that a
-    separate ``Path.exists()`` check would leave open.  Some filesystems do not
-    implement that flag; for regular files, a hard-link/unlink fallback retains
-    no-clobber and interruption-safe behavior.  If neither primitive is
-    supported, fail closed instead of risking an overwrite.
+    The action id makes the alternate name stable across retries and directly
+    traceable back to the journal row.  The original suffix (including its
+    case) is preserved.
+    """
+    destination = normalize_path(destination)
+    return destination.with_name(
+        f"{destination.stem}__collision-{int(action_id)}{destination.suffix}"
+    )
+
+
+def _verified_copy_noreplace(source: Path, destination: Path) -> None:
+    """Copy without clobbering, verify SHA-256, then remove the source.
+
+    This is a conservative fallback for filesystems that return ``EIO`` for a
+    no-replace rename/link even though ordinary reads and writes still work.
+    The source is never unlinked until a complete destination copy has been
+    flushed, fsynced, and cryptographically verified.
+    """
+    fd: Optional[int] = None
+    destination_created = False
+    verified = False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+
+    try:
+        fd = os.open(destination, flags, 0o600)
+        destination_created = True
+
+        with source.open("rb") as src, os.fdopen(fd, "wb") as dst:
+            fd = None  # ownership transferred to dst
+            shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+
+        if sha256_file(source) != sha256_file(destination):
+            raise OSError(
+                errno.EIO,
+                "verified copy fallback failed SHA-256 verification",
+                str(destination),
+            )
+        verified = True
+
+        # Metadata is useful but secondary to preserving file contents.
+        try:
+            shutil.copystat(source, destination)
+        except OSError:
+            pass
+
+        # If this fails, both verified copies remain for reconciliation.
+        os.unlink(source)
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        # Before verification, a partial/new destination must not linger. After
+        # verification, retain it if source unlink failed: two good copies are
+        # safer than deleting the newly verified one during error handling.
+        if destination_created and not verified:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def move_noreplace(source: Path, destination: Path) -> None:
+    """Move a regular file without ever replacing an existing destination.
+
+    Prefer Linux ``renameat2(RENAME_NOREPLACE)``. If that primitive is not
+    supported, retain the existing hard-link/unlink fallback. Some NAS-backed
+    filesystems return ``EIO`` for no-replace operations while still supporting
+    reliable reads/writes; for that specific failure, use an exclusive copy,
+    full SHA-256 verification, and only then unlink the source.
     """
     source_b = os.fsencode(source)
     destination_b = os.fsencode(destination)
@@ -465,6 +604,9 @@ def move_noreplace(source: Path, destination: Path) -> None:
         if renameat2(at_fdcwd, source_b, at_fdcwd, destination_b, rename_noreplace) == 0:
             return
         error_number = ctypes.get_errno()
+        if error_number == errno.EIO:
+            _verified_copy_noreplace(source, destination)
+            return
         if error_number not in unsupported:
             raise OSError(error_number, os.strerror(error_number), str(destination))
 
@@ -473,6 +615,9 @@ def move_noreplace(source: Path, destination: Path) -> None:
     except OSError as exc:
         if exc.errno == errno.EEXIST:
             raise
+        if exc.errno == errno.EIO:
+            _verified_copy_noreplace(source, destination)
+            return
         raise OSError(
             exc.errno,
             "filesystem cannot perform a no-clobber move; source left untouched",
@@ -546,6 +691,13 @@ class Journal:
             (run_id, str(source)),
         ).fetchone()
         return row[0] if row else None
+
+    def action_id(self, run_id: str, source: Path) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT id FROM actions WHERE run_id=? AND source=?",
+            (run_id, str(source)),
+        ).fetchone()
+        return int(row[0]) if row else None
 
     def infer_quarantine_name(self, run_id: str, mount_roots: list[Path]) -> Optional[str]:
         """Infer the quarantine directory name already journaled for a run.

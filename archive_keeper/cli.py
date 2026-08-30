@@ -16,6 +16,7 @@ from .core import (
     ArchiveKeeperError,
     Journal,
     choose_keeper,
+    collision_destination,
     export_plan_csv,
     bounded_quarantine_preflight,
     bounded_files_identical,
@@ -196,8 +197,26 @@ def build_parser():
         help="SHA-256 both keeper and source before moving.",
     )
     retry_parser.add_argument(
+        "--sample-verify", action="store_true",
+        help=(
+            "Compare keeper/source using deterministic sampled SHA-256 windows "
+            "instead of hashing the entire file."
+        ),
+    )
+    retry_parser.add_argument(
+        "--allow-sample-verified", action="store_true",
+        help=(
+            "Permit --apply when --sample-verify succeeds. Required because "
+            "sampled verification is high-confidence, not a full-file proof."
+        ),
+    )
+    retry_parser.add_argument(
         "--limit", type=int, default=0,
         help="Process at most this many selected journal rows; 0 means no limit.",
+    )
+    retry_parser.add_argument(
+        "--action-id", type=int,
+        help="Retry exactly one journal action id from this run.",
     )
     retry_parser.add_argument(
         "--verify-timeout", type=verification_timeout, default=300.0,
@@ -598,6 +617,16 @@ def retry(args):
         raise ArchiveKeeperError("--limit cannot be negative")
     if args.min_free_gib < 0:
         raise ArchiveKeeperError("--min-free-gib cannot be negative")
+    sample_verify = bool(getattr(args, "sample_verify", False))
+    allow_sample_verified = bool(getattr(args, "allow_sample_verified", False))
+    if args.deep_verify and sample_verify:
+        raise ArchiveKeeperError("choose either --deep-verify or --sample-verify, not both")
+    if allow_sample_verified and not sample_verify:
+        raise ArchiveKeeperError("--allow-sample-verified requires --sample-verify")
+    if args.apply and sample_verify and not allow_sample_verified:
+        raise ArchiveKeeperError(
+            "--apply with --sample-verify requires explicit --allow-sample-verified"
+        )
 
     roots, _preferred, protected, excluded = configured(args)
     selected_statuses = tuple(dict.fromkeys(args.status or ("failed", "timeout")))
@@ -608,6 +637,13 @@ def retry(args):
     planned = moved = reconciled = stale = failed = timed_out = bytes_moved = 0
     try:
         rows = list(journal.iter_actions(args.run_id, query_statuses))
+        if getattr(args, "action_id", None) is not None:
+            if args.action_id <= 0:
+                raise ArchiveKeeperError("--action-id must be a positive integer")
+            rows = [
+                row for row in rows
+                if journal.action_id(args.run_id, normalize_path(row[2])) == args.action_id
+            ]
         if args.limit:
             rows = rows[:args.limit]
         if not rows:
@@ -665,11 +701,79 @@ def retry(args):
                 destination,
                 source_root,
                 deep_verify=args.deep_verify,
+                sample_verify=sample_verify,
                 min_free_bytes=needed,
                 expected_size=size,
                 timeout=args.verify_timeout,
             )
-            if not ok:
+            if not ok and outcome == "destination-conflict":
+                action_id = journal.action_id(args.run_id, source)
+                if action_id is None:
+                    failed += 1
+                    detail = "retry could not resolve journal action id for collision"
+                    if args.apply:
+                        journal.record_action(
+                            args.run_id, group_id, keeper, source, destination, size,
+                            "failed", f"retry: previous status={old_status}; {detail}",
+                        )
+                    tracker.result("REFUSED", detail, counter="failed")
+                    continue
+
+                original_destination = destination
+                alternate = collision_destination(destination, action_id)
+                alternate_root = mount_root_for(alternate, roots)
+                if alternate_root != source_root or alternate == source:
+                    failed += 1
+                    detail = f"unsafe alternate collision destination: {alternate}"
+                    if args.apply:
+                        journal.record_action(
+                            args.run_id, group_id, keeper, source, original_destination, size,
+                            "failed", f"retry: previous status={old_status}; {detail}",
+                        )
+                    tracker.result("REFUSED", detail, counter="failed")
+                    continue
+
+                original_conflict = verify_message
+                alt_ok, alt_message, alt_timeout, alt_outcome = bounded_quarantine_preflight(
+                    keeper,
+                    source,
+                    alternate,
+                    source_root,
+                    deep_verify=args.deep_verify,
+                    sample_verify=sample_verify,
+                    min_free_bytes=needed,
+                    expected_size=size,
+                    timeout=args.verify_timeout,
+                )
+                if not alt_ok:
+                    new_status = "timeout" if alt_timeout else "failed"
+                    if alt_timeout:
+                        timed_out += 1
+                        label, counter = "TIMEOUT", "timeout"
+                    else:
+                        failed += 1
+                        label, counter = "FAILED", "failed"
+                    detail = (
+                        f"{original_conflict}; alternate destination {alternate}: {alt_message}"
+                    )
+                    if args.apply:
+                        journal.record_action(
+                            args.run_id, group_id, keeper, source, original_destination, size,
+                            new_status, f"retry: previous status={old_status}; {detail}",
+                        )
+                    tracker.result(label, detail, counter=counter)
+                    continue
+
+                destination = alternate
+                verify_message = (
+                    f"{original_conflict}; preserved existing destination; "
+                    f"alternate destination={alternate}; {alt_message}"
+                )
+                ok = alt_ok
+                did_timeout = alt_timeout
+                outcome = alt_outcome
+
+            if not ok and outcome != "destination-conflict":
                 new_status = "timeout" if did_timeout else "failed"
                 if did_timeout:
                     timed_out += 1
@@ -726,7 +830,7 @@ def retry(args):
 
             planned += 1
             if not args.apply:
-                tracker.result("VERIFIED / WOULD QUARANTINE", str(source), counter="verified")
+                tracker.result("VERIFIED / WOULD QUARANTINE", f"{source} -> {destination}", counter="verified")
                 continue
 
             try:
