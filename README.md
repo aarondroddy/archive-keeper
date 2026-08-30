@@ -1,11 +1,11 @@
-# Archive Keeper 1.6.7
+# Archive Keeper 1.6.8
 
 Archive Keeper turns an existing `rmlint.json` scan into a safe, reviewable,
 resumable deduplication workflow. It never runs `rmlint.sh` and never deletes
 files directly: duplicates are moved into a per-NAS quarantine tree and every
 action is journaled for restoration.
 
-## 1.6.7 highlights
+## 1.6.8 highlights
 
 - New quarantine runs use a visible `ArchiveKeeper Quarantine` directory on each NAS root so quarantined files can be browsed in NAS/mobile file apps that hide dot-directories.
 - Existing runs automatically reuse their journaled quarantine directory (including legacy `.ArchiveKeeper`) when resumed; nothing is renamed or migrated.

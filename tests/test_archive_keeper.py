@@ -929,9 +929,9 @@ class ArchiveKeeperTests(unittest.TestCase):
             self.assertIn("Failed        : 1", result.stdout)
             self.assertIn("keeper size mismatch", result.stdout)
 
-    def test_version_is_1_6_7(self):
+    def test_version_is_1_6_8(self):
         from archive_keeper import __version__
-        self.assertEqual(__version__, "1.6.7")
+        self.assertEqual(__version__, "1.6.8")
 
 
     def test_sampled_sha256_match_detects_match_and_sample_mismatch(self):
