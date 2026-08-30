@@ -35,7 +35,7 @@ DEFAULT_ROOTS = [Path("/mnt/MyCloud1"), Path("/mnt/MyCloud2"), Path("/mnt/MyClou
 DEFAULT_QUARANTINE_NAME = "ArchiveKeeper Quarantine"
 LEGACY_QUARANTINE_NAME = ".ArchiveKeeper"
 
-MOUNTED_COMMANDS = {"analyze", "tui", "review", "search", "inspect", "keep", "folders", "plan", "quarantine"}
+MOUNTED_COMMANDS = {"analyze", "tui", "review", "search", "inspect", "keep", "folders", "plan", "quarantine", "reconcile"}
 
 
 def path_list(values):
@@ -145,6 +145,20 @@ def build_parser():
     restore.add_argument(
         "--verify-timeout", type=float, default=30.0,
         help="Maximum seconds to wait when hashing an existing restore destination (default: 30)."
+    )
+
+    reconcile_parser = sub.add_parser(
+        "reconcile",
+        help="Audit unresolved journal actions against live source/quarantine state.",
+    )
+    reconcile_parser.add_argument("run_id")
+    reconcile_parser.add_argument(
+        "--apply", action="store_true",
+        help="Update only proven-safe journal rows; never move or delete files.",
+    )
+    reconcile_parser.add_argument(
+        "--verify-timeout", type=float, default=300.0,
+        help="Maximum seconds for each SHA-256 comparison (default: 300).",
     )
 
     status = sub.add_parser("status", help="Show journaled runs.")
@@ -531,6 +545,83 @@ def restore(args):
         journal.close()
 
 
+
+def reconcile(args):
+    """Audit failed/timeout actions; --apply updates journal state only."""
+    journal = Journal(args.state_db.expanduser())
+    labels = ("DEST_ONLY_MATCH", "SOURCE_ONLY", "BOTH_IDENTICAL", "BOTH_DIFFERENT", "NEITHER", "ERROR")
+    counts = {label: 0 for label in labels}
+    applied = 0
+    try:
+        rows = list(journal.iter_actions(args.run_id, ("failed", "timeout")))
+        if not rows:
+            print(f"No failed/timeout actions found for run {args.run_id}")
+            return 0
+        tracker = ProgressTracker("Reconcile", total=len(rows))
+        for index, row in enumerate(rows, 1):
+            group_id, keeper_s, source_s, dest_s, size, old_status, old_message = row
+            keeper, source, destination = Path(keeper_s), Path(source_s), Path(dest_s)
+            tracker.current(index, "CHECKING", str(source))
+            try:
+                src, dst = source.exists(), destination.exists()
+                if not src and not dst:
+                    result, detail = "NEITHER", "source and quarantine destination are both absent"
+                elif src and not dst:
+                    actual = source.stat().st_size
+                    result, detail = "SOURCE_ONLY", f"source exists; size={actual}; expected={size}"
+                elif not src and dst:
+                    destination_size = destination.stat().st_size
+                    if destination_size != size:
+                        result, detail = "BOTH_DIFFERENT", f"destination size={destination_size}; expected={size}"
+                    elif not keeper.exists() or not keeper.is_file():
+                        result, detail = "ERROR", "keeper unavailable for destination verification"
+                    elif keeper.stat().st_size != size:
+                        result, detail = "BOTH_DIFFERENT", f"keeper size={keeper.stat().st_size}; expected={size}"
+                    else:
+                        identical, msg, timed_out = bounded_files_identical(keeper, destination, timeout=args.verify_timeout)
+                        if identical:
+                            result, detail = "DEST_ONLY_MATCH", f"destination SHA-256 matches keeper; {msg}"
+                        elif timed_out:
+                            result, detail = "ERROR", msg
+                        else:
+                            result, detail = "BOTH_DIFFERENT", f"destination differs from keeper; {msg}"
+                else:
+                    source_size, destination_size = source.stat().st_size, destination.stat().st_size
+                    if source_size != destination_size:
+                        result, detail = "BOTH_DIFFERENT", f"source size={source_size}; destination size={destination_size}"
+                    else:
+                        identical, msg, timed_out = bounded_files_identical(source, destination, timeout=args.verify_timeout)
+                        if identical:
+                            result, detail = "BOTH_IDENTICAL", msg
+                        elif timed_out:
+                            result, detail = "ERROR", msg
+                        else:
+                            result, detail = "BOTH_DIFFERENT", msg
+            except OSError as exc:
+                result, detail = "ERROR", str(exc)
+            counts[result] += 1
+            print(f"{index:04d}/{len(rows)}  {result:<16} old={old_status:<7}  {source}")
+            print(f"  {detail}")
+            if args.apply and result in ("DEST_ONLY_MATCH", "BOTH_IDENTICAL"):
+                journal.record_action(args.run_id, group_id, keeper, source, destination, size, "reconciled", f"reconcile: {result}; previous status={old_status}; {detail}")
+                applied += 1
+                tracker.result("RECONCILED", str(source), counter="reconciled")
+            else:
+                tracker.result(result, str(source), counter=result.lower())
+        tracker.finish("complete")
+        print("\nReconciliation summary")
+        for label in labels:
+            print(f"{label:<18} {counts[label]:>8,}")
+        safe = counts["DEST_ONLY_MATCH"] + counts["BOTH_IDENTICAL"]
+        print(f"{'SAFE_TO_RECONCILE':<18} {safe:>8,}")
+        if args.apply:
+            print(f"{'JOURNAL_UPDATED':<18} {applied:>8,}")
+        else:
+            print("\nDry run only. Add --apply to update proven-safe journal rows.")
+        return 1 if counts["ERROR"] else 0
+    finally:
+        journal.close()
+
 def status(args):
     journal = Journal(args.state_db.expanduser())
     try:
@@ -584,6 +675,8 @@ def main(argv=None):
             return quarantine(args)
         if args.command == "restore":
             return restore(args)
+        if args.command == "reconcile":
+            return reconcile(args)
         if args.command == "status":
             return status(args)
         if args.command == "review":
