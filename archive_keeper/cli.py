@@ -23,6 +23,7 @@ from .core import (
     load_rmlint_groups,
     mount_root_for,
     normalize_path,
+    move_noreplace,
     path_is_within,
     quarantine_destination,
 )
@@ -35,11 +36,27 @@ DEFAULT_ROOTS = [Path("/mnt/MyCloud1"), Path("/mnt/MyCloud2"), Path("/mnt/MyClou
 DEFAULT_QUARANTINE_NAME = "ArchiveKeeper Quarantine"
 LEGACY_QUARANTINE_NAME = ".ArchiveKeeper"
 
-MOUNTED_COMMANDS = {"analyze", "tui", "review", "search", "inspect", "keep", "folders", "plan", "quarantine", "reconcile"}
+MOUNTED_COMMANDS = {"analyze", "tui", "review", "search", "inspect", "keep", "folders", "plan", "quarantine", "reconcile", "retry"}
 
 
 def path_list(values):
     return [normalize_path(v) for v in (values or [])]
+
+
+def verification_timeout(value: str) -> float | None:
+    if value.strip().lower() == "unlimited":
+        return None
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("use a positive number of seconds or 'unlimited'") from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("timeout must be greater than zero, or use 'unlimited'")
+    return seconds
+
+
+def timeout_label(value: float | None) -> str:
+    return "unlimited" if value is None else f"{value:g}s"
 
 
 def build_parser():
@@ -159,6 +176,36 @@ def build_parser():
     reconcile_parser.add_argument(
         "--verify-timeout", type=float, default=300.0,
         help="Maximum seconds for each SHA-256 comparison (default: 300).",
+    )
+
+    retry_parser = sub.add_parser(
+        "retry",
+        help="Retry only unresolved journal actions from an existing run.",
+    )
+    retry_parser.add_argument("run_id")
+    retry_parser.add_argument(
+        "--status", action="append", choices=("failed", "timeout"),
+        help="Retry this unresolved status; repeat as needed (default: failed and timeout).",
+    )
+    retry_parser.add_argument(
+        "--apply", action="store_true",
+        help="Move verified retry candidates and update their journal rows. Default is read-only.",
+    )
+    retry_parser.add_argument(
+        "--deep-verify", action="store_true",
+        help="SHA-256 both keeper and source before moving.",
+    )
+    retry_parser.add_argument(
+        "--limit", type=int, default=0,
+        help="Process at most this many selected journal rows; 0 means no limit.",
+    )
+    retry_parser.add_argument(
+        "--verify-timeout", type=verification_timeout, default=300.0,
+        help="Maximum seconds per verification (default: 300); use 'unlimited' explicitly for no limit.",
+    )
+    retry_parser.add_argument(
+        "--min-free-gib", type=float, default=1.0,
+        help="Require this much free space on the source NAS (default: 1).",
     )
 
     status = sub.add_parser("status", help="Show journaled runs.")
@@ -545,6 +592,187 @@ def restore(args):
         journal.close()
 
 
+def retry(args):
+    """Retry selected unresolved rows without reloading the rmlint report."""
+    if args.limit < 0:
+        raise ArchiveKeeperError("--limit cannot be negative")
+    if args.min_free_gib < 0:
+        raise ArchiveKeeperError("--min-free-gib cannot be negative")
+
+    roots, _preferred, protected, excluded = configured(args)
+    selected_statuses = tuple(dict.fromkeys(args.status or ("failed", "timeout")))
+    # A SIGINT or power loss can leave the current row at "moving". Always
+    # include it so retry is resumable even when the user filters old statuses.
+    query_statuses = (*selected_statuses, "moving")
+    journal = Journal(args.state_db.expanduser())
+    planned = moved = reconciled = stale = failed = timed_out = bytes_moved = 0
+    try:
+        rows = list(journal.iter_actions(args.run_id, query_statuses))
+        if args.limit:
+            rows = rows[:args.limit]
+        if not rows:
+            joined = ", ".join(selected_statuses)
+            print(f"No retryable actions with status {joined} found for run {args.run_id}")
+            return 0
+
+        print(
+            f"Retrying run {args.run_id}: statuses={','.join(selected_statuses)}; "
+            f"rows={len(rows):,}; verification timeout={timeout_label(args.verify_timeout)}"
+        )
+        if not args.apply:
+            print("Read-only dry run: files and journal rows will remain unchanged.")
+
+        tracker = ProgressTracker("Retry", total=len(rows))
+        needed = int(args.min_free_gib * 1024**3)
+        for index, row in enumerate(rows, 1):
+            group_id, keeper_s, source_s, destination_s, size, old_status, _old_message = row
+            keeper = normalize_path(keeper_s)
+            source = normalize_path(source_s)
+            destination = normalize_path(destination_s)
+            tracker.current(
+                index,
+                f"VERIFYING timeout={timeout_label(args.verify_timeout)}",
+                str(source),
+            )
+
+            source_root = mount_root_for(source, roots)
+            destination_root = mount_root_for(destination, roots)
+            safety_error = None
+            if source_root is None:
+                safety_error = "source is outside allowed mount roots"
+            elif destination_root != source_root:
+                safety_error = "journal destination is not on the source mount root"
+            elif source == destination:
+                safety_error = "journal source and destination are identical paths"
+            elif _is_excluded(source, excluded):
+                safety_error = "source is beneath an excluded root"
+            elif _is_excluded(source, protected):
+                safety_error = "source is beneath a protected root"
+
+            if safety_error:
+                failed += 1
+                if args.apply:
+                    journal.record_action(
+                        args.run_id, group_id, keeper, source, destination, size,
+                        "failed", f"retry refused: previous status={old_status}; {safety_error}",
+                    )
+                tracker.result("REFUSED", safety_error, counter="failed")
+                continue
+
+            ok, verify_message, did_timeout, outcome = bounded_quarantine_preflight(
+                keeper,
+                source,
+                destination,
+                source_root,
+                deep_verify=args.deep_verify,
+                min_free_bytes=needed,
+                expected_size=size,
+                timeout=args.verify_timeout,
+            )
+            if not ok:
+                new_status = "timeout" if did_timeout else "failed"
+                if did_timeout:
+                    timed_out += 1
+                    label, counter = "TIMEOUT", "timeout"
+                else:
+                    failed += 1
+                    label, counter = "FAILED", "failed"
+                if args.apply:
+                    journal.record_action(
+                        args.run_id, group_id, keeper, source, destination, size,
+                        new_status,
+                        f"retry: previous status={old_status}; {verify_message}",
+                    )
+                tracker.result(label, verify_message, counter=counter)
+                continue
+
+            if outcome == "destination-identical":
+                reconciled += 1
+                if args.apply:
+                    journal.record_action(
+                        args.run_id, group_id, keeper, source, destination, size,
+                        "reconciled",
+                        f"retry: existing destination is identical; previous status={old_status}; {verify_message}",
+                    )
+                    label = "RECONCILED / BOTH KEPT"
+                else:
+                    label = "WOULD RECONCILE / BOTH KEPT"
+                tracker.result(label, str(source), counter="reconciled")
+                continue
+
+            if outcome == "source-missing-keeper-valid":
+                stale += 1
+                if args.apply:
+                    journal.record_action(
+                        args.run_id, group_id, keeper, source, destination, size,
+                        "stale", f"retry: previous status={old_status}; {verify_message}",
+                    )
+                    label = "STALE"
+                else:
+                    label = "WOULD MARK STALE"
+                tracker.result(label, str(source), counter="stale")
+                continue
+
+            if outcome != "ready":
+                failed += 1
+                detail = f"unexpected verification outcome: {outcome}; {verify_message}"
+                if args.apply:
+                    journal.record_action(
+                        args.run_id, group_id, keeper, source, destination, size,
+                        "failed", f"retry: previous status={old_status}; {detail}",
+                    )
+                tracker.result("REFUSED", detail, counter="failed")
+                continue
+
+            planned += 1
+            if not args.apply:
+                tracker.result("VERIFIED / WOULD QUARANTINE", str(source), counter="verified")
+                continue
+
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                journal.record_action(
+                    args.run_id, group_id, keeper, source, destination, size,
+                    "moving", f"retry: previous status={old_status}; {verify_message}",
+                )
+                move_noreplace(source, destination)
+                journal.record_action(
+                    args.run_id, group_id, keeper, source, destination, size,
+                    "moved", f"retry: previous status={old_status}; {verify_message}",
+                )
+                moved += 1
+                bytes_moved += size
+                tracker.result("QUARANTINED", str(source), counter="moved")
+            except OSError as exc:
+                failed += 1
+                journal.record_action(
+                    args.run_id, group_id, keeper, source, destination, size,
+                    "failed", f"retry move failed; previous status={old_status}; {exc}",
+                )
+                tracker.result("FAILED MOVE", str(exc), counter="failed")
+
+        tracker.finish("complete" if args.apply else "dry-run complete")
+        print("\nRetry summary")
+        print(f"Selected       : {len(rows):,}")
+        print(f"Verified       : {planned:,}")
+        print(f"Moved          : {moved:,}")
+        print(f"Reconciled     : {reconciled:,}")
+        print(f"Stale          : {stale:,}")
+        print(f"Timed out      : {timed_out:,}")
+        print(f"Failed         : {failed:,}")
+        print(f"Quarantined    : {human_bytes(bytes_moved)}")
+        if not args.apply:
+            print("\nDry run only. Add --apply to move verified candidates and journal results.")
+        return 1 if failed or timed_out else 0
+    except KeyboardInterrupt:
+        if "tracker" in locals():
+            tracker.finish("interrupted")
+        print(f"\nInterrupted safely. Resume with: archive-keeper retry {args.run_id} --apply")
+        return 130
+    finally:
+        journal.close()
+
+
 
 def reconcile(args):
     """Audit failed/timeout actions; --apply updates journal state only."""
@@ -677,6 +905,8 @@ def main(argv=None):
             return restore(args)
         if args.command == "reconcile":
             return reconcile(args)
+        if args.command == "retry":
+            return retry(args)
         if args.command == "status":
             return status(args)
         if args.command == "review":

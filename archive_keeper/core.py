@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -313,7 +315,7 @@ def bounded_quarantine_preflight(
     deep_verify: bool = False,
     min_free_bytes: int = 0,
     expected_size: int | None = None,
-    timeout: float = 30.0,
+    timeout: float | None = 30.0,
 ) -> tuple[bool, str, bool, str]:
     """Run live NAS validation outside the main Archive Keeper process.
 
@@ -345,7 +347,8 @@ def bounded_quarantine_preflight(
         start_new_session=True,
     )
     try:
-        stdout, stderr = proc.communicate(timeout=max(0.1, float(timeout)))
+        wait_timeout = None if timeout is None else max(0.1, float(timeout))
+        stdout, stderr = proc.communicate(timeout=wait_timeout)
     except subprocess.TimeoutExpired:
         # SIGKILL may remain pending while a CIFS request is in D state, but the
         # parent must not wait for that kernel call to recover. The helper owns
@@ -355,6 +358,12 @@ def bounded_quarantine_preflight(
         except ProcessLookupError:
             pass
         return False, f"verification timed out after {timeout:g}s", True, "timeout"
+    except KeyboardInterrupt:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise
 
     payload = (stdout or "").strip().splitlines()
     if payload:
@@ -372,7 +381,7 @@ def bounded_quarantine_preflight(
     return False, f"verification worker error: {detail}", False, "worker-error"
 
 
-def bounded_files_identical(a: Path, b: Path, *, timeout: float = 30.0) -> tuple[bool, str, bool]:
+def bounded_files_identical(a: Path, b: Path, *, timeout: float | None = 30.0) -> tuple[bool, str, bool]:
     """SHA-256 compare two live files in a bounded helper process.
 
     Returns ``(identical, message, timed_out)``. This is used for restore
@@ -388,13 +397,20 @@ def bounded_files_identical(a: Path, b: Path, *, timeout: float = 30.0) -> tuple
         start_new_session=True,
     )
     try:
-        stdout, stderr = proc.communicate(timeout=max(0.1, float(timeout)))
+        wait_timeout = None if timeout is None else max(0.1, float(timeout))
+        stdout, stderr = proc.communicate(timeout=wait_timeout)
     except subprocess.TimeoutExpired:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
         return False, f"comparison timed out after {timeout:g}s", True
+    except KeyboardInterrupt:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise
     payload = (stdout or "").strip().splitlines()
     if payload:
         try:
@@ -418,6 +434,56 @@ def quarantine_destination(
 ) -> Path:
     rel = normalize_path(source).relative_to(normalize_path(mount_root))
     return mount_root / quarantine_name / run_id / rel
+
+
+def move_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename a file without replacing an existing destination.
+
+    Linux ``renameat2(RENAME_NOREPLACE)`` closes the check/rename race that a
+    separate ``Path.exists()`` check would leave open.  Some filesystems do not
+    implement that flag; for regular files, a hard-link/unlink fallback retains
+    no-clobber and interruption-safe behavior.  If neither primitive is
+    supported, fail closed instead of risking an overwrite.
+    """
+    source_b = os.fsencode(source)
+    destination_b = os.fsencode(destination)
+    at_fdcwd = -100
+    rename_noreplace = 1
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    unsupported = {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}
+
+    if renameat2 is not None:
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        if renameat2(at_fdcwd, source_b, at_fdcwd, destination_b, rename_noreplace) == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number not in unsupported:
+            raise OSError(error_number, os.strerror(error_number), str(destination))
+
+    try:
+        os.link(source, destination)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            raise
+        raise OSError(
+            exc.errno,
+            "filesystem cannot perform a no-clobber move; source left untouched",
+            str(destination),
+        ) from exc
+    try:
+        os.unlink(source)
+    except BaseException:
+        # Both names now refer to the same inode. Leave that provably safe state
+        # for reconciliation instead of trying a second mutation while failing.
+        raise
 
 
 class Journal:

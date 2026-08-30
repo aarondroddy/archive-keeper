@@ -196,6 +196,42 @@ Apply restoration:
 archive-keeper restore pilot-25 --apply
 ```
 
+## Reconcile unresolved actions
+
+Audit the live source and quarantine state for only the `failed` and `timeout`
+rows already recorded for a run:
+
+```bash
+archive-keeper reconcile full-2026-08
+```
+
+The command is read-only unless `--apply` is supplied. Applying reconciliation
+updates only journal rows proven safe (`DEST_ONLY_MATCH` and `BOTH_IDENTICAL`);
+it does not move, delete, or overwrite either copy.
+
+## Targeted retry
+
+Preview retries directly from unresolved journal rows without replaying the
+original rmlint report:
+
+```bash
+archive-keeper retry full-2026-08 --verify-timeout 300
+```
+
+Apply verified retries:
+
+```bash
+archive-keeper retry full-2026-08 --verify-timeout 300 --apply
+```
+
+By default, retry selects both `failed` and `timeout` rows. Use repeated
+`--status` options to narrow the selection, `--limit` for a small test, or
+`--verify-timeout unlimited` only when an intentionally unbounded verification
+is acceptable. Existing destinations are never overwritten: identical copies
+are journaled as reconciled while different-content collisions remain failures
+with both files untouched. Interrupted `moving` rows are automatically included
+on the next retry.
+
 ## Resume after interruption
 
 Repeat the quarantine command with the same run ID. Already handled files are

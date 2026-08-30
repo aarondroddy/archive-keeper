@@ -38,12 +38,29 @@ Before real use, verify the installed interface:
 archive-keeper --help
 archive-keeper quarantine --help
 archive-keeper restore --help
+archive-keeper reconcile --help
+archive-keeper retry --help
 ```
 
 
 ## Restore collision verification
 
 Restore checks an already-existing original against its quarantined copy with SHA-256. The comparison is bounded by `--verify-timeout` (30 seconds by default). Identical files can be reconciled during `--apply`; different-content collisions are skipped without overwriting either file.
+
+## Reconcile and targeted retry
+
+`archive-keeper reconcile RUN_ID` audits only unresolved journal actions and is
+read-only by default. `--apply` changes journal state only for destination-only
+matches and identical source/destination pairs; it never deletes either copy.
+
+`archive-keeper retry RUN_ID` selects only unresolved `failed` and `timeout`
+journal rows, plus any interrupted `moving` row. It does not parse or replay the
+original duplicate report. Dry runs leave both files and journal rows unchanged.
+Use `--apply` to move verified source-only candidates, `--status` to select a
+specific unresolved status, and `--limit` for a small first run. Verification
+defaults to 300 seconds per row; `--verify-timeout unlimited` is available only
+when explicitly requested. Retry moves use a no-clobber filesystem operation,
+so an existing or newly appearing destination is never blindly overwritten.
 
 
 ## Visible quarantine directories (1.6.6)

@@ -282,6 +282,198 @@ class ArchiveKeeperTests(unittest.TestCase):
             "--prefer", str(root / "MyCloud1"),
         ]
 
+    def _seed_retry_action(self, state, run_id, group_id, keeper, source, destination, status):
+        from archive_keeper.core import Journal
+        journal = Journal(state)
+        journal.create_run(run_id, Path("/tmp/original-rmlint.json"), "apply")
+        journal.record_action(
+            run_id, group_id, keeper.resolve(), source.resolve(), destination.resolve(),
+            source.stat().st_size, status, f"seeded {status}",
+        )
+        journal.set_run_status(run_id, "complete")
+        journal.close()
+
+    def test_retry_dry_run_is_read_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "retry-dry" / "copy.bin"
+            self._seed_retry_action(state, "retry-dry", 1, keeper, source, destination, "timeout")
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "retry-dry", "--verify-timeout", "5",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+            conn = __import__("sqlite3").connect(state)
+            row = conn.execute(
+                "SELECT status,message FROM actions WHERE run_id=? AND source=?",
+                ("retry-dry", str(source.resolve())),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row, ("timeout", "seeded timeout"))
+            self.assertIn("Read-only dry run", result.stdout)
+            self.assertIn("Verified       : 1", result.stdout)
+
+    def test_retry_apply_moves_only_selected_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, failed_source, timeout_source = self.make_report(root)
+            state = root / "state.sqlite3"
+            failed_destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "retry-filter" / "copy.bin"
+            timeout_destination = root / "MyCloud3" / "ArchiveKeeper Quarantine" / "retry-filter" / "copy.bin"
+            self._seed_retry_action(
+                state, "retry-filter", 1, keeper, failed_source, failed_destination, "failed"
+            )
+            self._seed_retry_action(
+                state, "retry-filter", 1, keeper, timeout_source, timeout_destination, "timeout"
+            )
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "retry-filter", "--status", "timeout",
+                    "--verify-timeout", "5", "--apply",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue(failed_source.exists())
+            self.assertFalse(failed_destination.exists())
+            self.assertFalse(timeout_source.exists())
+            self.assertTrue(timeout_destination.exists())
+            conn = __import__("sqlite3").connect(state)
+            statuses = dict(conn.execute(
+                "SELECT source,status FROM actions WHERE run_id=?", ("retry-filter",)
+            ).fetchall())
+            conn.close()
+            self.assertEqual(statuses[str(failed_source.resolve())], "failed")
+            self.assertEqual(statuses[str(timeout_source.resolve())], "moved")
+
+    def test_retry_existing_different_destination_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "retry-conflict" / "copy.bin"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"different")
+            self._seed_retry_action(state, "retry-conflict", 1, keeper, source, destination, "failed")
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "retry-conflict", "--verify-timeout", "5", "--apply",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+            self.assertTrue(source.exists())
+            self.assertEqual(destination.read_bytes(), b"different")
+            self.assertIn("destination collision", result.stdout)
+
+    def test_retry_existing_identical_destination_reconciles_without_deleting(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "retry-identical" / "copy.bin"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(source.read_bytes())
+            self._seed_retry_action(state, "retry-identical", 1, keeper, source, destination, "failed")
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "retry-identical", "--verify-timeout", "5", "--apply",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue(source.exists())
+            self.assertTrue(destination.exists())
+            conn = __import__("sqlite3").connect(state)
+            status = conn.execute(
+                "SELECT status FROM actions WHERE run_id=? AND source=?",
+                ("retry-identical", str(source.resolve())),
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "reconciled")
+            self.assertIn("BOTH KEPT", result.stdout)
+
+    def test_retry_recovers_moving_row_after_interruption(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "retry-moving" / "copy.bin"
+            self._seed_retry_action(state, "retry-moving", 1, keeper, source, destination, "moving")
+
+            result = subprocess.run(
+                self._base_cli(root, report, state) + [
+                    "retry", "retry-moving", "--verify-timeout", "5", "--apply",
+                ], text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.exists())
+            conn = __import__("sqlite3").connect(state)
+            status = conn.execute(
+                "SELECT status FROM actions WHERE run_id=? AND source=?",
+                ("retry-moving", str(source.resolve())),
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "moved")
+
+    def test_retry_timeout_is_journaled_and_source_is_untouched(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from archive_keeper.cli import retry
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, keeper, source, other = self.make_report(root)
+            state = root / "state.sqlite3"
+            destination = root / "MyCloud2" / "ArchiveKeeper Quarantine" / "retry-timeout" / "copy.bin"
+            self._seed_retry_action(state, "retry-timeout", 1, keeper, source, destination, "failed")
+            args = SimpleNamespace(
+                run_id="retry-timeout", state_db=state,
+                mount_roots=[str(root / "MyCloud1"), str(root / "MyCloud2"), str(root / "MyCloud3")],
+                prefer=[], protect=[], exclude=[], status=None, limit=0,
+                min_free_gib=0, verify_timeout=300.0, deep_verify=False, apply=True,
+            )
+            with patch(
+                "archive_keeper.cli.bounded_quarantine_preflight",
+                return_value=(False, "verification timed out after 300s", True, "timeout"),
+            ):
+                result = retry(args)
+            self.assertEqual(result, 1)
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+            conn = __import__("sqlite3").connect(state)
+            status = conn.execute(
+                "SELECT status FROM actions WHERE run_id=? AND source=?",
+                ("retry-timeout", str(source.resolve())),
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "timeout")
+
+    def test_retry_accepts_explicit_unlimited_timeout(self):
+        from archive_keeper.cli import build_parser
+        args = build_parser().parse_args(["retry", "run-id", "--verify-timeout", "unlimited"])
+        self.assertIsNone(args.verify_timeout)
+
+    def test_no_clobber_move_refuses_existing_destination(self):
+        from archive_keeper.core import move_noreplace
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            source.write_bytes(b"source")
+            destination.write_bytes(b"destination")
+            with self.assertRaises(OSError):
+                move_noreplace(source, destination)
+            self.assertEqual(source.read_bytes(), b"source")
+            self.assertEqual(destination.read_bytes(), b"destination")
+
     def test_quarantine_identical_existing_destination_is_reconciled(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

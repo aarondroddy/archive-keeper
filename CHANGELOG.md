@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Added read-only-by-default `reconcile` for classifying unresolved journal rows and applying only proven-safe journal reconciliation.
+- Added targeted, read-only-by-default `retry` for existing `failed` and `timeout` journal rows without replaying the original rmlint report.
+- Added retry status filtering, limits, deep verification, a longer 300-second default timeout, and explicit `--verify-timeout unlimited` support.
+- Retry writes `moving` before mutation, resumes interrupted `moving` rows, journals every applied outcome, and never changes the original run's overall status.
+- Added atomic no-clobber moves for retry so a destination appearing after verification cannot be overwritten.
+- Added retry regression coverage for dry runs, status selection, successful moves, interruption recovery, timeouts, and identical/different destination collisions.
+
 ## 1.6.7
 
 - Classify stale rmlint duplicate candidates as `stale` instead of `failed` when the source is already absent but the selected keeper still exists as a regular file and matches the report size.
