@@ -933,6 +933,14 @@ class ArchiveKeeperTests(unittest.TestCase):
         from archive_keeper import __version__
         self.assertEqual(__version__, "1.6.8")
 
+    def test_cli_version_does_not_require_a_command(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "archive_keeper", "--version"],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "archive-keeper 1.6.8")
+
 
     def test_sampled_sha256_match_detects_match_and_sample_mismatch(self):
         from archive_keeper.core import sampled_sha256_match
