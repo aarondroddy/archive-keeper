@@ -10,6 +10,7 @@ import sys
 import secrets
 from pathlib import Path
 
+from . import __version__
 from .progress import ProgressTracker
 
 from .core import (
@@ -64,6 +65,12 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="archive-keeper",
         description="Safe, resumable quarantine workflow for rmlint duplicate reports.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show the installed Archive Keeper version and exit.",
     )
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     parser.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
