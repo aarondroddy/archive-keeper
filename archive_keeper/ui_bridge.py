@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,16 @@ def _report_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
                 "recoverable_bytes": group.recoverable_bytes,
                 "recoverable_human": human_bytes(group.recoverable_bytes),
                 "sample_path": str(group.files[0].path),
+                "files": [
+                    {
+                        "path": str(item.path),
+                        "size": item.size,
+                        "size_human": human_bytes(item.size),
+                        "original_hint": item.is_original_hint,
+                        "checksum": item.checksum,
+                    }
+                    for item in group.files
+                ],
             }
             for group in sorted(groups, key=lambda item: item.recoverable_bytes, reverse=True)[:8]
         ],
@@ -88,7 +99,7 @@ def _decision_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
         return result
 
     try:
-        with _readonly_connection(path) as connection:
+        with closing(_readonly_connection(path)) as connection:
             if _table_exists(connection, "keeper_decisions"):
                 result["keepers"] = connection.execute(
                     "SELECT COUNT(*) FROM keeper_decisions"
@@ -122,7 +133,7 @@ def _journal_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
         return result
 
     try:
-        with _readonly_connection(path) as connection:
+        with closing(_readonly_connection(path)) as connection:
             if _table_exists(connection, "runs"):
                 result["runs"] = connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
                 rows = connection.execute(
