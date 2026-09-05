@@ -87,7 +87,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func frame(title, subtitle, body string, width int, accent lipgloss.Color) string {
+func frame(title, subtitle, body string, width int, accent color.Color) string {
 	w := max(28, width-4)
 	header := lipgloss.NewStyle().Bold(true).Foreground(accent).Render(title)
 	sub := mutedText.Render(subtitle)
