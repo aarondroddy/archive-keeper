@@ -42,6 +42,8 @@ Optional environment variables let a development build use non-default inputs:
 - `ARCHIVE_KEEPER_STATE_DB`
 - `ARCHIVE_KEEPER_DECISIONS_DB`
 
-The next milestone adds interactive group inspection and explicit keeper
-selection. Mutation stays offline until preview, confirmation, and journaled
-operation messages are specified and tested end to end.
+The largest recoverable groups can be selected and opened in a copy-by-copy
+inspector. It exposes report metadata only; it does not touch the files named in
+the report. The next milestone adds explicit keeper selection. Mutation stays
+offline until preview, confirmation, and journaled operation messages are
+specified and tested end to end.
