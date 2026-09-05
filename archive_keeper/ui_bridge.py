@@ -12,6 +12,7 @@ from typing import Any
 from . import __version__
 from .cli import DEFAULT_DECISIONS, DEFAULT_REPORT, DEFAULT_STATE
 from .core import ArchiveKeeperError, human_bytes, load_rmlint_groups, normalize_path
+from .decisions import DecisionStore
 
 
 PROTOCOL_VERSION = 1
@@ -175,6 +176,46 @@ def dashboard_snapshot(report: Path, state_db: Path, decisions_db: Path) -> dict
     return snapshot
 
 
+def select_keeper(report: Path, decisions_db: Path, group_id: int, keeper: Path) -> dict[str, Any]:
+    """Validate and persist one keeper decision without touching archive files."""
+    report = normalize_path(report)
+    keeper = normalize_path(keeper)
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": False,
+        "operation": "select-keeper",
+        "files_moved": 0,
+        "group_id": group_id,
+        "keeper_path": str(keeper),
+    }
+
+    try:
+        groups = load_rmlint_groups(report)
+    except ArchiveKeeperError as exc:
+        result["error"] = str(exc)
+        return result
+
+    group = next((item for item in groups if item.group_id == group_id), None)
+    if group is None:
+        result["error"] = f"duplicate group not found in report: {group_id}"
+        return result
+    if keeper not in {normalize_path(item.path) for item in group.files}:
+        result["error"] = f"selected keeper is not a member of group {group_id}"
+        return result
+
+    try:
+        store = DecisionStore(decisions_db)
+        try:
+            store.set_keeper(group_id, keeper, "selected in Storage Galaxy UI")
+        finally:
+            store.close()
+    except (OSError, sqlite3.Error) as exc:
+        result["error"] = f"cannot save keeper decision: {exc}"
+        return result
+    result["ok"] = True
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="archive-keeper-ui-bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -182,6 +223,11 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     dashboard.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
     dashboard.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
+    keeper = subparsers.add_parser("select-keeper", help="Validate and save one keeper decision")
+    keeper.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    keeper.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
+    keeper.add_argument("--group-id", type=int, required=True)
+    keeper.add_argument("--keeper", type=Path, required=True)
     return parser
 
 
@@ -191,6 +237,11 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(dashboard_snapshot(args.report, args.state_db, args.decisions_db), sys.stdout)
         sys.stdout.write("\n")
         return 0
+    if args.command == "select-keeper":
+        result = select_keeper(args.report, args.decisions_db, args.group_id, args.keeper)
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        return 0 if result["ok"] else 1
     return 2
 
 
