@@ -48,6 +48,10 @@ type model struct {
 	dashboard     dashboardSnapshot
 	loading       bool
 	loadErr       error
+	contentFocus  bool
+	groupCursor   int
+	fileCursor    int
+	inspecting    bool
 }
 
 type dashboardSnapshot struct {
@@ -66,6 +70,12 @@ type dashboardSnapshot struct {
 			Copies           int    `json:"copies"`
 			RecoverableHuman string `json:"recoverable_human"`
 			SamplePath       string `json:"sample_path"`
+			Files            []struct {
+				Path         string `json:"path"`
+				SizeHuman    string `json:"size_human"`
+				OriginalHint bool   `json:"original_hint"`
+				Checksum     string `json:"checksum"`
+			} `json:"files"`
 		} `json:"largest_groups"`
 	} `json:"report"`
 	Decisions struct {
@@ -153,17 +163,50 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "1", "2", "3", "4", "5", "6", "7":
+			i := int(msg.String()[0] - '1')
+			m.selected, m.page = i, destinations[i].page
+			m.contentFocus = m.page == groups
+			m.inspecting = false
+			m.fileCursor = 0
+			return m, nil
+		}
+		if m.page == groups && m.contentFocus {
+			switch msg.String() {
+			case "up", "k":
+				if m.inspecting {
+					if m.fileCursor > 0 { m.fileCursor-- }
+				} else if m.groupCursor > 0 { m.groupCursor-- }
+			case "down", "j":
+				if m.inspecting {
+					files := m.currentGroupFiles()
+					if m.fileCursor < len(files)-1 { m.fileCursor++ }
+				} else if m.groupCursor < len(m.dashboard.Report.LargestGroups)-1 { m.groupCursor++ }
+			case "enter", "right", "l":
+				if len(m.dashboard.Report.LargestGroups) > 0 {
+					m.inspecting = true
+					m.fileCursor = 0
+				}
+			case "esc", "left", "h":
+				if m.inspecting {
+					m.inspecting = false
+					m.fileCursor = 0
+				} else {
+					m.contentFocus = false
+				}
+			}
+			return m, nil
+		}
+		switch msg.String() {
 		case "up", "k":
 			if m.selected > 0 { m.selected-- }
 		case "down", "j":
 			if m.selected < len(destinations)-1 { m.selected++ }
 		case "enter", "right", "l":
 			m.page = destinations[m.selected].page
+			m.contentFocus = m.page == groups
 		case "esc", "left", "h":
 			m.page = home
-		case "1", "2", "3", "4", "5", "6", "7":
-			i := int(msg.String()[0] - '1')
-			m.selected, m.page = i, destinations[i].page
 		}
 	}
 	return m, nil
@@ -219,6 +262,18 @@ func compactPath(path string, width int) string {
 	return string(characters[:left]) + "…" + string(characters[len(characters)-right:])
 }
 
+func (m model) currentGroupFiles() []struct {
+	Path         string `json:"path"`
+	SizeHuman    string `json:"size_human"`
+	OriginalHint bool   `json:"original_hint"`
+	Checksum     string `json:"checksum"`
+} {
+	if m.groupCursor < 0 || m.groupCursor >= len(m.dashboard.Report.LargestGroups) {
+		return nil
+	}
+	return m.dashboard.Report.LargestGroups[m.groupCursor].Files
+}
+
 func (m model) homeView(width int) string {
 	ready := m.loadErr == nil && m.dashboard.ProtocolVersion == 1
 	recoverable := "—"
@@ -263,15 +318,43 @@ func (m model) pageView(page screen, width int) string {
 	if m.loadErr == nil && m.dashboard.ProtocolVersion == 1 {
 		switch page {
 		case groups:
+			if m.inspecting && m.groupCursor < len(m.dashboard.Report.LargestGroups) {
+				group := m.dashboard.Report.LargestGroups[m.groupCursor]
+				files := group.Files
+				visible := max(5, m.height-18)
+				start := 0
+				if m.fileCursor >= visible { start = m.fileCursor-visible+1 }
+				end := min(len(files), start+visible)
+				lines := []string{}
+				for i := start; i < end; i++ {
+					marker := "  "
+					if i == m.fileCursor { marker = "▶ " }
+					hint := "COPY"
+					if files[i].OriginalHint { hint = "ORIGINAL HINT" }
+					line := fmt.Sprintf("%s%-13s %10s  %s", marker, hint, files[i].SizeHuman, compactPath(files[i].Path, max(20, width-39)))
+					if i == m.fileCursor {
+						line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line)
+					}
+					lines = append(lines, line)
+				}
+				lines = append(lines, "", fmt.Sprintf("Copy %d of %d · ↑↓ inspect · Esc back · no changes permitted", m.fileCursor+1, len(files)))
+				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · report inspection only", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n"), width, cyan)
+			}
 			lines := []string{}
-			for _, group := range m.dashboard.Report.LargestGroups {
-				pathWidth := max(24, width-47)
-				lines = append(lines, fmt.Sprintf("◉ Group %-5d  %d copies  %10s  %s", group.GroupID, group.Copies, group.RecoverableHuman, compactPath(group.SamplePath, pathWidth)))
+			for i, group := range m.dashboard.Report.LargestGroups {
+				marker := "  "
+				if i == m.groupCursor { marker = "▶ " }
+				pathWidth := max(18, width-64)
+				line := fmt.Sprintf("%sGroup %-5d  %2d copies  %10s  %s", marker, group.GroupID, group.Copies, group.RecoverableHuman, compactPath(group.SamplePath, pathWidth))
+				if i == m.groupCursor {
+					line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line)
+				}
+				lines = append(lines, line)
 			}
 			if len(lines) == 0 {
 				lines = append(lines, "No duplicate groups are loaded yet.")
 			}
-			v[2] = strings.Join(lines, "\n") + "\n\nLargest recoverable groups · report inspection only"
+			v[2] = strings.Join(lines, "\n") + "\n\n↑↓ select · Enter inspect copies · Esc return to menu"
 		case decisions:
 			v[2] = fmt.Sprintf("★ KEEP       %d selected originals\n◇ QUARANTINE %d staged copies\n? UNDECIDED  %d marked for attention\n\n%d favorites saved.",
 				m.dashboard.Decisions.Keepers,
@@ -309,6 +392,9 @@ func (m model) View() tea.View {
 		bridgeStatus = "Python bridge offline · " + m.loadErr.Error()
 	} else if !m.loading && m.dashboard.ProtocolVersion == 1 {
 		bridgeStatus = fmt.Sprintf("Python %s · protocol v%d · read-only", m.dashboard.Version, m.dashboard.ProtocolVersion)
+	}
+	if m.page == groups && m.contentFocus {
+		bridgeStatus = "GROUP INSPECTOR · ↑↓ select · Enter open · Esc back · read-only"
 	}
 	footerLine := keyStyle.Render(" SAFE BY DEFAULT ") + " " +
 		lipgloss.NewStyle().Foreground(lime).Render("READ-ONLY") + "  " +
