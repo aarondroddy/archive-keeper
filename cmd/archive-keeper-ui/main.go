@@ -403,7 +403,7 @@ func (m model) pageView(page screen, width int) string {
 		quarantine: {"QUARANTINE AIRLOCK", "Preview first; mutation always requires explicit confirmation", "1  Inspect the generated plan\n2  Run a bounded dry pilot\n3  Verify source and keeper\n4  Confirm --apply\n\nSafety interlocks remain owned by the Python engine."},
 		restore: {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history: {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
-		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open\nEsc or h    home\n1–7         jump to screen\nq           quit\n\nColor is never the only status signal. Destructive actions require words, state, and confirmation."},
+		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose\nH or ←      back\n1–7         jump to screen\nq           quit\n\nKeeper choices write only to decisions.sqlite3. Archive files remain untouched. Destructive actions require words, state, and confirmation."},
 	}
 	v := spec[page]
 	if m.loadErr == nil && m.dashboard.ProtocolVersion == 1 {
@@ -435,7 +435,7 @@ func (m model) pageView(page screen, width int) string {
 					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · ↑↓ inspect · Enter choose keeper · H/← back", m.fileCursor+1, len(files)))
 				}
 				if m.statusMessage != "" { lines = append(lines, "", m.statusMessage) }
-				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · report inspection only", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n"), width, cyan)
+				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · keeper decisions enabled", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n"), width, cyan)
 			}
 			lines := []string{}
 			for i, group := range m.dashboard.Report.LargestGroups {
@@ -493,8 +493,8 @@ func (m model) View() tea.View {
 	if m.page == groups && m.contentFocus {
 		bridgeStatus = "GROUP INSPECTOR · ↑↓ select · Enter open/choose · H/← back · files untouched"
 	}
-	footerLine := keyStyle.Render(" SAFE BY DEFAULT ") + " " +
-		lipgloss.NewStyle().Foreground(lime).Render("READ-ONLY") + "  " +
+	footerLine := keyStyle.Render(" FILES UNTOUCHED ") + " " +
+		lipgloss.NewStyle().Foreground(lime).Render("DECISIONS ENABLED") + "  " +
 		mutedText.Render(bridgeStatus)
 	footer := "\n" + lipgloss.NewStyle().Width(max(30, m.width-2)).Background(panel).Render(footerLine)
 	canvas := lipgloss.NewStyle().
