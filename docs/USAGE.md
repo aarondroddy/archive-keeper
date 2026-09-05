@@ -35,6 +35,7 @@ archive-keeper \
 Before real use, verify the installed interface:
 
 ```bash
+archive-keeper --version
 archive-keeper --help
 archive-keeper quarantine --help
 archive-keeper restore --help

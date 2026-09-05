@@ -91,6 +91,12 @@ sudo apt install ffmpeg chafa imagemagick poppler-utils libarchive-tools
 
 Archive Keeper still works without these packages.
 
+Verify the installed version:
+
+```bash
+archive-keeper --version
+```
+
 ## Open the visual reviewer
 
 ```bash
@@ -283,7 +289,8 @@ decisions database backed up until the quarantine has been reviewed.
 ## Documentation
 
 - [Installation](docs/INSTALL.md)
-- [Usage](docs/USAGE.md)
+- [User guide](docs/USER_GUIDE.md)
+- [Command reference](docs/USAGE.md)
 - [Safety model](docs/SAFETY.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Contributing](CONTRIBUTING.md)

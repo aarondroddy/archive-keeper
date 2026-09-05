@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+_No changes yet._
+
+## 1.6.8 — 2026-08-30
+
 - Add explicit sampled SHA-256 verification for very large retry candidates, with mutation gated by `--allow-sample-verified` and journaled verification provenance.
 - Added read-only-by-default `reconcile` for classifying unresolved journal rows and applying only proven-safe journal reconciliation.
 - Added targeted, read-only-by-default `retry` for existing `failed` and `timeout` journal rows without replaying the original rmlint report.

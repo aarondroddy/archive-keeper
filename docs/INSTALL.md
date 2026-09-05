@@ -25,11 +25,12 @@ sudo apt install python3-venv ffmpeg chafa imagemagick poppler-utils
 Run these commands from the directory containing the release files:
 
 ```bash
-sha256sum -c archive-keeper-1.5.0.tar.gz.sha256
-tar -xzf archive-keeper-1.5.0.tar.gz
+sha256sum -c archive-keeper-1.6.8.tar.gz.sha256
+tar -xzf archive-keeper-1.6.8.tar.gz
 cd archive-keeper
 ./install.sh
 source .venv/bin/activate
+archive-keeper --version
 archive-keeper --help
 ```
 
