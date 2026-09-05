@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"strings"
 
@@ -96,7 +97,7 @@ func frame(title, subtitle, body string, width int, accent lipgloss.Color) strin
 		Render(header + "\n" + sub + "\n\n" + body)
 }
 
-func metric(icon, value, label string, color lipgloss.Color) string {
+func metric(icon, value, label string, color color.Color) string {
 	return lipgloss.NewStyle().Width(20).Padding(1, 2).
 		Border(lipgloss.RoundedBorder()).BorderForeground(color).
 		Render(lipgloss.NewStyle().Bold(true).Foreground(color).Render(icon+"  "+value) + "\n" + mutedText.Render(label))
