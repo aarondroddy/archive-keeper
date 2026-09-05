@@ -30,6 +30,18 @@ The Go application will consume a versioned JSON protocol emitted by the Python
 package. It will never infer mutation success from prose output. Applied
 operations must return structured journal identifiers and terminal states.
 
-The initial shell is deliberately read-only. The next milestone adds the JSON
-bridge, real dashboard data, tests for protocol compatibility, and explicit
-confirmation flows.
+The initial shell and dashboard bridge are deliberately read-only. The Go UI
+runs `python3 -m archive_keeper.ui_bridge dashboard` asynchronously and accepts
+only protocol-versioned JSON. Existing SQLite state is opened with SQLite
+`mode=ro` and `query_only`; absent databases are reported but never created.
+
+Optional environment variables let a development build use non-default inputs:
+
+- `ARCHIVE_KEEPER_PYTHON`
+- `ARCHIVE_KEEPER_REPORT`
+- `ARCHIVE_KEEPER_STATE_DB`
+- `ARCHIVE_KEEPER_DECISIONS_DB`
+
+The next milestone adds interactive group inspection and explicit keeper
+selection. Mutation stays offline until preview, confirmation, and journaled
+operation messages are specified and tested end to end.
