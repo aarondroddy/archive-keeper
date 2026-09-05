@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from archive_keeper.ui_bridge import PROTOCOL_VERSION, dashboard_snapshot, main
+from archive_keeper.ui_bridge import PROTOCOL_VERSION, dashboard_snapshot, main, select_keeper
 
 
 class UIBridgeTests(unittest.TestCase):
@@ -118,6 +118,35 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(result, 0)
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["protocol_version"], PROTOCOL_VERSION)
+
+    def test_select_keeper_validates_membership_and_persists_decision(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "new-decisions.sqlite3"
+            selected = root / "copy-b.bin"
+
+            result = select_keeper(report, decisions, 1, selected)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["files_moved"], 0)
+            with sqlite3.connect(decisions) as connection:
+                row = connection.execute(
+                    "SELECT keeper_path, reason FROM keeper_decisions WHERE group_id=1"
+                ).fetchone()
+            self.assertEqual(row, (str(selected), "selected in Storage Galaxy UI"))
+
+    def test_select_keeper_rejects_path_outside_group_without_creating_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+
+            result = select_keeper(report, decisions, 1, root / "stranger.bin")
+
+            self.assertFalse(result["ok"])
+            self.assertIn("not a member", result["error"])
+            self.assertFalse(decisions.exists())
 
 
 if __name__ == "__main__":
