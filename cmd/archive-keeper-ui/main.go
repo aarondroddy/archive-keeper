@@ -209,6 +209,16 @@ func dashboardValue(ready bool, value int) string {
 	return strconv.Itoa(value)
 }
 
+func compactPath(path string, width int) string {
+	characters := []rune(path)
+	if width < 5 || len(characters) <= width {
+		return path
+	}
+	left := (width - 1) / 2
+	right := width - left - 1
+	return string(characters[:left]) + "…" + string(characters[len(characters)-right:])
+}
+
 func (m model) homeView(width int) string {
 	ready := m.loadErr == nil && m.dashboard.ProtocolVersion == 1
 	recoverable := "—"
@@ -255,7 +265,8 @@ func (m model) pageView(page screen, width int) string {
 		case groups:
 			lines := []string{}
 			for _, group := range m.dashboard.Report.LargestGroups {
-				lines = append(lines, fmt.Sprintf("◉ Group %-5d  %d copies  %10s  %s", group.GroupID, group.Copies, group.RecoverableHuman, group.SamplePath))
+				pathWidth := max(24, width-47)
+				lines = append(lines, fmt.Sprintf("◉ Group %-5d  %d copies  %10s  %s", group.GroupID, group.Copies, group.RecoverableHuman, compactPath(group.SamplePath, pathWidth)))
 			}
 			if len(lines) == 0 {
 				lines = append(lines, "No duplicate groups are loaded yet.")
@@ -302,8 +313,14 @@ func (m model) View() tea.View {
 	footerLine := keyStyle.Render(" SAFE BY DEFAULT ") + " " +
 		lipgloss.NewStyle().Foreground(lime).Render("READ-ONLY") + "  " +
 		mutedText.Render(bridgeStatus)
-	footer := "\n" + lipgloss.NewStyle().Width(max(30, m.width-4)).Background(panel).Render(footerLine)
-	v := tea.NewView(lipgloss.NewStyle().Background(void).Foreground(ink).Padding(1).Render(rendered + footer))
+	footer := "\n" + lipgloss.NewStyle().Width(max(30, m.width-2)).Background(panel).Render(footerLine)
+	canvas := lipgloss.NewStyle().
+		Width(max(30, m.width-2)).
+		Height(max(10, m.height-2)).
+		Background(void).
+		Foreground(ink).
+		Render(rendered + footer)
+	v := tea.NewView(lipgloss.NewStyle().Background(void).Padding(1).Render(canvas))
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
 	v.WindowTitle = "Archive Keeper · Storage Galaxy"
