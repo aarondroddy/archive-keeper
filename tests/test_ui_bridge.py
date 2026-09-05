@@ -72,6 +72,8 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(snapshot["report"]["groups"], 1)
             self.assertEqual(snapshot["report"]["files"], 3)
             self.assertEqual(snapshot["report"]["recoverable_bytes"], 8192)
+            self.assertEqual(len(snapshot["report"]["largest_groups"][0]["files"]), 3)
+            self.assertTrue(snapshot["report"]["largest_groups"][0]["files"][0]["original_hint"])
             self.assertEqual(snapshot["decisions"]["keepers"], 1)
             self.assertEqual(snapshot["decisions"]["actions"], {"QUARANTINE": 1, "UNDECIDED": 1})
             self.assertEqual(snapshot["journal"]["runs"], 1)
