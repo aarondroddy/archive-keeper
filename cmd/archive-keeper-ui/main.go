@@ -52,6 +52,9 @@ type model struct {
 	groupCursor   int
 	fileCursor    int
 	inspecting    bool
+	confirmKeeper bool
+	savingKeeper  bool
+	statusMessage string
 }
 
 type dashboardSnapshot struct {
@@ -103,6 +106,18 @@ type dashboardLoadedMsg struct {
 	err      error
 }
 
+type keeperSavedMsg struct {
+	groupID int
+	path    string
+	err     error
+}
+
+type keeperResult struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	OK              bool   `json:"ok"`
+	Error           string `json:"error"`
+}
+
 var (
 	ink       = lipgloss.Color("#EDE9FF")
 	muted     = lipgloss.Color("#918AAE")
@@ -148,6 +163,46 @@ func loadDashboard() tea.Msg {
 	return dashboardLoadedMsg{snapshot: snapshot}
 }
 
+func bridgeArgs(command string) (string, []string) {
+	python := os.Getenv("ARCHIVE_KEEPER_PYTHON")
+	if python == "" {
+		python = "python3"
+	}
+	args := []string{"-m", "archive_keeper.ui_bridge", command}
+	return python, args
+}
+
+func saveKeeper(groupID int, path string) tea.Cmd {
+	return func() tea.Msg {
+		python, args := bridgeArgs("select-keeper")
+		for _, setting := range []struct{ env, flag string }{
+			{"ARCHIVE_KEEPER_REPORT", "--report"},
+			{"ARCHIVE_KEEPER_DECISIONS_DB", "--decisions-db"},
+		} {
+			if value := os.Getenv(setting.env); value != "" {
+				args = append(args, setting.flag, value)
+			}
+		}
+		args = append(args, "--group-id", strconv.Itoa(groupID), "--keeper", path)
+		output, err := exec.Command(python, args...).CombinedOutput()
+		var result keeperResult
+		if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
+			if err != nil {
+				return keeperSavedMsg{groupID, path, fmt.Errorf("bridge command: %w", err)}
+			}
+			return keeperSavedMsg{groupID, path, fmt.Errorf("bridge JSON: %w", jsonErr)}
+		}
+		if err != nil || !result.OK {
+			message := result.Error
+			if message == "" {
+				message = "keeper decision was not saved"
+			}
+			return keeperSavedMsg{groupID, path, fmt.Errorf("%s", message)}
+		}
+		return keeperSavedMsg{groupID: groupID, path: path}
+	}
+}
+
 func (m model) Init() tea.Cmd { return loadDashboard }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -156,6 +211,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.dashboard = msg.snapshot
 		m.loadErr = msg.err
+	case keeperSavedMsg:
+		m.savingKeeper = false
+		m.confirmKeeper = false
+		if msg.err != nil {
+			m.statusMessage = "SAVE FAILED · " + msg.err.Error()
+			return m, nil
+		}
+		m.statusMessage = fmt.Sprintf("KEEPER SAVED · Group %d · no files moved", msg.groupID)
+		return m, loadDashboard
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.compact = msg.Width < 96
@@ -172,18 +236,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.page == groups && m.contentFocus {
+			if m.confirmKeeper {
+				switch msg.String() {
+				case "y", "enter":
+					if !m.savingKeeper {
+						group := m.dashboard.Report.LargestGroups[m.groupCursor]
+						file := group.Files[m.fileCursor]
+						m.savingKeeper = true
+						m.statusMessage = "SAVING KEEPER DECISION…"
+						return m, saveKeeper(group.GroupID, file.Path)
+					}
+				case "n", "esc", "left", "h":
+					m.confirmKeeper = false
+					m.statusMessage = "Keeper selection cancelled"
+				}
+				return m, nil
+			}
 			switch msg.String() {
 			case "up", "k":
 				if m.inspecting {
-					if m.fileCursor > 0 { m.fileCursor-- }
-				} else if m.groupCursor > 0 { m.groupCursor-- }
+					if m.fileCursor > 0 {
+						m.fileCursor--
+					}
+				} else if m.groupCursor > 0 {
+					m.groupCursor--
+				}
 			case "down", "j":
 				if m.inspecting {
 					files := m.currentGroupFiles()
-					if m.fileCursor < len(files)-1 { m.fileCursor++ }
-				} else if m.groupCursor < len(m.dashboard.Report.LargestGroups)-1 { m.groupCursor++ }
+					if m.fileCursor < len(files)-1 {
+						m.fileCursor++
+					}
+				} else if m.groupCursor < len(m.dashboard.Report.LargestGroups)-1 {
+					m.groupCursor++
+				}
 			case "enter", "right", "l":
-				if len(m.dashboard.Report.LargestGroups) > 0 {
+				if m.inspecting {
+					m.confirmKeeper = true
+					m.statusMessage = "Confirm keeper selection"
+				} else if len(m.dashboard.Report.LargestGroups) > 0 {
 					m.inspecting = true
 					m.fileCursor = 0
 				}
@@ -337,7 +428,13 @@ func (m model) pageView(page screen, width int) string {
 					}
 					lines = append(lines, line)
 				}
-				lines = append(lines, "", fmt.Sprintf("Copy %d of %d · ↑↓ inspect · Esc back · no changes permitted", m.fileCursor+1, len(files)))
+				if m.confirmKeeper {
+					lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("SAVE THIS COPY AS KEEPER?"),
+						"Enter/Y confirm · N/H/← cancel · this records a decision only")
+				} else {
+					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · ↑↓ inspect · Enter choose keeper · H/← back", m.fileCursor+1, len(files)))
+				}
+				if m.statusMessage != "" { lines = append(lines, "", m.statusMessage) }
 				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · report inspection only", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n"), width, cyan)
 			}
 			lines := []string{}
@@ -394,7 +491,7 @@ func (m model) View() tea.View {
 		bridgeStatus = fmt.Sprintf("Python %s · protocol v%d · read-only", m.dashboard.Version, m.dashboard.ProtocolVersion)
 	}
 	if m.page == groups && m.contentFocus {
-		bridgeStatus = "GROUP INSPECTOR · ↑↓ select · Enter open · Esc back · read-only"
+		bridgeStatus = "GROUP INSPECTOR · ↑↓ select · Enter open/choose · H/← back · files untouched"
 	}
 	footerLine := keyStyle.Render(" SAFE BY DEFAULT ") + " " +
 		lipgloss.NewStyle().Foreground(lime).Render("READ-ONLY") + "  " +
