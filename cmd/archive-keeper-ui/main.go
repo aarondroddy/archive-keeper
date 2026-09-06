@@ -356,6 +356,16 @@ func expectedApplyConfirmation() string {
 	return fmt.Sprintf("QUARANTINE UP TO %d FILES", controlledApplyLimit())
 }
 
+func appendApplyConfirmationInput(current, key string) string {
+	if key == "space" {
+		return current + " "
+	}
+	if runes := []rune(key); len(runes) == 1 {
+		return current + strings.ToUpper(key)
+	}
+	return current
+}
+
 func runControlledApply(confirmation string) tea.Cmd {
 	return func() tea.Msg {
 		python, args := bridgeArgs("quarantine-apply")
@@ -512,6 +522,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.compact = msg.Width < 96
 	case tea.KeyPressMsg:
+		shortcut := strings.ToLower(msg.String())
 		if m.confirmApply {
 			key := msg.String()
 			switch key {
@@ -532,17 +543,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.applyInput = ""
 				m.applyErr = nil
 			default:
-				if runes := []rune(key); len(runes) == 1 {
-					m.applyInput += strings.ToUpper(key)
-				}
+				m.applyInput = appendApplyConfirmationInput(m.applyInput, key)
 			}
 			return m, nil
 		}
-		switch msg.String() {
+		switch shortcut {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "1", "2", "3", "4", "5", "6", "7":
-			i := int(msg.String()[0] - '1')
+			i := int(shortcut[0] - '1')
 			m.selected, m.page = i, destinations[i].page
 			m.contentFocus = m.page == groups || m.page == quarantine
 			m.inspecting = false
@@ -561,7 +570,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.page == groups && m.contentFocus {
 			if m.confirmKeeper {
-				switch msg.String() {
+				switch shortcut {
 				case "y", "enter":
 					if !m.savingKeeper {
 						group := m.dashboard.Report.LargestGroups[m.groupCursor]
@@ -577,7 +586,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.confirmAction != "" {
-				switch msg.String() {
+				switch shortcut {
 				case "y", "enter":
 					if !m.savingAction {
 						group := m.dashboard.Report.LargestGroups[m.groupCursor]
@@ -592,7 +601,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-			switch msg.String() {
+			switch shortcut {
 			case "up", "k":
 				if m.inspecting {
 					if m.fileCursor > 0 {
@@ -647,7 +656,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.page == quarantine && m.contentFocus {
 			if m.confirmDryRun {
-				switch msg.String() {
+				switch shortcut {
 				case "y", "enter":
 					if !m.dryRunning {
 						m.dryRunning = true
@@ -659,7 +668,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-			switch msg.String() {
+			switch shortcut {
 			case "up", "k":
 				if m.planCursor > 0 { m.planCursor-- }
 			case "down", "j":
@@ -691,7 +700,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		switch msg.String() {
+		switch shortcut {
 		case "up", "k":
 			if m.selected > 0 { m.selected-- }
 		case "down", "j":
