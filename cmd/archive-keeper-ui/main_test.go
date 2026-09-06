@@ -32,3 +32,11 @@ func TestControlledApplyLimitRejectsUnsafeOverride(t *testing.T) {
 		t.Fatalf("unsafe limit override escaped the hard cap: %d", got)
 	}
 }
+
+func TestApplyConfirmationInputAcceptsNamedSpaceKey(t *testing.T) {
+	got := appendApplyConfirmationInput("QUARANTINE", "space")
+	got = appendApplyConfirmationInput(got, "u")
+	if got != "QUARANTINE U" {
+		t.Fatalf("space key was not added to confirmation input: %q", got)
+	}
+}
