@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 from collections import Counter
 from contextlib import closing
@@ -10,12 +12,27 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .cli import DEFAULT_DECISIONS, DEFAULT_REPORT, DEFAULT_STATE
-from .core import ArchiveKeeperError, human_bytes, load_rmlint_groups, normalize_path
+from .cli import (
+    DEFAULT_DECISIONS,
+    DEFAULT_QUARANTINE_NAME,
+    DEFAULT_REPORT,
+    DEFAULT_ROOTS,
+    DEFAULT_STATE,
+)
+from .core import (
+    ArchiveKeeperError,
+    human_bytes,
+    load_rmlint_groups,
+    mount_root_for,
+    normalize_path,
+    quarantine_destination,
+)
 from .decisions import DecisionStore
 
 
 PROTOCOL_VERSION = 1
+PREVIEW_RUN_ID = "storage-galaxy-preview"
+PATH_PROBE_TIMEOUT = 2.0
 
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
@@ -298,6 +315,179 @@ def set_file_action(
     return result
 
 
+def _bounded_path_probe(paths: list[Path]) -> tuple[dict[str, str], str | None]:
+    """Inspect a small set of live paths without allowing a stale NAS to hang the UI."""
+    script = (
+        "import json, os, sys\n"
+        "result = {}\n"
+        "for value in sys.argv[1:]:\n"
+        "    try:\n"
+        "        result[value] = 'file' if os.path.isfile(value) else "
+        "('exists' if os.path.exists(value) else 'missing')\n"
+        "    except OSError as exc:\n"
+        "        result[value] = 'error:' + str(exc)\n"
+        "print(json.dumps(result))\n"
+    )
+    values = [str(normalize_path(path)) for path in paths]
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script, *values],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PATH_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return {}, f"live path check exceeded {PATH_PROBE_TIMEOUT:g}s"
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "path check failed").strip()
+        return {}, detail
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {}, "live path check returned invalid data"
+    return {str(key): str(value) for key, value in payload.items()}, None
+
+
+def quarantine_plan_snapshot(
+    report: Path,
+    decisions_db: Path,
+    mount_roots: list[Path] | None = None,
+    quarantine_name: str = DEFAULT_QUARANTINE_NAME,
+    run_id: str = PREVIEW_RUN_ID,
+) -> dict[str, Any]:
+    """Build a read-only plan from explicit QUARANTINE decisions.
+
+    The destination is computed by the same helper used by the Python engine.
+    No journal rows, directories, or archive files are created.
+    """
+    report = normalize_path(report)
+    decisions_db = normalize_path(decisions_db)
+    roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
+    warnings: list[str] = []
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": False,
+        "mode": "read-only",
+        "operation": "quarantine-plan",
+        "files_moved": 0,
+        "run_id": run_id,
+        "quarantine_name": quarantine_name,
+        "total_files": 0,
+        "total_bytes": 0,
+        "total_human": human_bytes(0),
+        "ready_files": 0,
+        "blocked_files": 0,
+        "items": [],
+        "warnings": warnings,
+    }
+    try:
+        groups = load_rmlint_groups(report)
+    except ArchiveKeeperError as exc:
+        warnings.append(str(exc))
+        return result
+    group_map = {group.group_id: group for group in groups}
+
+    if not decisions_db.is_file():
+        warnings.append(f"decision database not found: {decisions_db}")
+        result["ok"] = True
+        return result
+    try:
+        with closing(_readonly_connection(decisions_db)) as connection:
+            if not _table_exists(connection, "file_decisions"):
+                result["ok"] = True
+                return result
+            staged = connection.execute(
+                "SELECT group_id, path FROM file_decisions "
+                "WHERE action='QUARANTINE' ORDER BY group_id, path"
+            ).fetchall()
+            keepers = {}
+            if _table_exists(connection, "keeper_decisions"):
+                keepers = {
+                    int(group_id): normalize_path(path)
+                    for group_id, path in connection.execute(
+                        "SELECT group_id, keeper_path FROM keeper_decisions"
+                    )
+                }
+    except sqlite3.Error as exc:
+        warnings.append(f"cannot read decision database {decisions_db}: {exc}")
+        return result
+
+    root_mounted = {root: root.is_dir() and os.path.ismount(root) for root in roots}
+    for group_id, path_text in staged:
+        source = normalize_path(path_text)
+        keeper = keepers.get(int(group_id))
+        group = group_map.get(int(group_id))
+        reasons: list[str] = []
+        destination: Path | None = None
+        size = 0
+
+        if group is None:
+            reasons.append("group is stale or absent from the current report")
+        else:
+            members = {normalize_path(item.path): item for item in group.files}
+            source_item = members.get(source)
+            if source_item is None:
+                reasons.append("source is stale or absent from the current report group")
+            else:
+                size = source_item.size
+            if keeper is None:
+                reasons.append("keeper decision is missing")
+            elif keeper not in members:
+                reasons.append("keeper is stale or absent from the current report group")
+            elif keeper == source:
+                reasons.append("keeper cannot also be quarantined")
+
+        source_root = mount_root_for(source, roots)
+        keeper_root = mount_root_for(keeper, roots) if keeper is not None else None
+        if source_root is None:
+            reasons.append("source is outside configured mount roots")
+        else:
+            destination = quarantine_destination(source, source_root, quarantine_name, run_id)
+            if not root_mounted[source_root]:
+                reasons.append(f"source mount is unavailable: {source_root}")
+        if keeper is not None:
+            if keeper_root is None:
+                reasons.append("keeper is outside configured mount roots")
+            elif not root_mounted[keeper_root]:
+                reasons.append(f"keeper mount is unavailable: {keeper_root}")
+
+        if not reasons and keeper is not None and destination is not None:
+            statuses, probe_error = _bounded_path_probe([source, keeper, destination])
+            if probe_error:
+                reasons.append(f"live validation unavailable: {probe_error}")
+            else:
+                if statuses.get(str(source)) != "file":
+                    reasons.append("source file is missing or not a regular file")
+                if statuses.get(str(keeper)) != "file":
+                    reasons.append("keeper file is missing or not a regular file")
+                destination_status = statuses.get(str(destination))
+                if destination_status != "missing":
+                    reasons.append("quarantine destination already exists (collision)")
+
+        status = "READY" if not reasons else "BLOCKED"
+        result["items"].append(
+            {
+                "group_id": int(group_id),
+                "status": status,
+                "size": size,
+                "size_human": human_bytes(size),
+                "source": str(source),
+                "keeper": str(keeper) if keeper is not None else "",
+                "destination": str(destination) if destination is not None else "",
+                "warnings": reasons,
+            }
+        )
+
+    result["total_files"] = len(result["items"])
+    result["total_bytes"] = sum(item["size"] for item in result["items"])
+    result["total_human"] = human_bytes(result["total_bytes"])
+    result["ready_files"] = sum(item["status"] == "READY" for item in result["items"])
+    result["blocked_files"] = result["total_files"] - result["ready_files"]
+    result["ok"] = True
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="archive-keeper-ui-bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -320,6 +510,14 @@ def build_parser() -> argparse.ArgumentParser:
     file_action.add_argument(
         "--action", choices=("QUARANTINE", "UNDECIDED", "CLEAR"), required=True
     )
+    preview = subparsers.add_parser(
+        "quarantine-plan", help="Emit a read-only preview of explicitly staged files"
+    )
+    preview.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    preview.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
+    preview.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
+    preview.add_argument("--quarantine-name", default=DEFAULT_QUARANTINE_NAME)
+    preview.add_argument("--run-id", default=PREVIEW_RUN_ID)
     return parser
 
 
@@ -337,6 +535,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "set-file-action":
         result = set_file_action(
             args.report, args.decisions_db, args.group_id, args.path, args.action
+        )
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        return 0 if result["ok"] else 1
+    if args.command == "quarantine-plan":
+        result = quarantine_plan_snapshot(
+            args.report,
+            args.decisions_db,
+            args.mount_roots,
+            args.quarantine_name,
+            args.run_id,
         )
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
