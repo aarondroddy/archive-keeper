@@ -15,3 +15,20 @@ func TestCompactPathKeepsBothEnds(t *testing.T) {
 		t.Fatalf("unexpected compact path: %q", got)
 	}
 }
+
+func TestControlledApplyConfirmationUsesBoundedLimit(t *testing.T) {
+	t.Setenv("ARCHIVE_KEEPER_APPLY_LIMIT", "3")
+	if got := controlledApplyLimit(); got != 3 {
+		t.Fatalf("unexpected controlled apply limit: %d", got)
+	}
+	if got := expectedApplyConfirmation(); got != "QUARANTINE UP TO 3 FILES" {
+		t.Fatalf("unexpected confirmation phrase: %q", got)
+	}
+}
+
+func TestControlledApplyLimitRejectsUnsafeOverride(t *testing.T) {
+	t.Setenv("ARCHIVE_KEEPER_APPLY_LIMIT", "999")
+	if got := controlledApplyLimit(); got != 10 {
+		t.Fatalf("unsafe limit override escaped the hard cap: %d", got)
+	}
+}
