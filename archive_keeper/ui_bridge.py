@@ -39,6 +39,7 @@ PROTOCOL_VERSION = 1
 PREVIEW_RUN_ID = "storage-galaxy-preview"
 PATH_PROBE_TIMEOUT = 2.0
 MAX_CONTROLLED_APPLY_FILES = 10
+MAX_CONTROLLED_RESTORE_FILES = 10
 
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
@@ -744,6 +745,183 @@ def controlled_quarantine_apply(
     return result
 
 
+def restore_catalog_snapshot(state_db: Path) -> dict[str, Any]:
+    """List runs that still contain quarantined files, without changing the journal."""
+    state_db = normalize_path(state_db)
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": True,
+        "mode": "read-only",
+        "operation": "restore-catalog",
+        "runs": [],
+        "warnings": [],
+    }
+    if not state_db.is_file():
+        result["warnings"].append(f"journal database not found: {state_db}")
+        return result
+    try:
+        with closing(_readonly_connection(state_db)) as connection:
+            if not (_table_exists(connection, "runs") and _table_exists(connection, "actions")):
+                return result
+            rows = connection.execute(
+                "SELECT r.run_id,r.created_at,r.mode,r.status,COUNT(a.id),"
+                "COALESCE(SUM(a.size),0) FROM runs r JOIN actions a ON a.run_id=r.run_id "
+                "WHERE a.status='moved' GROUP BY r.run_id,r.created_at,r.mode,r.status "
+                "ORDER BY r.created_at DESC LIMIT 50"
+            ).fetchall()
+            result["runs"] = [
+                {
+                    "run_id": row[0], "created_at": row[1], "mode": row[2],
+                    "status": row[3], "restorable_files": row[4],
+                    "restorable_bytes": row[5], "restorable_human": human_bytes(row[5]),
+                }
+                for row in rows
+            ]
+    except sqlite3.Error as exc:
+        result["ok"] = False
+        result["warnings"].append(f"cannot read journal database {state_db}: {exc}")
+    return result
+
+
+def restore_plan_snapshot(
+    state_db: Path, run_id: str, mount_roots: list[Path] | None = None
+) -> dict[str, Any]:
+    """Preview restoration with a fail-closed, no-overwrite policy."""
+    state_db = normalize_path(state_db)
+    roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION, "ok": False, "mode": "read-only",
+        "operation": "restore-plan", "run_id": run_id, "total_files": 0,
+        "total_bytes": 0, "total_human": human_bytes(0), "ready_files": 0,
+        "blocked_files": 0, "items": [], "warnings": [],
+    }
+    if not state_db.is_file():
+        result["warnings"].append(f"journal database not found: {state_db}")
+        return result
+    try:
+        with closing(_readonly_connection(state_db)) as connection:
+            run = connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if run is None:
+                result["warnings"].append(f"restore run not found: {run_id}")
+                return result
+            rows = connection.execute(
+                "SELECT group_id,keeper,source,destination,size FROM actions "
+                "WHERE run_id=? AND status='moved' ORDER BY id DESC", (run_id,)
+            ).fetchall()
+    except sqlite3.Error as exc:
+        result["warnings"].append(f"cannot read journal database {state_db}: {exc}")
+        return result
+
+    mounted = {root: root.is_dir() and os.path.ismount(root) for root in roots}
+    for group_id, keeper_text, source_text, destination_text, size in rows:
+        source, destination = normalize_path(source_text), normalize_path(destination_text)
+        source_root, destination_root = mount_root_for(source, roots), mount_root_for(destination, roots)
+        reasons: list[str] = []
+        if source_root is None or destination_root is None:
+            reasons.append("source or quarantine file is outside configured mount roots")
+        elif source_root != destination_root:
+            reasons.append("source and quarantine file are on different configured roots")
+        elif not mounted[source_root]:
+            reasons.append(f"restore mount is unavailable: {source_root}")
+        if not reasons:
+            statuses, probe_error = _bounded_path_probe([source, destination])
+            if probe_error:
+                reasons.append(f"live validation unavailable: {probe_error}")
+            else:
+                if statuses.get(str(destination)) != "file":
+                    reasons.append("quarantine file is missing or not a regular file")
+                if statuses.get(str(source)) != "missing":
+                    reasons.append("original path already exists (no overwrite)")
+        result["items"].append({
+            "group_id": int(group_id), "status": "READY" if not reasons else "BLOCKED",
+            "size": int(size), "size_human": human_bytes(int(size)), "source": str(source),
+            "keeper": str(normalize_path(keeper_text)), "destination": str(destination),
+            "warnings": reasons,
+        })
+    result["total_files"] = len(result["items"])
+    result["total_bytes"] = sum(item["size"] for item in result["items"])
+    result["total_human"] = human_bytes(result["total_bytes"])
+    result["ready_files"] = sum(item["status"] == "READY" for item in result["items"])
+    result["blocked_files"] = result["total_files"] - result["ready_files"]
+    result["ok"] = True
+    return result
+
+
+def controlled_restore_apply(
+    state_db: Path, run_id: str, confirmation: str,
+    mount_roots: list[Path] | None = None, limit: int = MAX_CONTROLLED_RESTORE_FILES,
+) -> dict[str, Any]:
+    """Restore a bounded set of journaled moves without replacing any path."""
+    limit = int(limit)
+    expected = f"RESTORE UP TO {limit} FILES"
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION, "ok": False, "mode": "apply",
+        "operation": "restore-apply", "run_id": run_id, "restored": 0,
+        "bytes_restored": 0, "bytes_restored_human": human_bytes(0), "failed": 0,
+        "remaining": 0, "limit": limit, "expected_confirmation": expected,
+        "items": [], "error": "",
+    }
+    if limit < 1 or limit > MAX_CONTROLLED_RESTORE_FILES:
+        result["error"] = f"controlled restore limit must be between 1 and {MAX_CONTROLLED_RESTORE_FILES}"
+        return result
+    if confirmation != expected:
+        result["error"] = f"confirmation must exactly match: {expected}"
+        return result
+    plan = restore_plan_snapshot(state_db, run_id, mount_roots)
+    if not plan["ok"]:
+        result["error"] = "; ".join(plan["warnings"]) or "cannot build restore plan"
+        return result
+    candidates = [item for item in plan["items"] if item["status"] == "READY"][:limit]
+    if not candidates:
+        result["error"] = "no quarantined files passed the final restore checks"
+        return result
+    journal: Journal | None = None
+    try:
+        journal = Journal(normalize_path(state_db))
+        for item in candidates:
+            source, destination = normalize_path(item["source"]), normalize_path(item["destination"])
+            action = {"group_id": item["group_id"], "source": str(source),
+                      "destination": str(destination), "status": "failed", "message": ""}
+            statuses, probe_error = _bounded_path_probe([source, destination])
+            message = probe_error or ""
+            if probe_error or statuses.get(str(source)) != "missing" or statuses.get(str(destination)) != "file":
+                if not message:
+                    message = "final check blocked restore: original exists or quarantine file is unavailable"
+                journal.record_action(run_id, item["group_id"], normalize_path(item["keeper"]),
+                                      source, destination, item["size"], "failed", message)
+                action["message"], result["failed"] = message, result["failed"] + 1
+                result["items"].append(action)
+                continue
+            try:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                move_noreplace(destination, source)
+            except OSError as exc:
+                journal.record_action(run_id, item["group_id"], normalize_path(item["keeper"]),
+                                      source, destination, item["size"], "failed", str(exc))
+                action["message"], result["failed"] = str(exc), result["failed"] + 1
+            else:
+                journal.record_action(run_id, item["group_id"], normalize_path(item["keeper"]),
+                                      source, destination, item["size"], "restored", "restored by UI")
+                action["status"] = "restored"
+                result["restored"] += 1
+                result["bytes_restored"] += item["size"]
+            result["items"].append(action)
+        remaining = journal.conn.execute(
+            "SELECT COUNT(*) FROM actions WHERE run_id=? AND status='moved'", (run_id,)
+        ).fetchone()[0]
+        result["remaining"] = remaining
+        journal.set_run_status(run_id, "restored" if remaining == 0 and result["failed"] == 0 else "attention")
+    except (ArchiveKeeperError, OSError, sqlite3.Error) as exc:
+        result["error"] = f"controlled restore failed: {exc}"
+        return result
+    finally:
+        if journal is not None:
+            journal.close()
+    result["bytes_restored_human"] = human_bytes(result["bytes_restored"])
+    result["ok"] = True
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="archive-keeper-ui-bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -796,6 +974,18 @@ def build_parser() -> argparse.ArgumentParser:
     apply_run.add_argument("--limit", type=int, default=MAX_CONTROLLED_APPLY_FILES)
     apply_run.add_argument("--verify-timeout", type=float, default=30.0)
     apply_run.add_argument("--confirm", required=True)
+    restore_catalog = subparsers.add_parser("restore-catalog", help="List restorable runs")
+    restore_catalog.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
+    restore_plan = subparsers.add_parser("restore-plan", help="Preview a no-overwrite restore")
+    restore_plan.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
+    restore_plan.add_argument("--run-id", required=True)
+    restore_plan.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
+    restore_apply = subparsers.add_parser("restore-apply", help="Run a bounded no-overwrite restore")
+    restore_apply.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
+    restore_apply.add_argument("--run-id", required=True)
+    restore_apply.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
+    restore_apply.add_argument("--limit", type=int, default=MAX_CONTROLLED_RESTORE_FILES)
+    restore_apply.add_argument("--confirm", required=True)
     return parser
 
 
@@ -856,7 +1046,19 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
         return 0 if result["ok"] else 1
-    return 2
+    if args.command == "restore-catalog":
+        result = restore_catalog_snapshot(args.state_db)
+    elif args.command == "restore-plan":
+        result = restore_plan_snapshot(args.state_db, args.run_id, args.mount_roots)
+    elif args.command == "restore-apply":
+        result = controlled_restore_apply(
+            args.state_db, args.run_id, args.confirm, args.mount_roots, args.limit
+        )
+    else:
+        return 2
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+    return 0 if result["ok"] else 1
 
 
 if __name__ == "__main__":
