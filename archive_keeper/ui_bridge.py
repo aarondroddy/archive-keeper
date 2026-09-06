@@ -57,7 +57,33 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
     return row is not None
 
 
-def _report_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
+def _mount_summary(roots: list[Path], mountinfo_text: str | None = None) -> dict[str, Any]:
+    """Read kernel mount metadata without issuing potentially blocking NAS stats."""
+    if mountinfo_text is None:
+        try:
+            mountinfo_text = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+        except OSError:
+            mountinfo_text = ""
+    mounted: dict[str, tuple[str, str]] = {}
+    for line in mountinfo_text.splitlines():
+        try:
+            left, right = line.split(" - ", 1)
+            mount_point = left.split()[4].replace("\\040", " ")
+            filesystem, source = right.split()[:2]
+            mounted[str(normalize_path(mount_point))] = (filesystem, source.replace("\\040", " "))
+        except (IndexError, ValueError):
+            continue
+    entries = []
+    for root in roots:
+        filesystem, source = mounted.get(str(root), ("", ""))
+        is_mounted = bool(filesystem)
+        entries.append({"path": str(root), "mounted": is_mounted, "filesystem": filesystem,
+                        "source": source, "status": "ONLINE" if is_mounted else "OFFLINE"})
+    return {"all_ready": bool(entries) and all(item["mounted"] for item in entries),
+            "roots": entries}
+
+
+def _report_summary(path: Path, warnings: list[str], roots: list[Path]) -> dict[str, Any]:
     path = normalize_path(path)
     result: dict[str, Any] = {
         "path": str(path),
@@ -92,6 +118,7 @@ def _report_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
                 "recoverable_bytes": group.recoverable_bytes,
                 "recoverable_human": human_bytes(group.recoverable_bytes),
                 "sample_path": str(group.files[0].path),
+                "mount_root": str(mount_root_for(normalize_path(group.files[0].path), roots) or "Unmapped"),
                 "files": [
                     {
                         "path": str(item.path),
@@ -103,7 +130,7 @@ def _report_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
                     for item in group.files
                 ],
             }
-            for group in sorted(groups, key=lambda item: item.recoverable_bytes, reverse=True)[:8]
+            for group in sorted(groups, key=lambda item: item.recoverable_bytes, reverse=True)[:24]
         ],
     )
     return result
@@ -194,14 +221,19 @@ def _journal_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
     return result
 
 
-def dashboard_snapshot(report: Path, state_db: Path, decisions_db: Path) -> dict[str, Any]:
+def dashboard_snapshot(
+    report: Path, state_db: Path, decisions_db: Path,
+    mount_roots: list[Path] | None = None,
+) -> dict[str, Any]:
     warnings: list[str] = []
+    roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
     snapshot = {
         "protocol_version": PROTOCOL_VERSION,
         "ok": True,
         "mode": "read-only",
         "archive_keeper_version": __version__,
-        "report": _report_summary(report, warnings),
+        "report": _report_summary(report, warnings, roots),
+        "mounts": _mount_summary(roots),
         "decisions": _decision_summary(decisions_db, warnings),
         "journal": _journal_summary(state_db, warnings),
         "warnings": warnings,
@@ -931,6 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     dashboard.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
     dashboard.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
+    dashboard.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
     keeper = subparsers.add_parser("select-keeper", help="Validate and save one keeper decision")
     keeper.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     keeper.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
@@ -994,7 +1027,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "dashboard":
-        json.dump(dashboard_snapshot(args.report, args.state_db, args.decisions_db), sys.stdout)
+        json.dump(dashboard_snapshot(args.report, args.state_db, args.decisions_db, args.mount_roots), sys.stdout)
         sys.stdout.write("\n")
         return 0
     if args.command == "select-keeper":
