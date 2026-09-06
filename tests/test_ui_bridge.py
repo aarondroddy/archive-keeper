@@ -122,6 +122,27 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(result["files_moved"], 0)
             self.assertFalse(decisions.exists())
 
+    def test_file_action_rejection_does_not_initialize_existing_database(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            with sqlite3.connect(decisions):
+                pass
+            before = self._sha256(decisions)
+
+            result = set_file_action(
+                report, decisions, 1, root / "copy-a.bin", "QUARANTINE"
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(self._sha256(decisions), before)
+            with sqlite3.connect(decisions) as connection:
+                tables = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            self.assertEqual(tables, [])
+
     def test_file_action_cannot_stage_keeper_and_can_stage_and_clear_copy(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
