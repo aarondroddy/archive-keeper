@@ -40,3 +40,9 @@ func TestApplyConfirmationInputAcceptsNamedSpaceKey(t *testing.T) {
 		t.Fatalf("space key was not added to confirmation input: %q", got)
 	}
 }
+
+func TestControlledRestoreConfirmationUsesBoundedLimit(t *testing.T) {
+	t.Setenv("ARCHIVE_KEEPER_RESTORE_LIMIT", "2")
+	if got := controlledRestoreLimit(); got != 2 { t.Fatalf("unexpected restore limit: %d", got) }
+	if got := expectedRestoreConfirmation(); got != "RESTORE UP TO 2 FILES" { t.Fatalf("unexpected restore phrase: %q", got) }
+}
