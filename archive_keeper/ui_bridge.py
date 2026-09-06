@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -21,10 +23,12 @@ from .cli import (
 )
 from .core import (
     ArchiveKeeperError,
+    Journal,
     bounded_quarantine_preflight,
     human_bytes,
     load_rmlint_groups,
     mount_root_for,
+    move_noreplace,
     normalize_path,
     quarantine_destination,
 )
@@ -34,6 +38,7 @@ from .decisions import DecisionStore
 PROTOCOL_VERSION = 1
 PREVIEW_RUN_ID = "storage-galaxy-preview"
 PATH_PROBE_TIMEOUT = 2.0
+MAX_CONTROLLED_APPLY_FILES = 10
 
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
@@ -576,6 +581,169 @@ def quarantine_dry_run(
     return result
 
 
+def controlled_quarantine_apply(
+    report: Path,
+    state_db: Path,
+    decisions_db: Path,
+    confirmation: str,
+    mount_roots: list[Path] | None = None,
+    quarantine_name: str = DEFAULT_QUARANTINE_NAME,
+    run_id: str | None = None,
+    limit: int = MAX_CONTROLLED_APPLY_FILES,
+    verify_timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Move only explicitly staged files behind a strict confirmation gate."""
+    limit = int(limit)
+    expected_confirmation = f"QUARANTINE UP TO {limit} FILES"
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": False,
+        "mode": "apply",
+        "operation": "quarantine-apply",
+        "files_moved": 0,
+        "bytes_moved": 0,
+        "bytes_moved_human": human_bytes(0),
+        "reconciled": 0,
+        "stale": 0,
+        "failed": 0,
+        "timed_out": 0,
+        "limit": limit,
+        "expected_confirmation": expected_confirmation,
+        "run_id": run_id or "",
+        "items": [],
+        "error": "",
+    }
+    if limit < 1 or limit > MAX_CONTROLLED_APPLY_FILES:
+        result["error"] = (
+            f"controlled quarantine limit must be between 1 and "
+            f"{MAX_CONTROLLED_APPLY_FILES}"
+        )
+        return result
+    if confirmation != expected_confirmation:
+        result["error"] = f"confirmation must exactly match: {expected_confirmation}"
+        return result
+
+    roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
+    run_id = run_id or (
+        f"ui-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')}-"
+        f"{secrets.token_hex(2)}"
+    )
+    result["run_id"] = run_id
+    plan = quarantine_plan_snapshot(
+        report, decisions_db, roots, quarantine_name, run_id
+    )
+    if not plan["ok"]:
+        result["error"] = "; ".join(plan["warnings"]) or "cannot build quarantine plan"
+        return result
+    candidates = [item for item in plan["items"] if item["status"] == "READY"][:limit]
+    if not candidates:
+        result["error"] = "no staged files passed the final preview checks"
+        return result
+
+    journal: Journal | None = None
+    try:
+        journal = Journal(normalize_path(state_db))
+        journal.create_run(run_id, normalize_path(report), "apply")
+        for item in candidates:
+            source = normalize_path(item["source"])
+            keeper = normalize_path(item["keeper"])
+            destination = normalize_path(item["destination"])
+            source_root = mount_root_for(source, roots)
+            action = {
+                "group_id": int(item["group_id"]),
+                "source": str(source),
+                "keeper": str(keeper),
+                "destination": str(destination),
+                "size_human": item["size_human"],
+                "status": "failed",
+                "message": "",
+            }
+            if source_root is None:
+                action["message"] = "source is outside configured mount roots"
+                result["failed"] += 1
+                result["items"].append(action)
+                continue
+
+            ok, message, timed_out, outcome = bounded_quarantine_preflight(
+                keeper,
+                source,
+                destination,
+                source_root,
+                expected_size=int(item["size"]),
+                timeout=max(0.1, float(verify_timeout)),
+            )
+            if not ok:
+                status = "timeout" if timed_out else "failed"
+                journal.record_action(
+                    run_id, item["group_id"], keeper, source, destination,
+                    item["size"], status, message
+                )
+                action.update(status=status, message=message)
+                result["failed"] += 1
+                if timed_out:
+                    result["timed_out"] += 1
+                result["items"].append(action)
+                continue
+            if outcome == "destination-identical":
+                journal.record_action(
+                    run_id, item["group_id"], keeper, source, destination,
+                    item["size"], "reconciled", message
+                )
+                action.update(status="reconciled", message=message)
+                result["reconciled"] += 1
+                result["items"].append(action)
+                continue
+            if outcome == "source-missing-keeper-valid":
+                journal.record_action(
+                    run_id, item["group_id"], keeper, source, destination,
+                    item["size"], "stale", message
+                )
+                action.update(status="stale", message=message)
+                result["stale"] += 1
+                result["items"].append(action)
+                continue
+
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                journal.record_action(
+                    run_id, item["group_id"], keeper, source, destination,
+                    item["size"], "moving", message
+                )
+                move_noreplace(source, destination)
+            except OSError as exc:
+                journal.record_action(
+                    run_id, item["group_id"], keeper, source, destination,
+                    item["size"], "failed", str(exc)
+                )
+                action.update(status="failed", message=str(exc))
+                result["failed"] += 1
+            else:
+                journal.record_action(
+                    run_id, item["group_id"], keeper, source, destination,
+                    item["size"], "moved", message
+                )
+                action.update(status="moved", message=message)
+                result["files_moved"] += 1
+                result["bytes_moved"] += int(item["size"])
+            result["items"].append(action)
+        journal.set_run_status(run_id, "complete" if result["failed"] == 0 else "attention")
+    except (ArchiveKeeperError, OSError, sqlite3.Error) as exc:
+        if journal is not None:
+            try:
+                journal.set_run_status(run_id, "interrupted")
+            except sqlite3.Error:
+                pass
+        result["error"] = f"controlled quarantine failed: {exc}"
+        return result
+    finally:
+        if journal is not None:
+            journal.close()
+
+    result["bytes_moved_human"] = human_bytes(result["bytes_moved"])
+    result["ok"] = True
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="archive-keeper-ui-bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -616,6 +784,18 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument("--run-id", default=PREVIEW_RUN_ID)
     dry_run.add_argument("--limit", type=int, default=10)
     dry_run.add_argument("--verify-timeout", type=float, default=5.0)
+    apply_run = subparsers.add_parser(
+        "quarantine-apply", help="Move an explicitly confirmed bounded set of staged files"
+    )
+    apply_run.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    apply_run.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
+    apply_run.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
+    apply_run.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
+    apply_run.add_argument("--quarantine-name", default=DEFAULT_QUARANTINE_NAME)
+    apply_run.add_argument("--run-id")
+    apply_run.add_argument("--limit", type=int, default=MAX_CONTROLLED_APPLY_FILES)
+    apply_run.add_argument("--verify-timeout", type=float, default=30.0)
+    apply_run.add_argument("--confirm", required=True)
     return parser
 
 
@@ -652,6 +832,21 @@ def main(argv: list[str] | None = None) -> int:
         result = quarantine_dry_run(
             args.report,
             args.decisions_db,
+            args.mount_roots,
+            args.quarantine_name,
+            args.run_id,
+            args.limit,
+            args.verify_timeout,
+        )
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        return 0 if result["ok"] else 1
+    if args.command == "quarantine-apply":
+        result = controlled_quarantine_apply(
+            args.report,
+            args.state_db,
+            args.decisions_db,
+            args.confirm,
             args.mount_roots,
             args.quarantine_name,
             args.run_id,
