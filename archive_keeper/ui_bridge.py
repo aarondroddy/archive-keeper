@@ -887,8 +887,9 @@ def controlled_restore_apply(
             if probe_error or statuses.get(str(source)) != "missing" or statuses.get(str(destination)) != "file":
                 if not message:
                     message = "final check blocked restore: original exists or quarantine file is unavailable"
+                # Keep the journal action restorable after a blocked attempt.
                 journal.record_action(run_id, item["group_id"], normalize_path(item["keeper"]),
-                                      source, destination, item["size"], "failed", message)
+                                      source, destination, item["size"], "moved", message)
                 action["message"], result["failed"] = message, result["failed"] + 1
                 result["items"].append(action)
                 continue
@@ -896,8 +897,9 @@ def controlled_restore_apply(
                 source.parent.mkdir(parents=True, exist_ok=True)
                 move_noreplace(destination, source)
             except OSError as exc:
+                # A failed no-replace move leaves the quarantine copy in place.
                 journal.record_action(run_id, item["group_id"], normalize_path(item["keeper"]),
-                                      source, destination, item["size"], "failed", str(exc))
+                                      source, destination, item["size"], "moved", str(exc))
                 action["message"], result["failed"] = str(exc), result["failed"] + 1
             else:
                 journal.record_action(run_id, item["group_id"], normalize_path(item["keeper"]),
