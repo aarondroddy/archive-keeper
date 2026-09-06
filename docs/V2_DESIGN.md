@@ -41,9 +41,17 @@ Optional environment variables let a development build use non-default inputs:
 - `ARCHIVE_KEEPER_REPORT`
 - `ARCHIVE_KEEPER_STATE_DB`
 - `ARCHIVE_KEEPER_DECISIONS_DB`
+- `ARCHIVE_KEEPER_MOUNT_ROOTS`
+- `ARCHIVE_KEEPER_QUARANTINE_NAME`
+- `ARCHIVE_KEEPER_VERIFY_TIMEOUT`
+- `ARCHIVE_KEEPER_APPLY_LIMIT` (1–10; invalid values fall back to 10)
 
-The largest recoverable groups can be selected and opened in a copy-by-copy
-inspector. It exposes report metadata only; it does not touch the files named in
-the report. The next milestone adds explicit keeper selection. Mutation stays
-offline until preview, confirmation, and journaled operation messages are
-specified and tested end to end.
+The largest recoverable groups can be opened in a copy-by-copy inspector.
+Keeper selection and quarantine staging write only to `decisions.sqlite3`.
+
+Controlled quarantine is available only after a clean bounded dry pilot. The
+operator must then type the exact phrase shown by the UI. Apply is capped at 10
+explicitly staged files, repeats live source/keeper/mount/destination checks
+immediately before each move, refuses to overwrite an existing destination,
+and journals every attempted move under a restore-compatible run ID. The UI
+shows that run ID and its matching restore command after execution.
