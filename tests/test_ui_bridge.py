@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,7 @@ from unittest.mock import patch
 
 from archive_keeper.ui_bridge import (
     PROTOCOL_VERSION,
+    controlled_quarantine_apply,
     dashboard_snapshot,
     main,
     quarantine_dry_run,
@@ -360,6 +363,133 @@ class UIBridgeTests(unittest.TestCase):
             preflight.assert_called_once()
             self.assertEqual(self._sha256(decisions), before)
             self.assertFalse((root / "ArchiveKeeper Quarantine").exists())
+
+    def test_controlled_apply_requires_exact_confirmation_before_journaling(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            state = root / "journal.sqlite3"
+
+            result = controlled_quarantine_apply(
+                report,
+                state,
+                decisions,
+                "yes",
+                [root],
+                limit=1,
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["files_moved"], 0)
+            self.assertIn("QUARANTINE UP TO 1 FILES", result["error"])
+            self.assertFalse(state.exists())
+
+    def test_controlled_apply_moves_only_staged_copy_and_is_restore_compatible(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            state = root / "journal.sqlite3"
+            keeper = root / "keeper.bin"
+            staged = root / "copy-a.bin"
+            untouched = root / "copy-b.bin"
+            for path in (keeper, staged, untouched):
+                path.write_bytes(b"x" * 4096)
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+            self.assertTrue(set_file_action(report, decisions, 1, staged, "QUARANTINE")["ok"])
+
+            with patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True):
+                result = controlled_quarantine_apply(
+                    report,
+                    state,
+                    decisions,
+                    "QUARANTINE UP TO 1 FILES",
+                    [root],
+                    run_id="ui-apply-test",
+                    limit=1,
+                    verify_timeout=5,
+                )
+
+            destination = (
+                root / "ArchiveKeeper Quarantine" / "ui-apply-test" / "copy-a.bin"
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["files_moved"], 1)
+            self.assertTrue(keeper.exists())
+            self.assertFalse(staged.exists())
+            self.assertTrue(untouched.exists())
+            self.assertTrue(destination.exists())
+            with sqlite3.connect(state) as connection:
+                row = connection.execute(
+                    "SELECT mode, status FROM runs WHERE run_id='ui-apply-test'"
+                ).fetchone()
+                action = connection.execute(
+                    "SELECT source, destination, status FROM actions "
+                    "WHERE run_id='ui-apply-test'"
+                ).fetchone()
+            self.assertEqual(row, ("apply", "complete"))
+            self.assertEqual(action, (str(staged), str(destination), "moved"))
+
+            restored = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "archive_keeper",
+                    "--state-db",
+                    str(state),
+                    "restore",
+                    "ui-apply-test",
+                    "--apply",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(restored.returncode, 0, restored.stderr + restored.stdout)
+            self.assertTrue(staged.exists())
+            self.assertFalse(destination.exists())
+
+    def test_controlled_apply_no_clobber_guard_survives_race(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            state = root / "journal.sqlite3"
+            keeper = root / "keeper.bin"
+            staged = root / "copy-a.bin"
+            keeper.write_bytes(b"x" * 4096)
+            staged.write_bytes(b"x" * 4096)
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+            self.assertTrue(set_file_action(report, decisions, 1, staged, "QUARANTINE")["ok"])
+            destination = root / "ArchiveKeeper Quarantine" / "race-test" / "copy-a.bin"
+
+            def create_collision(*args, **kwargs):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"do not overwrite")
+                return True, "verified before race", False, "ready"
+
+            with (
+                patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True),
+                patch(
+                    "archive_keeper.ui_bridge.bounded_quarantine_preflight",
+                    side_effect=create_collision,
+                ),
+            ):
+                result = controlled_quarantine_apply(
+                    report,
+                    state,
+                    decisions,
+                    "QUARANTINE UP TO 1 FILES",
+                    [root],
+                    run_id="race-test",
+                    limit=1,
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["files_moved"], 0)
+            self.assertEqual(result["failed"], 1)
+            self.assertTrue(staged.exists())
+            self.assertEqual(destination.read_bytes(), b"do not overwrite")
 
 
 if __name__ == "__main__":
