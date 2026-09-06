@@ -1129,6 +1129,14 @@ func (m model) pageView(page screen, width int) string {
 			}
 			if m.restorePlanLoading { v[2] = "Checking restore destinations and collisions…\n\nNo files are being changed."; break }
 			if m.restorePlanErr != nil { v[2] = lipgloss.NewStyle().Bold(true).Foreground(danger).Render("RESTORE PREVIEW UNAVAILABLE")+"\n"+m.restorePlanErr.Error()+"\n\nH/← return"; break }
+			if m.restoreResult.ProtocolVersion == 1 && m.restoreResult.Remaining == 0 && !m.restoring {
+				label := fmt.Sprintf("RESTORE VERIFIED · %d restored · %s · %d failed · 0 remaining", m.restoreResult.Restored, m.restoreResult.BytesRestoredHuman, m.restoreResult.Failed)
+				style := lipgloss.NewStyle().Bold(true).Foreground(lime)
+				if m.restoreResult.Failed > 0 { style = style.Foreground(gold) }
+				v[2] = style.Render(label) + "\n\nRun ID: " + m.restoreResult.RunID +
+					"\nJournal status: restored\nOriginal path restored with no overwrite.\n\nH/← return to restorable runs"
+				break
+			}
 			lines := []string{fmt.Sprintf("Run %s · %d files · %s · %d ready · %d blocked", m.restorePlan.RunID, m.restorePlan.TotalFiles, m.restorePlan.TotalHuman, m.restorePlan.ReadyFiles, m.restorePlan.BlockedFiles), ""}
 			visible := max(3, min(8, m.height-24)); start := 0
 			if m.restorePlanCursor >= visible { start = m.restorePlanCursor-visible+1 }; end := min(len(m.restorePlan.Items), start+visible)
