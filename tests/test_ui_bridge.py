@@ -10,6 +10,7 @@ from archive_keeper.ui_bridge import (
     PROTOCOL_VERSION,
     dashboard_snapshot,
     main,
+    quarantine_dry_run,
     quarantine_plan_snapshot,
     select_keeper,
     set_file_action,
@@ -321,6 +322,44 @@ class UIBridgeTests(unittest.TestCase):
 
             self.assertEqual(plan["blocked_files"], 1)
             self.assertIn("collision", " ".join(plan["items"][0]["warnings"]))
+
+    def test_quarantine_dry_run_is_bounded_and_never_mutates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            keeper = root / "keeper.bin"
+            first = root / "copy-a.bin"
+            second = root / "copy-b.bin"
+            for path in (keeper, first, second):
+                path.write_bytes(b"same")
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+            self.assertTrue(set_file_action(report, decisions, 1, first, "QUARANTINE")["ok"])
+            self.assertTrue(set_file_action(report, decisions, 1, second, "QUARANTINE")["ok"])
+            before = self._sha256(decisions)
+
+            with (
+                patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True),
+                patch(
+                    "archive_keeper.ui_bridge.bounded_quarantine_preflight",
+                    return_value=(True, "size verified; report trusted", False, "ready"),
+                ) as preflight,
+            ):
+                result = quarantine_dry_run(
+                    report, decisions, [root], run_id="pilot-preview", limit=1
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["mode"], "dry-run")
+            self.assertEqual(result["files_moved"], 0)
+            self.assertEqual(result["journal_writes"], 0)
+            self.assertEqual(result["total_staged"], 2)
+            self.assertEqual(result["attempted"], 1)
+            self.assertEqual(result["verified"], 1)
+            self.assertTrue(result["limited"])
+            preflight.assert_called_once()
+            self.assertEqual(self._sha256(decisions), before)
+            self.assertFalse((root / "ArchiveKeeper Quarantine").exists())
 
 
 if __name__ == "__main__":
