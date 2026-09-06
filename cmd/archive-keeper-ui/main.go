@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -51,6 +52,8 @@ type model struct {
 	loadErr       error
 	contentFocus  bool
 	groupCursor   int
+	galaxyMode    bool
+	scanPhase     int
 	fileCursor    int
 	inspecting    bool
 	confirmKeeper bool
@@ -101,8 +104,10 @@ type dashboardSnapshot struct {
 		LargestGroups    []struct {
 			GroupID          int    `json:"group_id"`
 			Copies           int    `json:"copies"`
+			RecoverableBytes int64  `json:"recoverable_bytes"`
 			RecoverableHuman string `json:"recoverable_human"`
 			SamplePath       string `json:"sample_path"`
+			MountRoot        string `json:"mount_root"`
 			Files            []struct {
 				Path         string `json:"path"`
 				SizeHuman    string `json:"size_human"`
@@ -111,6 +116,16 @@ type dashboardSnapshot struct {
 			} `json:"files"`
 		} `json:"largest_groups"`
 	} `json:"report"`
+	Mounts struct {
+		AllReady bool `json:"all_ready"`
+		Roots []struct {
+			Path       string `json:"path"`
+			Mounted    bool   `json:"mounted"`
+			Filesystem string `json:"filesystem"`
+			Source     string `json:"source"`
+			Status     string `json:"status"`
+		} `json:"roots"`
+	} `json:"mounts"`
 	Decisions struct {
 		Exists        bool           `json:"exists"`
 		Keepers       int            `json:"keepers"`
@@ -292,6 +307,13 @@ func loadDashboard() tea.Msg {
 	} {
 		if value := os.Getenv(setting.env); value != "" {
 			args = append(args, setting.flag, value)
+		}
+	}
+	if value := os.Getenv("ARCHIVE_KEEPER_MOUNT_ROOTS"); value != "" {
+		for _, root := range filepath.SplitList(value) {
+			if root != "" {
+				args = append(args, "--mount-root", root)
+			}
 		}
 	}
 	output, err := exec.Command(python, args...).Output()
@@ -564,10 +586,19 @@ func saveFileAction(groupID int, path, action string) tea.Cmd {
 	}
 }
 
-func (m model) Init() tea.Cmd { return loadDashboard }
+type scanTickMsg time.Time
+
+func scanTick() tea.Cmd {
+	return tea.Tick(360*time.Millisecond, func(t time.Time) tea.Msg { return scanTickMsg(t) })
+}
+
+func (m model) Init() tea.Cmd { return tea.Batch(loadDashboard, scanTick()) }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case scanTickMsg:
+		m.scanPhase = (m.scanPhase + 1) % 4
+		return m, scanTick()
 	case dashboardLoadedMsg:
 		m.loading = false
 		m.dashboard = msg.snapshot
@@ -634,6 +665,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key {
 			case "ctrl+c": return m, tea.Quit
 			case "enter":
+				if !m.dashboard.Mounts.AllReady { m.restoreErr = fmt.Errorf("mount array is not ready"); return m, nil }
 				if m.restoreInput == expectedRestoreConfirmation() && !m.restoring { m.restoring = true; m.restoreErr = nil; return m, runControlledRestore(m.restorePlan.RunID, m.restoreInput) }
 				m.restoreErr = fmt.Errorf("confirmation phrase does not match")
 			case "backspace", "ctrl+h": runes := []rune(m.restoreInput); if len(runes) > 0 { m.restoreInput = string(runes[:len(runes)-1]) }
@@ -648,6 +680,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+c":
 				return m, tea.Quit
 			case "enter":
+				if !m.dashboard.Mounts.AllReady { m.applyErr = fmt.Errorf("mount array is not ready"); return m, nil }
 				if m.applyInput == expectedApplyConfirmation() && !m.applying {
 					m.applying = true
 					m.applyErr = nil
@@ -722,6 +755,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			switch shortcut {
+			case "g":
+				if !m.inspecting { m.galaxyMode = !m.galaxyMode }
 			case "up", "k":
 				if m.inspecting {
 					if m.fileCursor > 0 {
@@ -806,7 +841,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.confirmDryRun = true
 				}
 			case "a":
-				if m.dryRun.ProtocolVersion == 1 && m.dryRun.Verified > 0 && m.dryRun.Blocked == 0 && m.dryRun.TimedOut == 0 {
+				if m.dashboard.Mounts.AllReady && m.dryRun.ProtocolVersion == 1 && m.dryRun.Verified > 0 && m.dryRun.Blocked == 0 && m.dryRun.TimedOut == 0 {
 					m.confirmApply = true
 					m.applyInput = ""
 					m.applyErr = nil
@@ -826,7 +861,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "up", "k": if m.restorePlanCursor > 0 { m.restorePlanCursor-- }
 				case "down", "j": if m.restorePlanCursor < len(m.restorePlan.Items)-1 { m.restorePlanCursor++ }
 				case "r": m.restorePlanLoading = true; m.restorePlanErr = nil; m.restoreResult = controlledRestoreResult{}; m.restoreErr = nil; return m, loadRestorePlan(m.restorePlan.RunID)
-				case "a": if m.restorePlan.ReadyFiles > 0 && m.restorePlan.BlockedFiles == 0 { m.confirmRestore = true; m.restoreInput = ""; m.restoreErr = nil }
+				case "a": if m.dashboard.Mounts.AllReady && m.restorePlan.ReadyFiles > 0 && m.restorePlan.BlockedFiles == 0 { m.confirmRestore = true; m.restoreInput = ""; m.restoreErr = nil }
 				case "esc", "left", "h": m.restoreInspecting = false; m.restorePlanCursor = 0; m.confirmRestore = false; m.restoreCatalogLoading = true; return m, loadRestoreCatalog
 				}
 			} else {
@@ -923,6 +958,117 @@ func (m model) currentGroupFiles() []struct {
 	return m.dashboard.Report.LargestGroups[m.groupCursor].Files
 }
 
+func galaxyGlyph(value, maximum int64, selected bool, phase int) string {
+	if selected && phase%2 == 0 {
+		return "◉"
+	}
+	if maximum <= 0 {
+		return "·"
+	}
+	ratio := float64(value) / float64(maximum)
+	switch {
+	case ratio >= 0.66:
+		return "✹"
+	case ratio >= 0.25:
+		return "✦"
+	default:
+		return "·"
+	}
+}
+
+func (m model) mountHealthView(width int) string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(danger).Render("MOUNT ARRAY LOCKED")
+	if m.dashboard.Mounts.AllReady {
+		title = lipgloss.NewStyle().Bold(true).Foreground(lime).Render("MOUNT ARRAY ONLINE")
+	}
+	lines := []string{title}
+	for _, root := range m.dashboard.Mounts.Roots {
+		icon := "○"
+		state := "OFFLINE"
+		style := lipgloss.NewStyle().Foreground(danger)
+		if root.Mounted {
+			icon, state = "●", "ONLINE"
+			style = lipgloss.NewStyle().Foreground(lime)
+		}
+		detail := root.Filesystem
+		if root.Source != "" {
+			detail += " · " + root.Source
+		}
+		line := fmt.Sprintf("%s %-7s %-18s %s", icon, state, compactPath(root.Path, 18), compactPath(detail, max(16, width-48)))
+		lines = append(lines, style.Render(line))
+	}
+	if len(m.dashboard.Mounts.Roots) == 0 {
+		lines = append(lines, lipgloss.NewStyle().Foreground(danger).Render("○ OFFLINE  no mount roots configured"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) galaxyView(width int) string {
+	groups := m.dashboard.Report.LargestGroups
+	if len(groups) == 0 {
+		return "No duplicate systems are loaded yet."
+	}
+	maximum := int64(0)
+	for _, group := range groups {
+		if group.RecoverableBytes > maximum {
+			maximum = group.RecoverableBytes
+		}
+	}
+	frames := []string{"◐", "◓", "◑", "◒"}
+	scan := frames[m.scanPhase%len(frames)]
+	panels := []string{}
+	roots := m.dashboard.Mounts.Roots
+	for rootIndex, root := range roots {
+		indices := []int{}
+		for i, group := range groups {
+			if group.MountRoot == root.Path || (group.MountRoot == "" && rootIndex == 0) {
+				indices = append(indices, i)
+			}
+		}
+		start := 0
+		for position, index := range indices {
+			if index == m.groupCursor && position >= 7 {
+				start = position - 6
+			}
+		}
+		end := min(len(indices), start+8)
+		status := "OFFLINE"
+		accent := danger
+		if root.Mounted {
+			status, accent = "ONLINE", lime
+		}
+		lines := []string{lipgloss.NewStyle().Bold(true).Foreground(accent).Render(strings.ToUpper(filepath.Base(root.Path))+" NEBULA"), mutedText.Render(status+" · "+root.Filesystem), ""}
+		for _, index := range indices[start:end] {
+			group := groups[index]
+			selected := index == m.groupCursor
+			marker := "  "
+			if selected {
+				marker = "▶ "
+			}
+			line := fmt.Sprintf("%s%s G%-5d %10s", marker, galaxyGlyph(group.RecoverableBytes, maximum, selected, m.scanPhase), group.GroupID, group.RecoverableHuman)
+			if selected {
+				line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line)
+			} else {
+				line = lipgloss.NewStyle().Foreground(cyan).Render(line)
+			}
+			lines = append(lines, line)
+		}
+		if end < len(indices) {
+			lines = append(lines, mutedText.Render(fmt.Sprintf("+%d systems beyond scan", len(indices)-end)))
+		}
+		if len(indices) == 0 {
+			lines = append(lines, mutedText.Render("· clear orbit"))
+		}
+		panelWidth := max(22, (width-8)/max(1, len(roots)))
+		panels = append(panels, lipgloss.NewStyle().Width(panelWidth).Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1).Render(strings.Join(lines, "\n")))
+	}
+	if len(panels) == 0 {
+		return "Mount telemetry is unavailable; press G for the list view."
+	}
+	mapView := lipgloss.JoinHorizontal(lipgloss.Top, panels...)
+	return fmt.Sprintf("LIVE ARRAY SCAN %s · star intensity = recoverable space\n\n%s\n\n↑↓ navigate systems · Enter inspect copies · G list view", scan, mapView)
+}
+
 func (m model) homeView(width int) string {
 	ready := m.loadErr == nil && m.dashboard.ProtocolVersion == 1
 	recoverable := "—"
@@ -950,7 +1096,7 @@ func (m model) homeView(width int) string {
 			fmt.Sprintf("\n%d files charted across %d duplicate groups.", m.dashboard.Report.Files, m.dashboard.Report.Groups)
 	}
 	body := "Your storage universe, charted without moving a single byte.\n\n" + metrics +
-		"\n\n" + status
+		"\n\n" + m.mountHealthView(width) + "\n\n" + status
 	return frame("MISSION CONTROL", "Read-only overview · no files move from this screen", body, width, pink)
 }
 
@@ -1010,6 +1156,10 @@ func (m model) pageView(page screen, width int) string {
 				if m.statusMessage != "" { lines = append(lines, "", m.statusMessage) }
 				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · keeper decisions enabled", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n"), width, cyan)
 			}
+			if m.galaxyMode {
+				v[2] = m.galaxyView(width)
+				break
+			}
 			lines := []string{}
 			for i, group := range m.dashboard.Report.LargestGroups {
 				marker := "  "
@@ -1024,7 +1174,7 @@ func (m model) pageView(page screen, width int) string {
 			if len(lines) == 0 {
 				lines = append(lines, "No duplicate groups are loaded yet.")
 			}
-			v[2] = strings.Join(lines, "\n") + "\n\n↑↓ select · Enter inspect copies · H/← return to menu"
+			v[2] = strings.Join(lines, "\n") + "\n\n↑↓ select · Enter inspect copies · G galaxy view · H/← return to menu"
 		case decisions:
 			v[2] = fmt.Sprintf("★ KEEP       %d selected originals\n◇ QUARANTINE %d staged copies\n? UNDECIDED  %d marked for attention\n\n%d favorites saved.",
 				m.dashboard.Decisions.Keepers,
@@ -1107,7 +1257,11 @@ func (m model) pageView(page screen, width int) string {
 				lines = append(lines, "", style.Render(label))
 				if m.dryRun.Limited { lines = append(lines, fmt.Sprintf("Pilot stopped safely at limit %d of %d staged files.", m.dryRun.Limit, m.dryRun.TotalStaged)) }
 				if m.dryRun.Verified > 0 && m.dryRun.Blocked == 0 && m.dryRun.TimedOut == 0 {
-					lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(pink).Render("A controlled apply · typed confirmation required"))
+					if m.dashboard.Mounts.AllReady {
+						lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(pink).Render("A controlled apply · typed confirmation required"))
+					} else {
+						lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(danger).Render("APPLY LOCKED · mount array not ready"))
+					}
 				}
 			}
 			lines = append(lines, "", "↑↓ inspect · D dry pilot · R reload · H/← return")
@@ -1146,7 +1300,10 @@ func (m model) pageView(page screen, width int) string {
 			} else if m.confirmRestore { phrase:=expectedRestoreConfirmation(); lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(danger).Render("FINAL SAFETY GATE · QUARANTINED FILES WILL MOVE"),"Type exactly: "+phrase,lipgloss.NewStyle().Bold(true).Foreground(gold).Render("> "+m.restoreInput+"▌"),"Enter submits · ← or Ctrl+G cancels"); if m.restoreErr != nil { lines=append(lines,lipgloss.NewStyle().Foreground(danger).Render(m.restoreErr.Error())) }
 			} else if m.restoreErr != nil { lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(danger).Render("RESTORE FAILED · "+m.restoreErr.Error()))
 			} else if m.restoreResult.ProtocolVersion == 1 { label:=fmt.Sprintf("RESTORE VERIFIED · %d restored · %s · %d failed · %d remaining",m.restoreResult.Restored,m.restoreResult.BytesRestoredHuman,m.restoreResult.Failed,m.restoreResult.Remaining); style:=lipgloss.NewStyle().Bold(true).Foreground(lime); if m.restoreResult.Failed>0 { style=style.Foreground(gold) }; lines=append(lines,"",style.Render(label),"Run ID: "+m.restoreResult.RunID) }
-			if m.restorePlan.ReadyFiles > 0 && m.restorePlan.BlockedFiles == 0 && !m.confirmRestore && !m.restoring { lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(pink).Render("A controlled restore · typed confirmation required")) }
+			if m.restorePlan.ReadyFiles > 0 && m.restorePlan.BlockedFiles == 0 && !m.confirmRestore && !m.restoring {
+				if m.dashboard.Mounts.AllReady { lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(pink).Render("A controlled restore · typed confirmation required"))
+				} else { lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(danger).Render("RESTORE LOCKED · mount array not ready")) }
+			}
 			lines=append(lines,"","↑↓ inspect · A controlled restore · R reload · H/← runs")
 			v[2]=strings.Join(lines,"\n")
 		case history:
@@ -1182,7 +1339,8 @@ func (m model) View() tea.View {
 		bridgeStatus = fmt.Sprintf("Python %s · protocol v%d · read-only", m.dashboard.Version, m.dashboard.ProtocolVersion)
 	}
 	if m.page == groups && m.contentFocus {
-		bridgeStatus = "GROUP INSPECTOR · Enter keeper · X stage · U undecided · C clear · files untouched"
+		bridgeStatus = "GALAXY MAP · ↑↓ systems · Enter inspect · G list · files untouched"
+		if m.inspecting { bridgeStatus = "GROUP INSPECTOR · Enter keeper · X stage · U undecided · C clear · files untouched" }
 	} else if m.page == quarantine && m.contentFocus {
 		bridgeStatus = "QUARANTINE PREVIEW · D dry pilot · R reload · no moves · no journal writes"
 		if m.confirmApply {
@@ -1214,7 +1372,7 @@ func (m model) View() tea.View {
 }
 
 func main() {
-	p := tea.NewProgram(model{page: home, loading: true})
+	p := tea.NewProgram(model{page: home, loading: true, galaxyMode: true})
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "archive-keeper-ui:", err)
 		os.Exit(1)
