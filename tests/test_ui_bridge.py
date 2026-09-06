@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from archive_keeper.ui_bridge import (
     PROTOCOL_VERSION,
+    _mount_summary,
     controlled_quarantine_apply,
     controlled_restore_apply,
     dashboard_snapshot,
@@ -559,6 +560,18 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(result["remaining"], 1)
             self.assertEqual(source.read_bytes(), b"new original")
             self.assertTrue(destination.exists())
+
+
+    def test_mount_summary_uses_kernel_mount_table_without_path_probes(self):
+        roots = [Path("/mnt/MyCloud1"), Path("/mnt/MyCloud2")]
+        mountinfo = (
+            "42 31 0:99 / /mnt/MyCloud1 rw,relatime - cifs //192.168.1.121/MyCloud1 rw\n"
+        )
+        result = _mount_summary(roots, mountinfo)
+        self.assertFalse(result["all_ready"])
+        self.assertEqual(result["roots"][0]["status"], "ONLINE")
+        self.assertEqual(result["roots"][0]["filesystem"], "cifs")
+        self.assertEqual(result["roots"][1]["status"], "OFFLINE")
 
 
 if __name__ == "__main__":
