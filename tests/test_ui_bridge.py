@@ -4,11 +4,13 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from archive_keeper.ui_bridge import (
     PROTOCOL_VERSION,
     dashboard_snapshot,
     main,
+    quarantine_plan_snapshot,
     select_keeper,
     set_file_action,
 )
@@ -236,6 +238,89 @@ class UIBridgeTests(unittest.TestCase):
                     (str(replacement),),
                 ).fetchone()
             self.assertIsNone(row)
+
+    def test_quarantine_plan_is_read_only_and_uses_engine_destination(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            keeper = root / "keeper.bin"
+            copy = root / "copy-a.bin"
+            keeper.write_bytes(b"same")
+            copy.write_bytes(b"same")
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+            self.assertTrue(set_file_action(report, decisions, 1, copy, "QUARANTINE")["ok"])
+            before = self._sha256(decisions)
+
+            with patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True):
+                plan = quarantine_plan_snapshot(
+                    report,
+                    decisions,
+                    [root],
+                    "ArchiveKeeper Quarantine",
+                    "preview-1",
+                )
+
+            self.assertTrue(plan["ok"])
+            self.assertEqual(plan["mode"], "read-only")
+            self.assertEqual(plan["files_moved"], 0)
+            self.assertEqual(plan["total_files"], 1)
+            self.assertEqual(plan["total_bytes"], 4096)
+            self.assertEqual(plan["ready_files"], 1)
+            self.assertEqual(plan["blocked_files"], 0)
+            self.assertEqual(plan["items"][0]["status"], "READY")
+            self.assertEqual(plan["items"][0]["source"], str(copy))
+            self.assertEqual(plan["items"][0]["keeper"], str(keeper))
+            self.assertEqual(
+                plan["items"][0]["destination"],
+                str(root / "ArchiveKeeper Quarantine" / "preview-1" / "copy-a.bin"),
+            )
+            self.assertEqual(self._sha256(decisions), before)
+            self.assertFalse((root / "ArchiveKeeper Quarantine").exists())
+
+    def test_quarantine_plan_blocks_unmounted_root_and_never_probes_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            keeper = root / "keeper.bin"
+            copy = root / "copy-a.bin"
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+            self.assertTrue(set_file_action(report, decisions, 1, copy, "QUARANTINE")["ok"])
+
+            with (
+                patch("archive_keeper.ui_bridge.os.path.ismount", return_value=False),
+                patch("archive_keeper.ui_bridge._bounded_path_probe") as probe,
+            ):
+                plan = quarantine_plan_snapshot(report, decisions, [root])
+
+            self.assertEqual(plan["ready_files"], 0)
+            self.assertEqual(plan["blocked_files"], 1)
+            self.assertIn("mount is unavailable", " ".join(plan["items"][0]["warnings"]))
+            probe.assert_not_called()
+
+    def test_quarantine_plan_flags_existing_destination_collision(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            keeper = root / "keeper.bin"
+            copy = root / "copy-a.bin"
+            keeper.write_bytes(b"same")
+            copy.write_bytes(b"same")
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+            self.assertTrue(set_file_action(report, decisions, 1, copy, "QUARANTINE")["ok"])
+            destination = root / "ArchiveKeeper Quarantine" / "preview-2" / "copy-a.bin"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"occupied")
+
+            with patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True):
+                plan = quarantine_plan_snapshot(
+                    report, decisions, [root], run_id="preview-2"
+                )
+
+            self.assertEqual(plan["blocked_files"], 1)
+            self.assertIn("collision", " ".join(plan["items"][0]["warnings"]))
 
 
 if __name__ == "__main__":
