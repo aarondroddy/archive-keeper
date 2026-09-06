@@ -45,6 +45,7 @@ Optional environment variables let a development build use non-default inputs:
 - `ARCHIVE_KEEPER_QUARANTINE_NAME`
 - `ARCHIVE_KEEPER_VERIFY_TIMEOUT`
 - `ARCHIVE_KEEPER_APPLY_LIMIT` (1–10; invalid values fall back to 10)
+- `ARCHIVE_KEEPER_RESTORE_LIMIT` (1–10; invalid values fall back to 10)
 
 The largest recoverable groups can be opened in a copy-by-copy inspector.
 Keeper selection and quarantine staging write only to `decisions.sqlite3`.
@@ -55,3 +56,12 @@ explicitly staged files, repeats live source/keeper/mount/destination checks
 immediately before each move, refuses to overwrite an existing destination,
 and journals every attempted move under a restore-compatible run ID. The UI
 shows that run ID and its matching restore command after execution.
+
+The Restore screen lists journal runs that still contain `moved` actions and
+opens each run in a live, read-only preview. A file is eligible only when its
+quarantine copy is a regular file, its original path is absent, and both paths
+are on the same configured mounted root. Any existing original path is a hard
+collision; the UI does not overwrite or reconcile it. After the exact bounded
+confirmation phrase is entered, the engine repeats its checks, performs a
+no-replace move, journals the result, and displays `RESTORE VERIFIED` with
+restored, failed, and remaining counts.
