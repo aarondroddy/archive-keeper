@@ -268,15 +268,23 @@ def set_file_action(
         return result
 
     try:
+        with closing(_readonly_connection(decisions_db)) as connection:
+            if not _table_exists(connection, "keeper_decisions"):
+                result["error"] = "choose a keeper before staging file decisions"
+                return result
+            row = connection.execute(
+                "SELECT keeper_path FROM keeper_decisions WHERE group_id=?", (group_id,)
+            ).fetchone()
+        if row is None:
+            result["error"] = f"choose a keeper for group {group_id} first"
+            return result
+        keeper = normalize_path(row[0])
+        if target == keeper and action != "CLEAR":
+            result["error"] = "the selected keeper cannot be staged for quarantine"
+            return result
+
         store = DecisionStore(decisions_db)
         try:
-            keeper = store.get_keeper(group_id)
-            if keeper is None:
-                result["error"] = f"choose a keeper for group {group_id} first"
-                return result
-            if target == keeper and action != "CLEAR":
-                result["error"] = "the selected keeper cannot be staged for quarantine"
-                return result
             if action == "CLEAR":
                 store.clear_action(group_id, target)
             else:
