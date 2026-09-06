@@ -66,6 +66,11 @@ type model struct {
 	dryRunning    bool
 	dryRun        dryRunResult
 	dryRunErr     error
+	confirmApply  bool
+	applyInput    string
+	applying      bool
+	applyResult   controlledApplyResult
+	applyErr      error
 }
 
 type dashboardSnapshot struct {
@@ -179,6 +184,25 @@ type dryRunResult struct {
 
 type dryRunFinishedMsg struct {
 	result dryRunResult
+	err    error
+}
+
+type controlledApplyResult struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	OK              bool   `json:"ok"`
+	FilesMoved      int    `json:"files_moved"`
+	BytesMovedHuman string `json:"bytes_moved_human"`
+	Reconciled      int    `json:"reconciled"`
+	Stale           int    `json:"stale"`
+	Failed          int    `json:"failed"`
+	TimedOut        int    `json:"timed_out"`
+	Limit           int    `json:"limit"`
+	RunID           string `json:"run_id"`
+	Error           string `json:"error"`
+}
+
+type controlledApplyFinishedMsg struct {
+	result controlledApplyResult
 	err    error
 }
 
@@ -318,6 +342,60 @@ func runQuarantineDryRun() tea.Msg {
 	return dryRunFinishedMsg{result: result}
 }
 
+func controlledApplyLimit() int {
+	limit := 10
+	if value := os.Getenv("ARCHIVE_KEEPER_APPLY_LIMIT"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed >= 1 && parsed <= 10 {
+			limit = parsed
+		}
+	}
+	return limit
+}
+
+func expectedApplyConfirmation() string {
+	return fmt.Sprintf("QUARANTINE UP TO %d FILES", controlledApplyLimit())
+}
+
+func runControlledApply(confirmation string) tea.Cmd {
+	return func() tea.Msg {
+		python, args := bridgeArgs("quarantine-apply")
+		for _, setting := range []struct{ env, flag string }{
+			{"ARCHIVE_KEEPER_REPORT", "--report"},
+			{"ARCHIVE_KEEPER_STATE_DB", "--state-db"},
+			{"ARCHIVE_KEEPER_DECISIONS_DB", "--decisions-db"},
+			{"ARCHIVE_KEEPER_QUARANTINE_NAME", "--quarantine-name"},
+			{"ARCHIVE_KEEPER_RUN_ID", "--run-id"},
+			{"ARCHIVE_KEEPER_VERIFY_TIMEOUT", "--verify-timeout"},
+		} {
+			if value := os.Getenv(setting.env); value != "" {
+				args = append(args, setting.flag, value)
+			}
+		}
+		args = append(args, "--limit", strconv.Itoa(controlledApplyLimit()))
+		if value := os.Getenv("ARCHIVE_KEEPER_MOUNT_ROOTS"); value != "" {
+			for _, root := range filepath.SplitList(value) {
+				if root != "" { args = append(args, "--mount-root", root) }
+			}
+		}
+		args = append(args, "--confirm", confirmation)
+		output, err := exec.Command(python, args...).CombinedOutput()
+		var result controlledApplyResult
+		if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
+			if err != nil { return controlledApplyFinishedMsg{err: fmt.Errorf("bridge command: %w", err)} }
+			return controlledApplyFinishedMsg{err: fmt.Errorf("bridge JSON: %w", jsonErr)}
+		}
+		if err != nil || !result.OK {
+			message := result.Error
+			if message == "" { message = "controlled quarantine did not complete" }
+			return controlledApplyFinishedMsg{result: result, err: fmt.Errorf("%s", message)}
+		}
+		if result.ProtocolVersion != 1 {
+			return controlledApplyFinishedMsg{result: result, err: fmt.Errorf("unsupported bridge protocol %d", result.ProtocolVersion)}
+		}
+		return controlledApplyFinishedMsg{result: result}
+	}
+}
+
 func saveKeeper(groupID int, path string) tea.Cmd {
 	return func() tea.Msg {
 		python, args := bridgeArgs("select-keeper")
@@ -422,10 +500,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirmDryRun = false
 		m.dryRun = msg.result
 		m.dryRunErr = msg.err
+	case controlledApplyFinishedMsg:
+		m.applying = false
+		m.confirmApply = false
+		m.applyInput = ""
+		m.applyResult = msg.result
+		m.applyErr = msg.err
+		m.planLoading = true
+		return m, loadQuarantinePlan
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.compact = msg.Width < 96
 	case tea.KeyPressMsg:
+		if m.confirmApply {
+			key := msg.String()
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				if m.applyInput == expectedApplyConfirmation() && !m.applying {
+					m.applying = true
+					m.applyErr = nil
+					return m, runControlledApply(m.applyInput)
+				}
+				m.applyErr = fmt.Errorf("confirmation phrase does not match")
+			case "backspace", "ctrl+h":
+				runes := []rune(m.applyInput)
+				if len(runes) > 0 { m.applyInput = string(runes[:len(runes)-1]) }
+			case "left", "ctrl+g":
+				m.confirmApply = false
+				m.applyInput = ""
+				m.applyErr = nil
+			default:
+				if runes := []rune(key); len(runes) == 1 {
+					m.applyInput += strings.ToUpper(key)
+				}
+			}
+			return m, nil
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -438,6 +550,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.confirmKeeper = false
 			m.confirmAction = ""
 			m.confirmDryRun = false
+			m.confirmApply = false
+			m.applyInput = ""
 			if m.page == quarantine {
 				m.planLoading = true
 				m.planErr = nil
@@ -555,15 +669,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.planErr = nil
 				m.dryRun = dryRunResult{}
 				m.dryRunErr = nil
+				m.applyResult = controlledApplyResult{}
+				m.applyErr = nil
 				return m, loadQuarantinePlan
 			case "d":
 				if len(m.plan.Items) > 0 && !m.planLoading {
 					m.confirmDryRun = true
 				}
+			case "a":
+				if m.dryRun.ProtocolVersion == 1 && m.dryRun.Verified > 0 && m.dryRun.Blocked == 0 && m.dryRun.TimedOut == 0 {
+					m.confirmApply = true
+					m.applyInput = ""
+					m.applyErr = nil
+				}
 			case "esc", "left", "h":
 				m.contentFocus = false
 				m.page = home
 				m.confirmDryRun = false
+				m.confirmApply = false
+				m.applyInput = ""
 			}
 			return m, nil
 		}
@@ -687,7 +811,7 @@ func (m model) pageView(page screen, width int) string {
 		quarantine: {"QUARANTINE AIRLOCK", "Preview first; mutation always requires explicit confirmation", "1  Inspect the generated plan\n2  Run a bounded dry pilot\n3  Verify source and keeper\n4  Confirm --apply\n\nSafety interlocks remain owned by the Python engine."},
 		restore: {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history: {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
-		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nH or ←      back\n1–7         jump to screen\nq           quit\n\nChoices write only to decisions.sqlite3. Archive files remain untouched. Destructive actions require words, state, and confirmation."},
+		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\n1–7         jump to screen\nq           quit\n\nA clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
 	}
 	v := spec[page]
 	if m.loadErr == nil && m.dashboard.ProtocolVersion == 1 {
@@ -800,7 +924,26 @@ func (m model) pageView(page screen, width int) string {
 			} else {
 				lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(lime).Render("READY · structural and live checks passed"))
 			}
-			if m.dryRunning {
+			if m.applying {
+				lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(pink).Render("QUARANTINE IN PROGRESS · do not close this terminal"))
+			} else if m.confirmApply {
+				phrase := expectedApplyConfirmation()
+				lines = append(lines, "",
+					lipgloss.NewStyle().Bold(true).Foreground(danger).Render("FINAL SAFETY GATE · REAL FILES WILL MOVE"),
+					"Type exactly: "+phrase,
+					lipgloss.NewStyle().Bold(true).Foreground(gold).Render("> "+m.applyInput+"▌"),
+					"Enter submits · ← or Ctrl+G cancels")
+				if m.applyErr != nil { lines = append(lines, lipgloss.NewStyle().Foreground(danger).Render(m.applyErr.Error())) }
+			} else if m.applyErr != nil {
+				lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(danger).Render("QUARANTINE FAILED · "+m.applyErr.Error()))
+			} else if m.applyResult.ProtocolVersion == 1 {
+				label := fmt.Sprintf("QUARANTINE COMPLETE · %d moved · %s · %d failed", m.applyResult.FilesMoved, m.applyResult.BytesMovedHuman, m.applyResult.Failed)
+				style := lipgloss.NewStyle().Bold(true).Foreground(lime)
+				if m.applyResult.Failed > 0 { style = style.Foreground(gold) }
+				lines = append(lines, "", style.Render(label),
+					"Run ID: "+m.applyResult.RunID,
+					"Restore command: archive-keeper restore "+m.applyResult.RunID+" --apply")
+			} else if m.dryRunning {
 				lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("DRY PILOT RUNNING · bounded verification only"))
 			} else if m.confirmDryRun {
 				lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("RUN BOUNDED DRY PILOT?"),
@@ -813,6 +956,9 @@ func (m model) pageView(page screen, width int) string {
 				if m.dryRun.Blocked > 0 || m.dryRun.TimedOut > 0 { style = style.Foreground(gold) }
 				lines = append(lines, "", style.Render(label))
 				if m.dryRun.Limited { lines = append(lines, fmt.Sprintf("Pilot stopped safely at limit %d of %d staged files.", m.dryRun.Limit, m.dryRun.TotalStaged)) }
+				if m.dryRun.Verified > 0 && m.dryRun.Blocked == 0 && m.dryRun.TimedOut == 0 {
+					lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(pink).Render("A controlled apply · typed confirmation required"))
+				}
 			}
 			lines = append(lines, "", "↑↓ inspect · D dry pilot · R reload · H/← return")
 			v[2] = strings.Join(lines, "\n")
@@ -852,6 +998,11 @@ func (m model) View() tea.View {
 		bridgeStatus = "GROUP INSPECTOR · Enter keeper · X stage · U undecided · C clear · files untouched"
 	} else if m.page == quarantine && m.contentFocus {
 		bridgeStatus = "QUARANTINE PREVIEW · D dry pilot · R reload · no moves · no journal writes"
+		if m.confirmApply {
+			bridgeStatus = "FINAL SAFETY GATE · type the exact phrase · ← cancels"
+		} else if m.applying {
+			bridgeStatus = "CONTROLLED QUARANTINE · bounded apply · journal enabled"
+		}
 	}
 	footerLine := keyStyle.Render(" FILES UNTOUCHED ") + " " +
 		lipgloss.NewStyle().Foreground(lime).Render("DECISIONS ENABLED") + "  " +
