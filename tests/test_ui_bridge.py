@@ -5,7 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from archive_keeper.ui_bridge import PROTOCOL_VERSION, dashboard_snapshot, main, select_keeper
+from archive_keeper.ui_bridge import (
+    PROTOCOL_VERSION,
+    dashboard_snapshot,
+    main,
+    select_keeper,
+    set_file_action,
+)
 
 
 class UIBridgeTests(unittest.TestCase):
@@ -76,6 +82,11 @@ class UIBridgeTests(unittest.TestCase):
             self.assertTrue(snapshot["report"]["largest_groups"][0]["files"][0]["original_hint"])
             self.assertEqual(snapshot["decisions"]["keepers"], 1)
             self.assertEqual(snapshot["decisions"]["actions"], {"QUARANTINE": 1, "UNDECIDED": 1})
+            self.assertEqual(snapshot["decisions"]["keeper_paths"], {"1": "/keeper"})
+            self.assertEqual(
+                snapshot["decisions"]["file_actions"],
+                {"1\n/copy-a": "QUARANTINE", "1\n/copy-b": "UNDECIDED"},
+            )
             self.assertEqual(snapshot["journal"]["runs"], 1)
             self.assertEqual(snapshot["journal"]["status_counts"], {"failed": 1, "moved": 1})
             self.assertEqual(before, {path: self._sha256(path) for path in (journal, decisions)})
@@ -96,6 +107,41 @@ class UIBridgeTests(unittest.TestCase):
             self.assertFalse(report.exists())
             self.assertFalse(journal.exists())
             self.assertFalse(decisions.exists())
+
+    def test_file_action_requires_keeper_and_never_creates_database(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+
+            result = set_file_action(
+                report, decisions, 1, root / "copy-a.bin", "QUARANTINE"
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["files_moved"], 0)
+            self.assertFalse(decisions.exists())
+
+    def test_file_action_cannot_stage_keeper_and_can_stage_and_clear_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            keeper = root / "keeper.bin"
+            copy = root / "copy-a.bin"
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+
+            rejected = set_file_action(report, decisions, 1, keeper, "QUARANTINE")
+            staged = set_file_action(report, decisions, 1, copy, "QUARANTINE")
+            cleared = set_file_action(report, decisions, 1, copy, "CLEAR")
+
+            self.assertFalse(rejected["ok"])
+            self.assertIn("keeper cannot", rejected["error"])
+            self.assertTrue(staged["ok"])
+            self.assertTrue(cleared["ok"])
+            with sqlite3.connect(decisions) as connection:
+                count = connection.execute("SELECT COUNT(*) FROM file_decisions").fetchone()[0]
+            self.assertEqual(count, 0)
 
     def test_main_emits_one_json_document(self):
         with tempfile.TemporaryDirectory() as td:
@@ -147,6 +193,28 @@ class UIBridgeTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("not a member", result["error"])
             self.assertFalse(decisions.exists())
+
+    def test_selecting_keeper_clears_conflicting_file_action(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            first = root / "keeper.bin"
+            replacement = root / "copy-a.bin"
+            self.assertTrue(select_keeper(report, decisions, 1, first)["ok"])
+            self.assertTrue(
+                set_file_action(report, decisions, 1, replacement, "QUARANTINE")["ok"]
+            )
+
+            result = select_keeper(report, decisions, 1, replacement)
+
+            self.assertTrue(result["ok"])
+            with sqlite3.connect(decisions) as connection:
+                row = connection.execute(
+                    "SELECT action FROM file_decisions WHERE group_id=1 AND path=?",
+                    (str(replacement),),
+                ).fetchone()
+            self.assertIsNone(row)
 
 
 if __name__ == "__main__":
