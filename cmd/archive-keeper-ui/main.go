@@ -62,6 +62,10 @@ type model struct {
 	planLoading   bool
 	planErr       error
 	planCursor    int
+	confirmDryRun bool
+	dryRunning    bool
+	dryRun        dryRunResult
+	dryRunErr     error
 }
 
 type dashboardSnapshot struct {
@@ -154,6 +158,28 @@ type quarantinePlan struct {
 type quarantinePlanLoadedMsg struct {
 	plan quarantinePlan
 	err  error
+}
+
+type dryRunResult struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	OK              bool   `json:"ok"`
+	Mode            string `json:"mode"`
+	FilesMoved      int    `json:"files_moved"`
+	JournalWrites   int    `json:"journal_writes"`
+	Limit           int    `json:"limit"`
+	TotalStaged     int    `json:"total_staged"`
+	Attempted       int    `json:"attempted"`
+	Verified        int    `json:"verified"`
+	Blocked         int    `json:"blocked"`
+	TimedOut        int    `json:"timed_out"`
+	VerifiedHuman   string `json:"verified_human"`
+	Limited         bool   `json:"limited"`
+	Warnings        []string `json:"warnings"`
+}
+
+type dryRunFinishedMsg struct {
+	result dryRunResult
+	err    error
 }
 
 type keeperResult struct {
@@ -256,6 +282,42 @@ func loadQuarantinePlan() tea.Msg {
 	return quarantinePlanLoadedMsg{plan: plan}
 }
 
+func runQuarantineDryRun() tea.Msg {
+	python, args := bridgeArgs("quarantine-dry-run")
+	for _, setting := range []struct{ env, flag string }{
+		{"ARCHIVE_KEEPER_REPORT", "--report"},
+		{"ARCHIVE_KEEPER_DECISIONS_DB", "--decisions-db"},
+		{"ARCHIVE_KEEPER_QUARANTINE_NAME", "--quarantine-name"},
+		{"ARCHIVE_KEEPER_RUN_ID", "--run-id"},
+		{"ARCHIVE_KEEPER_DRY_RUN_LIMIT", "--limit"},
+		{"ARCHIVE_KEEPER_VERIFY_TIMEOUT", "--verify-timeout"},
+	} {
+		if value := os.Getenv(setting.env); value != "" {
+			args = append(args, setting.flag, value)
+		}
+	}
+	if value := os.Getenv("ARCHIVE_KEEPER_MOUNT_ROOTS"); value != "" {
+		for _, root := range filepath.SplitList(value) {
+			if root != "" { args = append(args, "--mount-root", root) }
+		}
+	}
+	output, err := exec.Command(python, args...).CombinedOutput()
+	var result dryRunResult
+	if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
+		if err != nil { return dryRunFinishedMsg{err: fmt.Errorf("bridge command: %w", err)} }
+		return dryRunFinishedMsg{err: fmt.Errorf("bridge JSON: %w", jsonErr)}
+	}
+	if err != nil || !result.OK {
+		message := "dry pilot did not complete"
+		if len(result.Warnings) > 0 { message = strings.Join(result.Warnings, "; ") }
+		return dryRunFinishedMsg{result: result, err: fmt.Errorf("%s", message)}
+	}
+	if result.ProtocolVersion != 1 {
+		return dryRunFinishedMsg{result: result, err: fmt.Errorf("unsupported bridge protocol %d", result.ProtocolVersion)}
+	}
+	return dryRunFinishedMsg{result: result}
+}
+
 func saveKeeper(groupID int, path string) tea.Cmd {
 	return func() tea.Msg {
 		python, args := bridgeArgs("select-keeper")
@@ -355,6 +417,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.planCursor >= len(m.plan.Items) {
 			m.planCursor = max(0, len(m.plan.Items)-1)
 		}
+	case dryRunFinishedMsg:
+		m.dryRunning = false
+		m.confirmDryRun = false
+		m.dryRun = msg.result
+		m.dryRunErr = msg.err
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.compact = msg.Width < 96
@@ -370,6 +437,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fileCursor = 0
 			m.confirmKeeper = false
 			m.confirmAction = ""
+			m.confirmDryRun = false
 			if m.page == quarantine {
 				m.planLoading = true
 				m.planErr = nil
@@ -464,6 +532,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.page == quarantine && m.contentFocus {
+			if m.confirmDryRun {
+				switch msg.String() {
+				case "y", "enter":
+					if !m.dryRunning {
+						m.dryRunning = true
+						m.dryRunErr = nil
+						return m, runQuarantineDryRun
+					}
+				case "n", "esc", "left", "h":
+					m.confirmDryRun = false
+				}
+				return m, nil
+			}
 			switch msg.String() {
 			case "up", "k":
 				if m.planCursor > 0 { m.planCursor-- }
@@ -472,10 +553,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				m.planLoading = true
 				m.planErr = nil
+				m.dryRun = dryRunResult{}
+				m.dryRunErr = nil
 				return m, loadQuarantinePlan
+			case "d":
+				if len(m.plan.Items) > 0 && !m.planLoading {
+					m.confirmDryRun = true
+				}
 			case "esc", "left", "h":
 				m.contentFocus = false
 				m.page = home
+				m.confirmDryRun = false
 			}
 			return m, nil
 		}
@@ -712,7 +800,21 @@ func (m model) pageView(page screen, width int) string {
 			} else {
 				lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(lime).Render("READY · structural and live checks passed"))
 			}
-			lines = append(lines, "", "↑↓ inspect · R reload · H/← return · preview only")
+			if m.dryRunning {
+				lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("DRY PILOT RUNNING · bounded verification only"))
+			} else if m.confirmDryRun {
+				lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("RUN BOUNDED DRY PILOT?"),
+					"Enter/Y confirm · N/H/← cancel · zero moves · zero journal writes")
+			} else if m.dryRunErr != nil {
+				lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(danger).Render("DRY PILOT FAILED · "+m.dryRunErr.Error()))
+			} else if m.dryRun.ProtocolVersion == 1 {
+				label := fmt.Sprintf("DRY PILOT COMPLETE · %d/%d verified · %d blocked · %d timed out · %s", m.dryRun.Verified, m.dryRun.Attempted, m.dryRun.Blocked, m.dryRun.TimedOut, m.dryRun.VerifiedHuman)
+				style := lipgloss.NewStyle().Bold(true).Foreground(lime)
+				if m.dryRun.Blocked > 0 || m.dryRun.TimedOut > 0 { style = style.Foreground(gold) }
+				lines = append(lines, "", style.Render(label))
+				if m.dryRun.Limited { lines = append(lines, fmt.Sprintf("Pilot stopped safely at limit %d of %d staged files.", m.dryRun.Limit, m.dryRun.TotalStaged)) }
+			}
+			lines = append(lines, "", "↑↓ inspect · D dry pilot · R reload · H/← return")
 			v[2] = strings.Join(lines, "\n")
 		case history:
 			lines := []string{fmt.Sprintf("%d journaled runs", m.dashboard.Journal.Runs)}
@@ -749,7 +851,7 @@ func (m model) View() tea.View {
 	if m.page == groups && m.contentFocus {
 		bridgeStatus = "GROUP INSPECTOR · Enter keeper · X stage · U undecided · C clear · files untouched"
 	} else if m.page == quarantine && m.contentFocus {
-		bridgeStatus = "QUARANTINE PREVIEW · R reload · no moves · no journal writes"
+		bridgeStatus = "QUARANTINE PREVIEW · D dry pilot · R reload · no moves · no journal writes"
 	}
 	footerLine := keyStyle.Render(" FILES UNTOUCHED ") + " " +
 		lipgloss.NewStyle().Foreground(lime).Render("DECISIONS ENABLED") + "  " +
