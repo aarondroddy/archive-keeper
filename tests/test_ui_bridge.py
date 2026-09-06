@@ -538,6 +538,28 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), b"do not overwrite")
             self.assertTrue(destination.exists())
 
+    def test_restore_race_never_overwrites_and_remains_restorable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); state = root / "journal.sqlite3"; source = root / "original.bin"
+            destination = root / "quarantine" / "original.bin"; keeper = root / "keeper.bin"
+            destination.parent.mkdir(); destination.write_bytes(b"archived")
+            journal = __import__("archive_keeper.core", fromlist=["Journal"]).Journal(state)
+            journal.create_run("race", root / "report.json", "apply")
+            journal.record_action("race", 1, keeper, source, destination, 8, "moved"); journal.close()
+            def race_probe(paths):
+                source.write_bytes(b"new original")
+                return {str(source): "missing", str(destination): "file"}, None
+            with (patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True),
+                  patch("archive_keeper.ui_bridge._bounded_path_probe", side_effect=[
+                      ({str(source): "missing", str(destination): "file"}, None),
+                      race_probe([source, destination]),
+                  ])):
+                result = controlled_restore_apply(state, "race", "RESTORE UP TO 1 FILES", [root], 1)
+            self.assertTrue(result["ok"]); self.assertEqual(result["failed"], 1)
+            self.assertEqual(result["remaining"], 1)
+            self.assertEqual(source.read_bytes(), b"new original")
+            self.assertTrue(destination.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
