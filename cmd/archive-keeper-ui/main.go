@@ -53,7 +53,9 @@ type model struct {
 	fileCursor    int
 	inspecting    bool
 	confirmKeeper bool
+	confirmAction string
 	savingKeeper  bool
+	savingAction  bool
 	statusMessage string
 }
 
@@ -87,6 +89,8 @@ type dashboardSnapshot struct {
 		FileDecisions int            `json:"file_decisions"`
 		Favorites     int            `json:"favorites"`
 		Actions       map[string]int `json:"actions"`
+		KeeperPaths   map[string]string `json:"keeper_paths"`
+		FileActions   map[string]string `json:"file_actions"`
 	} `json:"decisions"`
 	Journal struct {
 		Exists       bool           `json:"exists"`
@@ -109,6 +113,13 @@ type dashboardLoadedMsg struct {
 type keeperSavedMsg struct {
 	groupID int
 	path    string
+	err     error
+}
+
+type actionSavedMsg struct {
+	groupID int
+	path    string
+	action  string
 	err     error
 }
 
@@ -203,6 +214,37 @@ func saveKeeper(groupID int, path string) tea.Cmd {
 	}
 }
 
+func saveFileAction(groupID int, path, action string) tea.Cmd {
+	return func() tea.Msg {
+		python, args := bridgeArgs("set-file-action")
+		for _, setting := range []struct{ env, flag string }{
+			{"ARCHIVE_KEEPER_REPORT", "--report"},
+			{"ARCHIVE_KEEPER_DECISIONS_DB", "--decisions-db"},
+		} {
+			if value := os.Getenv(setting.env); value != "" {
+				args = append(args, setting.flag, value)
+			}
+		}
+		args = append(args, "--group-id", strconv.Itoa(groupID), "--path", path, "--action", action)
+		output, err := exec.Command(python, args...).CombinedOutput()
+		var result keeperResult
+		if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
+			if err != nil {
+				return actionSavedMsg{groupID, path, action, fmt.Errorf("bridge command: %w", err)}
+			}
+			return actionSavedMsg{groupID, path, action, fmt.Errorf("bridge JSON: %w", jsonErr)}
+		}
+		if err != nil || !result.OK {
+			message := result.Error
+			if message == "" {
+				message = "file decision was not saved"
+			}
+			return actionSavedMsg{groupID, path, action, fmt.Errorf("%s", message)}
+		}
+		return actionSavedMsg{groupID: groupID, path: path, action: action}
+	}
+}
+
 func (m model) Init() tea.Cmd { return loadDashboard }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -220,6 +262,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.statusMessage = fmt.Sprintf("KEEPER SAVED · Group %d · no files moved", msg.groupID)
 		return m, loadDashboard
+	case actionSavedMsg:
+		m.savingAction = false
+		m.confirmAction = ""
+		if msg.err != nil {
+			m.statusMessage = "STAGING FAILED · " + msg.err.Error()
+			return m, nil
+		}
+		verb := "STAGED " + msg.action
+		if msg.action == "CLEAR" {
+			verb = "STAGED DECISION CLEARED"
+		}
+		m.statusMessage = verb + " · no files moved"
+		return m, loadDashboard
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.compact = msg.Width < 96
@@ -233,6 +288,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.contentFocus = m.page == groups
 			m.inspecting = false
 			m.fileCursor = 0
+			m.confirmKeeper = false
+			m.confirmAction = ""
 			return m, nil
 		}
 		if m.page == groups && m.contentFocus {
@@ -249,6 +306,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "n", "esc", "left", "h":
 					m.confirmKeeper = false
 					m.statusMessage = "Keeper selection cancelled"
+				}
+				return m, nil
+			}
+			if m.confirmAction != "" {
+				switch msg.String() {
+				case "y", "enter":
+					if !m.savingAction {
+						group := m.dashboard.Report.LargestGroups[m.groupCursor]
+						file := group.Files[m.fileCursor]
+						m.savingAction = true
+						m.statusMessage = "SAVING STAGED DECISION…"
+						return m, saveFileAction(group.GroupID, file.Path, m.confirmAction)
+					}
+				case "n", "esc", "left", "h":
+					m.confirmAction = ""
+					m.statusMessage = "Staged decision cancelled"
 				}
 				return m, nil
 			}
@@ -278,10 +351,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.inspecting = true
 					m.fileCursor = 0
 				}
+			case "x":
+				if m.inspecting {
+					m.confirmAction = "QUARANTINE"
+					m.statusMessage = "Confirm quarantine staging"
+				}
+			case "u":
+				if m.inspecting {
+					m.confirmAction = "UNDECIDED"
+					m.statusMessage = "Confirm undecided staging"
+				}
+			case "c":
+				if m.inspecting {
+					m.confirmAction = "CLEAR"
+					m.statusMessage = "Confirm clearing staged decision"
+				}
 			case "esc", "left", "h":
 				if m.inspecting {
 					m.inspecting = false
 					m.fileCursor = 0
+					m.confirmKeeper = false
+					m.confirmAction = ""
 				} else {
 					m.contentFocus = false
 				}
@@ -403,7 +493,7 @@ func (m model) pageView(page screen, width int) string {
 		quarantine: {"QUARANTINE AIRLOCK", "Preview first; mutation always requires explicit confirmation", "1  Inspect the generated plan\n2  Run a bounded dry pilot\n3  Verify source and keeper\n4  Confirm --apply\n\nSafety interlocks remain owned by the Python engine."},
 		restore: {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history: {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
-		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose\nH or ←      back\n1–7         jump to screen\nq           quit\n\nKeeper choices write only to decisions.sqlite3. Archive files remain untouched. Destructive actions require words, state, and confirmation."},
+		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nH or ←      back\n1–7         jump to screen\nq           quit\n\nChoices write only to decisions.sqlite3. Archive files remain untouched. Destructive actions require words, state, and confirmation."},
 	}
 	v := spec[page]
 	if m.loadErr == nil && m.dashboard.ProtocolVersion == 1 {
@@ -421,7 +511,15 @@ func (m model) pageView(page screen, width int) string {
 					marker := "  "
 					if i == m.fileCursor { marker = "▶ " }
 					hint := "COPY"
-					if files[i].OriginalHint { hint = "ORIGINAL HINT" }
+					groupKey := strconv.Itoa(group.GroupID)
+					actionKey := groupKey + "\n" + files[i].Path
+					if m.dashboard.Decisions.KeeperPaths[groupKey] == files[i].Path {
+						hint = "KEEPER"
+					} else if action := m.dashboard.Decisions.FileActions[actionKey]; action != "" {
+						hint = action
+					} else if files[i].OriginalHint {
+						hint = "ORIGINAL HINT"
+					}
 					line := fmt.Sprintf("%s%-13s %10s  %s", marker, hint, files[i].SizeHuman, compactPath(files[i].Path, max(20, width-39)))
 					if i == m.fileCursor {
 						line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line)
@@ -431,8 +529,15 @@ func (m model) pageView(page screen, width int) string {
 				if m.confirmKeeper {
 					lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("SAVE THIS COPY AS KEEPER?"),
 						"Enter/Y confirm · N/H/← cancel · this records a decision only")
+				} else if m.confirmAction != "" {
+					prompt := "STAGE " + m.confirmAction + " FOR THIS COPY?"
+					if m.confirmAction == "CLEAR" {
+						prompt = "CLEAR THE STAGED DECISION FOR THIS COPY?"
+					}
+					lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render(prompt),
+						"Enter/Y confirm · N/H/← cancel · no archive files move")
 				} else {
-					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · ↑↓ inspect · Enter choose keeper · H/← back", m.fileCursor+1, len(files)))
+					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · Enter keeper · X quarantine · U undecided · C clear · H/← back", m.fileCursor+1, len(files)))
 				}
 				if m.statusMessage != "" { lines = append(lines, "", m.statusMessage) }
 				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · keeper decisions enabled", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n"), width, cyan)
@@ -451,7 +556,7 @@ func (m model) pageView(page screen, width int) string {
 			if len(lines) == 0 {
 				lines = append(lines, "No duplicate groups are loaded yet.")
 			}
-			v[2] = strings.Join(lines, "\n") + "\n\n↑↓ select · Enter inspect copies · Esc return to menu"
+			v[2] = strings.Join(lines, "\n") + "\n\n↑↓ select · Enter inspect copies · H/← return to menu"
 		case decisions:
 			v[2] = fmt.Sprintf("★ KEEP       %d selected originals\n◇ QUARANTINE %d staged copies\n? UNDECIDED  %d marked for attention\n\n%d favorites saved.",
 				m.dashboard.Decisions.Keepers,
@@ -491,7 +596,7 @@ func (m model) View() tea.View {
 		bridgeStatus = fmt.Sprintf("Python %s · protocol v%d · read-only", m.dashboard.Version, m.dashboard.ProtocolVersion)
 	}
 	if m.page == groups && m.contentFocus {
-		bridgeStatus = "GROUP INSPECTOR · ↑↓ select · Enter open/choose · H/← back · files untouched"
+		bridgeStatus = "GROUP INSPECTOR · Enter keeper · X stage · U undecided · C clear · files untouched"
 	}
 	footerLine := keyStyle.Render(" FILES UNTOUCHED ") + " " +
 		lipgloss.NewStyle().Foreground(lime).Render("DECISIONS ENABLED") + "  " +
