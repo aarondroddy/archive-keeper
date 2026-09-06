@@ -65,3 +65,20 @@ collision; the UI does not overwrite or reconcile it. After the exact bounded
 confirmation phrase is entered, the engine repeats its checks, performs a
 no-replace move, journals the result, and displays `RESTORE VERIFIED` with
 restored, failed, and remaining counts.
+
+## Mount array health
+
+The dashboard reads `/proc/self/mountinfo` and reports every configured storage
+root with an explicit ONLINE or OFFLINE state, filesystem type, and mounted
+source. Reading mount metadata does not traverse the NAS. Controlled quarantine
+and restore remain locked unless every configured root is an actual mount; the
+Python engine repeats its own live checks before moving anything.
+
+## Interactive galaxy map
+
+Duplicate Groups opens in Galaxy view. Each configured mount is rendered as a
+drive region, and the largest recoverable duplicate groups appear as selectable
+star systems within that region. Star intensity is proportional to recoverable
+bytes, the selected system pulses during the live scan, arrow keys move between
+systems, and Enter opens the existing copy inspector. Press `G` to switch
+between Galaxy and the compact list fallback.
