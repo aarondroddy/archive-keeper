@@ -71,6 +71,20 @@ type model struct {
 	applying      bool
 	applyResult   controlledApplyResult
 	applyErr      error
+	restoreCatalog restoreCatalog
+	restoreCatalogLoading bool
+	restoreCatalogErr error
+	restoreCursor int
+	restoreInspecting bool
+	restorePlan restorePlan
+	restorePlanLoading bool
+	restorePlanErr error
+	restorePlanCursor int
+	confirmRestore bool
+	restoreInput string
+	restoring bool
+	restoreResult controlledRestoreResult
+	restoreErr error
 }
 
 type dashboardSnapshot struct {
@@ -205,6 +219,43 @@ type controlledApplyFinishedMsg struct {
 	result controlledApplyResult
 	err    error
 }
+
+type restoreRun struct {
+	RunID string `json:"run_id"`
+	Status string `json:"status"`
+	RestorableFiles int `json:"restorable_files"`
+	RestorableHuman string `json:"restorable_human"`
+}
+type restoreCatalog struct {
+	ProtocolVersion int `json:"protocol_version"`
+	OK bool `json:"ok"`
+	Runs []restoreRun `json:"runs"`
+	Warnings []string `json:"warnings"`
+}
+type restoreCatalogLoadedMsg struct { catalog restoreCatalog; err error }
+type restorePlan struct {
+	ProtocolVersion int `json:"protocol_version"`
+	OK bool `json:"ok"`
+	RunID string `json:"run_id"`
+	TotalFiles int `json:"total_files"`
+	TotalHuman string `json:"total_human"`
+	ReadyFiles int `json:"ready_files"`
+	BlockedFiles int `json:"blocked_files"`
+	Items []struct {
+		GroupID int `json:"group_id"`; Status string `json:"status"`; SizeHuman string `json:"size_human"`
+		Source string `json:"source"`; Keeper string `json:"keeper"`; Destination string `json:"destination"`
+		Warnings []string `json:"warnings"`
+	} `json:"items"`
+	Warnings []string `json:"warnings"`
+}
+type restorePlanLoadedMsg struct { plan restorePlan; err error }
+type controlledRestoreResult struct {
+	ProtocolVersion int `json:"protocol_version"`
+	OK bool `json:"ok"`; RunID string `json:"run_id"`; Restored int `json:"restored"`
+	BytesRestoredHuman string `json:"bytes_restored_human"`; Failed int `json:"failed"`
+	Remaining int `json:"remaining"`; Error string `json:"error"`
+}
+type controlledRestoreFinishedMsg struct { result controlledRestoreResult; err error }
 
 type keeperResult struct {
 	ProtocolVersion int    `json:"protocol_version"`
@@ -366,6 +417,51 @@ func appendApplyConfirmationInput(current, key string) string {
 	return current
 }
 
+func controlledRestoreLimit() int {
+	limit := 10
+	if value := os.Getenv("ARCHIVE_KEEPER_RESTORE_LIMIT"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed >= 1 && parsed <= 10 { limit = parsed }
+	}
+	return limit
+}
+func expectedRestoreConfirmation() string { return fmt.Sprintf("RESTORE UP TO %d FILES", controlledRestoreLimit()) }
+
+func restoreBridgeArgs(command string) (string, []string) {
+	python, args := bridgeArgs(command)
+	if value := os.Getenv("ARCHIVE_KEEPER_STATE_DB"); value != "" { args = append(args, "--state-db", value) }
+	return python, args
+}
+func mountRootArgs(args []string) []string {
+	if value := os.Getenv("ARCHIVE_KEEPER_MOUNT_ROOTS"); value != "" {
+		for _, root := range filepath.SplitList(value) { if root != "" { args = append(args, "--mount-root", root) } }
+	}
+	return args
+}
+func loadRestoreCatalog() tea.Msg {
+	python, args := restoreBridgeArgs("restore-catalog")
+	output, err := exec.Command(python, args...).CombinedOutput()
+	var catalog restoreCatalog
+	if jsonErr := json.Unmarshal(output, &catalog); jsonErr != nil { if err != nil { return restoreCatalogLoadedMsg{err: fmt.Errorf("bridge command: %w", err)} }; return restoreCatalogLoadedMsg{err: jsonErr} }
+	if err != nil || !catalog.OK { return restoreCatalogLoadedMsg{catalog: catalog, err: fmt.Errorf("%s", strings.Join(catalog.Warnings, "; "))} }
+	return restoreCatalogLoadedMsg{catalog: catalog}
+}
+func loadRestorePlan(runID string) tea.Cmd { return func() tea.Msg {
+	python, args := restoreBridgeArgs("restore-plan")
+	args = mountRootArgs(append(args, "--run-id", runID))
+	output, err := exec.Command(python, args...).CombinedOutput(); var plan restorePlan
+	if jsonErr := json.Unmarshal(output, &plan); jsonErr != nil { if err != nil { return restorePlanLoadedMsg{err: fmt.Errorf("bridge command: %w", err)} }; return restorePlanLoadedMsg{err: jsonErr} }
+	if err != nil || !plan.OK { return restorePlanLoadedMsg{plan: plan, err: fmt.Errorf("%s", strings.Join(plan.Warnings, "; "))} }
+	return restorePlanLoadedMsg{plan: plan}
+} }
+func runControlledRestore(runID, confirmation string) tea.Cmd { return func() tea.Msg {
+	python, args := restoreBridgeArgs("restore-apply")
+	args = mountRootArgs(append(args, "--run-id", runID, "--limit", strconv.Itoa(controlledRestoreLimit()), "--confirm", confirmation))
+	output, err := exec.Command(python, args...).CombinedOutput(); var result controlledRestoreResult
+	if jsonErr := json.Unmarshal(output, &result); jsonErr != nil { if err != nil { return controlledRestoreFinishedMsg{err: fmt.Errorf("bridge command: %w", err)} }; return controlledRestoreFinishedMsg{err: jsonErr} }
+	if err != nil || !result.OK { message := result.Error; if message == "" { message = "controlled restore did not complete" }; return controlledRestoreFinishedMsg{result: result, err: fmt.Errorf("%s", message)} }
+	return controlledRestoreFinishedMsg{result: result}
+} }
+
 func runControlledApply(confirmation string) tea.Cmd {
 	return func() tea.Msg {
 		python, args := bridgeArgs("quarantine-apply")
@@ -518,11 +614,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyErr = msg.err
 		m.planLoading = true
 		return m, loadQuarantinePlan
+	case restoreCatalogLoadedMsg:
+		m.restoreCatalogLoading = false; m.restoreCatalog = msg.catalog; m.restoreCatalogErr = msg.err
+		if m.restoreCursor >= len(m.restoreCatalog.Runs) { m.restoreCursor = max(0, len(m.restoreCatalog.Runs)-1) }
+	case restorePlanLoadedMsg:
+		m.restorePlanLoading = false; m.restorePlan = msg.plan; m.restorePlanErr = msg.err
+		if m.restorePlanCursor >= len(m.restorePlan.Items) { m.restorePlanCursor = max(0, len(m.restorePlan.Items)-1) }
+	case controlledRestoreFinishedMsg:
+		m.restoring = false; m.confirmRestore = false; m.restoreInput = ""; m.restoreResult = msg.result; m.restoreErr = msg.err
+		m.restorePlanLoading = true
+		return m, loadRestorePlan(m.restorePlan.RunID)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.compact = msg.Width < 96
 	case tea.KeyPressMsg:
 		shortcut := strings.ToLower(msg.String())
+		if m.confirmRestore {
+			key := msg.String()
+			switch key {
+			case "ctrl+c": return m, tea.Quit
+			case "enter":
+				if m.restoreInput == expectedRestoreConfirmation() && !m.restoring { m.restoring = true; m.restoreErr = nil; return m, runControlledRestore(m.restorePlan.RunID, m.restoreInput) }
+				m.restoreErr = fmt.Errorf("confirmation phrase does not match")
+			case "backspace", "ctrl+h": runes := []rune(m.restoreInput); if len(runes) > 0 { m.restoreInput = string(runes[:len(runes)-1]) }
+			case "left", "ctrl+g": m.confirmRestore = false; m.restoreInput = ""; m.restoreErr = nil
+			default: m.restoreInput = appendApplyConfirmationInput(m.restoreInput, key)
+			}
+			return m, nil
+		}
 		if m.confirmApply {
 			key := msg.String()
 			switch key {
@@ -553,7 +672,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "1", "2", "3", "4", "5", "6", "7":
 			i := int(shortcut[0] - '1')
 			m.selected, m.page = i, destinations[i].page
-			m.contentFocus = m.page == groups || m.page == quarantine
+			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore
 			m.inspecting = false
 			m.fileCursor = 0
 			m.confirmKeeper = false
@@ -566,6 +685,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.planErr = nil
 				return m, loadQuarantinePlan
 			}
+			if m.page == restore { m.restoreCatalogLoading = true; m.restoreCatalogErr = nil; m.restoreInspecting = false; return m, loadRestoreCatalog }
 			return m, nil
 		}
 		if m.page == groups && m.contentFocus {
@@ -700,6 +820,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.page == restore && m.contentFocus {
+			if m.restoreInspecting {
+				switch shortcut {
+				case "up", "k": if m.restorePlanCursor > 0 { m.restorePlanCursor-- }
+				case "down", "j": if m.restorePlanCursor < len(m.restorePlan.Items)-1 { m.restorePlanCursor++ }
+				case "r": m.restorePlanLoading = true; m.restorePlanErr = nil; m.restoreResult = controlledRestoreResult{}; m.restoreErr = nil; return m, loadRestorePlan(m.restorePlan.RunID)
+				case "a": if m.restorePlan.ReadyFiles > 0 && m.restorePlan.BlockedFiles == 0 { m.confirmRestore = true; m.restoreInput = ""; m.restoreErr = nil }
+				case "esc", "left", "h": m.restoreInspecting = false; m.restorePlanCursor = 0; m.confirmRestore = false; m.restoreCatalogLoading = true; return m, loadRestoreCatalog
+				}
+			} else {
+				switch shortcut {
+				case "up", "k": if m.restoreCursor > 0 { m.restoreCursor-- }
+				case "down", "j": if m.restoreCursor < len(m.restoreCatalog.Runs)-1 { m.restoreCursor++ }
+				case "enter", "right", "l": if len(m.restoreCatalog.Runs) > 0 { m.restoreInspecting = true; m.restorePlanLoading = true; m.restorePlanErr = nil; return m, loadRestorePlan(m.restoreCatalog.Runs[m.restoreCursor].RunID) }
+				case "r": m.restoreCatalogLoading = true; m.restoreCatalogErr = nil; return m, loadRestoreCatalog
+				case "esc", "left", "h": m.contentFocus = false; m.page = home
+				}
+			}
+			return m, nil
+		}
 		switch shortcut {
 		case "up", "k":
 			if m.selected > 0 { m.selected-- }
@@ -707,12 +847,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.selected < len(destinations)-1 { m.selected++ }
 		case "enter", "right", "l":
 			m.page = destinations[m.selected].page
-			m.contentFocus = m.page == groups || m.page == quarantine
+			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore
 			if m.page == quarantine {
 				m.planLoading = true
 				m.planErr = nil
 				return m, loadQuarantinePlan
 			}
+			if m.page == restore { m.restoreCatalogLoading = true; m.restoreCatalogErr = nil; m.restoreInspecting = false; return m, loadRestoreCatalog }
 		case "esc", "left", "h":
 			m.page = home
 		}
@@ -971,6 +1112,35 @@ func (m model) pageView(page screen, width int) string {
 			}
 			lines = append(lines, "", "↑↓ inspect · D dry pilot · R reload · H/← return")
 			v[2] = strings.Join(lines, "\n")
+		case restore:
+			if !m.restoreInspecting {
+				if m.restoreCatalogLoading { v[2] = "Reading journaled quarantine runs…\n\nNo files are being changed."; break }
+				if m.restoreCatalogErr != nil { v[2] = lipgloss.NewStyle().Bold(true).Foreground(danger).Render("RESTORE CATALOG UNAVAILABLE")+"\n"+m.restoreCatalogErr.Error()+"\n\nR reload · H/← return"; break }
+				lines := []string{"Choose a quarantine run to preview:" , ""}
+				for i, run := range m.restoreCatalog.Runs {
+					marker := "  "; if i == m.restoreCursor { marker = "▶ " }
+					line := fmt.Sprintf("%s%-28s %3d files  %10s  %s", marker, run.RunID, run.RestorableFiles, run.RestorableHuman, run.Status)
+					if i == m.restoreCursor { line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line) }
+					lines = append(lines, line)
+				}
+				if len(m.restoreCatalog.Runs) == 0 { lines = append(lines, "No quarantined files remain to restore.") }
+				lines = append(lines, "", "↑↓ select · Enter preview · R reload · H/← return")
+				v[2] = strings.Join(lines, "\n"); break
+			}
+			if m.restorePlanLoading { v[2] = "Checking restore destinations and collisions…\n\nNo files are being changed."; break }
+			if m.restorePlanErr != nil { v[2] = lipgloss.NewStyle().Bold(true).Foreground(danger).Render("RESTORE PREVIEW UNAVAILABLE")+"\n"+m.restorePlanErr.Error()+"\n\nH/← return"; break }
+			lines := []string{fmt.Sprintf("Run %s · %d files · %s · %d ready · %d blocked", m.restorePlan.RunID, m.restorePlan.TotalFiles, m.restorePlan.TotalHuman, m.restorePlan.ReadyFiles, m.restorePlan.BlockedFiles), ""}
+			visible := max(3, min(8, m.height-24)); start := 0
+			if m.restorePlanCursor >= visible { start = m.restorePlanCursor-visible+1 }; end := min(len(m.restorePlan.Items), start+visible)
+			for i := start; i < end; i++ { item := m.restorePlan.Items[i]; marker := "  "; if i == m.restorePlanCursor { marker = "▶ " }; line := fmt.Sprintf("%s%-7s Group %-5d %10s  %s", marker, item.Status, item.GroupID, item.SizeHuman, compactPath(item.Source, max(18, width-48))); if i == m.restorePlanCursor { line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line) } else if item.Status == "BLOCKED" { line = lipgloss.NewStyle().Foreground(danger).Render(line) }; lines = append(lines, line) }
+			if len(m.restorePlan.Items) > 0 { item := m.restorePlan.Items[m.restorePlanCursor]; lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("RESTORE TO"), compactPath(item.Source, max(24,width-10)), lipgloss.NewStyle().Bold(true).Foreground(pink).Render("FROM QUARANTINE"), compactPath(item.Destination,max(24,width-10))); if len(item.Warnings)>0 { lines=append(lines,lipgloss.NewStyle().Bold(true).Foreground(danger).Render("BLOCKED · "+strings.Join(item.Warnings," · "))) } else { lines=append(lines,lipgloss.NewStyle().Bold(true).Foreground(lime).Render("READY · original path is clear; no-overwrite guard armed")) } }
+			if m.restoring { lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(pink).Render("RESTORE IN PROGRESS · do not close this terminal"))
+			} else if m.confirmRestore { phrase:=expectedRestoreConfirmation(); lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(danger).Render("FINAL SAFETY GATE · QUARANTINED FILES WILL MOVE"),"Type exactly: "+phrase,lipgloss.NewStyle().Bold(true).Foreground(gold).Render("> "+m.restoreInput+"▌"),"Enter submits · ← or Ctrl+G cancels"); if m.restoreErr != nil { lines=append(lines,lipgloss.NewStyle().Foreground(danger).Render(m.restoreErr.Error())) }
+			} else if m.restoreErr != nil { lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(danger).Render("RESTORE FAILED · "+m.restoreErr.Error()))
+			} else if m.restoreResult.ProtocolVersion == 1 { label:=fmt.Sprintf("RESTORE VERIFIED · %d restored · %s · %d failed · %d remaining",m.restoreResult.Restored,m.restoreResult.BytesRestoredHuman,m.restoreResult.Failed,m.restoreResult.Remaining); style:=lipgloss.NewStyle().Bold(true).Foreground(lime); if m.restoreResult.Failed>0 { style=style.Foreground(gold) }; lines=append(lines,"",style.Render(label),"Run ID: "+m.restoreResult.RunID) }
+			if m.restorePlan.ReadyFiles > 0 && m.restorePlan.BlockedFiles == 0 && !m.confirmRestore && !m.restoring { lines=append(lines,"",lipgloss.NewStyle().Bold(true).Foreground(pink).Render("A controlled restore · typed confirmation required")) }
+			lines=append(lines,"","↑↓ inspect · A controlled restore · R reload · H/← runs")
+			v[2]=strings.Join(lines,"\n")
 		case history:
 			lines := []string{fmt.Sprintf("%d journaled runs", m.dashboard.Journal.Runs)}
 			for _, run := range m.dashboard.Journal.LatestRuns {
@@ -1012,6 +1182,9 @@ func (m model) View() tea.View {
 		} else if m.applying {
 			bridgeStatus = "CONTROLLED QUARANTINE · bounded apply · journal enabled"
 		}
+	} else if m.page == restore && m.contentFocus {
+		bridgeStatus = "RESTORE PREVIEW · journaled moves only · no overwrite"
+		if m.confirmRestore { bridgeStatus = "FINAL RESTORE GATE · type the exact phrase · ← cancels" } else if m.restoring { bridgeStatus = "CONTROLLED RESTORE · bounded apply · journal enabled" }
 	}
 	footerLine := keyStyle.Render(" FILES UNTOUCHED ") + " " +
 		lipgloss.NewStyle().Foreground(lime).Render("DECISIONS ENABLED") + "  " +
