@@ -21,6 +21,7 @@ from .cli import (
 )
 from .core import (
     ArchiveKeeperError,
+    bounded_quarantine_preflight,
     human_bytes,
     load_rmlint_groups,
     mount_root_for,
@@ -488,6 +489,93 @@ def quarantine_plan_snapshot(
     return result
 
 
+def quarantine_dry_run(
+    report: Path,
+    decisions_db: Path,
+    mount_roots: list[Path] | None = None,
+    quarantine_name: str = DEFAULT_QUARANTINE_NAME,
+    run_id: str = PREVIEW_RUN_ID,
+    limit: int = 10,
+    verify_timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Run bounded engine preflight checks without moving files or writing a journal."""
+    roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
+    plan = quarantine_plan_snapshot(
+        report, decisions_db, roots, quarantine_name, run_id
+    )
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": plan["ok"],
+        "mode": "dry-run",
+        "operation": "quarantine-dry-run",
+        "files_moved": 0,
+        "journal_writes": 0,
+        "limit": max(1, int(limit)),
+        "verify_timeout": max(0.1, float(verify_timeout)),
+        "total_staged": plan["total_files"],
+        "attempted": 0,
+        "verified": 0,
+        "blocked": 0,
+        "timed_out": 0,
+        "verified_bytes": 0,
+        "verified_human": human_bytes(0),
+        "limited": False,
+        "items": [],
+        "warnings": list(plan["warnings"]),
+    }
+    if not plan["ok"]:
+        return result
+
+    selected = plan["items"][: result["limit"]]
+    result["limited"] = len(plan["items"]) > len(selected)
+    for item in selected:
+        dry_item = {
+            "group_id": item["group_id"],
+            "source": item["source"],
+            "keeper": item["keeper"],
+            "destination": item["destination"],
+            "size_human": item["size_human"],
+            "outcome": "blocked",
+            "message": " · ".join(item["warnings"]),
+        }
+        result["attempted"] += 1
+        if item["status"] != "READY":
+            result["blocked"] += 1
+            result["items"].append(dry_item)
+            continue
+
+        source = normalize_path(item["source"])
+        keeper = normalize_path(item["keeper"])
+        destination = normalize_path(item["destination"])
+        source_root = mount_root_for(source, roots)
+        if source_root is None:
+            result["blocked"] += 1
+            dry_item["message"] = "source is outside configured mount roots"
+            result["items"].append(dry_item)
+            continue
+        ok, message, timed_out, outcome = bounded_quarantine_preflight(
+            keeper,
+            source,
+            destination,
+            source_root,
+            expected_size=int(item["size"]),
+            timeout=result["verify_timeout"],
+        )
+        dry_item["outcome"] = outcome if ok else ("timeout" if timed_out else "blocked")
+        dry_item["message"] = message
+        if ok:
+            result["verified"] += 1
+            result["verified_bytes"] += int(item["size"])
+        else:
+            result["blocked"] += 1
+        if timed_out:
+            result["timed_out"] += 1
+        result["items"].append(dry_item)
+
+    result["verified_human"] = human_bytes(result["verified_bytes"])
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="archive-keeper-ui-bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -518,6 +606,16 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
     preview.add_argument("--quarantine-name", default=DEFAULT_QUARANTINE_NAME)
     preview.add_argument("--run-id", default=PREVIEW_RUN_ID)
+    dry_run = subparsers.add_parser(
+        "quarantine-dry-run", help="Verify a bounded set of staged files without mutation"
+    )
+    dry_run.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    dry_run.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
+    dry_run.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
+    dry_run.add_argument("--quarantine-name", default=DEFAULT_QUARANTINE_NAME)
+    dry_run.add_argument("--run-id", default=PREVIEW_RUN_ID)
+    dry_run.add_argument("--limit", type=int, default=10)
+    dry_run.add_argument("--verify-timeout", type=float, default=5.0)
     return parser
 
 
@@ -546,6 +644,19 @@ def main(argv: list[str] | None = None) -> int:
             args.mount_roots,
             args.quarantine_name,
             args.run_id,
+        )
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        return 0 if result["ok"] else 1
+    if args.command == "quarantine-dry-run":
+        result = quarantine_dry_run(
+            args.report,
+            args.decisions_db,
+            args.mount_roots,
+            args.quarantine_name,
+            args.run_id,
+            args.limit,
+            args.verify_timeout,
         )
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
