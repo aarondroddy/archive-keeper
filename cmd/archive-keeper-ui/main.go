@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -57,6 +58,10 @@ type model struct {
 	savingKeeper  bool
 	savingAction  bool
 	statusMessage string
+	plan          quarantinePlan
+	planLoading   bool
+	planErr       error
+	planCursor    int
 }
 
 type dashboardSnapshot struct {
@@ -123,6 +128,34 @@ type actionSavedMsg struct {
 	err     error
 }
 
+type quarantinePlan struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	OK              bool   `json:"ok"`
+	Mode            string `json:"mode"`
+	FilesMoved      int    `json:"files_moved"`
+	RunID           string `json:"run_id"`
+	QuarantineName  string `json:"quarantine_name"`
+	TotalFiles      int    `json:"total_files"`
+	TotalHuman      string `json:"total_human"`
+	ReadyFiles      int    `json:"ready_files"`
+	BlockedFiles    int    `json:"blocked_files"`
+	Items           []struct {
+		GroupID     int      `json:"group_id"`
+		Status      string   `json:"status"`
+		SizeHuman   string   `json:"size_human"`
+		Source      string   `json:"source"`
+		Keeper      string   `json:"keeper"`
+		Destination string   `json:"destination"`
+		Warnings    []string `json:"warnings"`
+	} `json:"items"`
+	Warnings []string `json:"warnings"`
+}
+
+type quarantinePlanLoadedMsg struct {
+	plan quarantinePlan
+	err  error
+}
+
 type keeperResult struct {
 	ProtocolVersion int    `json:"protocol_version"`
 	OK              bool   `json:"ok"`
@@ -181,6 +214,46 @@ func bridgeArgs(command string) (string, []string) {
 	}
 	args := []string{"-m", "archive_keeper.ui_bridge", command}
 	return python, args
+}
+
+func loadQuarantinePlan() tea.Msg {
+	python, args := bridgeArgs("quarantine-plan")
+	for _, setting := range []struct{ env, flag string }{
+		{"ARCHIVE_KEEPER_REPORT", "--report"},
+		{"ARCHIVE_KEEPER_DECISIONS_DB", "--decisions-db"},
+		{"ARCHIVE_KEEPER_QUARANTINE_NAME", "--quarantine-name"},
+		{"ARCHIVE_KEEPER_RUN_ID", "--run-id"},
+	} {
+		if value := os.Getenv(setting.env); value != "" {
+			args = append(args, setting.flag, value)
+		}
+	}
+	if value := os.Getenv("ARCHIVE_KEEPER_MOUNT_ROOTS"); value != "" {
+		for _, root := range filepath.SplitList(value) {
+			if root != "" {
+				args = append(args, "--mount-root", root)
+			}
+		}
+	}
+	output, err := exec.Command(python, args...).CombinedOutput()
+	var plan quarantinePlan
+	if jsonErr := json.Unmarshal(output, &plan); jsonErr != nil {
+		if err != nil {
+			return quarantinePlanLoadedMsg{err: fmt.Errorf("bridge command: %w", err)}
+		}
+		return quarantinePlanLoadedMsg{err: fmt.Errorf("bridge JSON: %w", jsonErr)}
+	}
+	if err != nil || !plan.OK {
+		message := "quarantine preview was not generated"
+		if len(plan.Warnings) > 0 {
+			message = strings.Join(plan.Warnings, "; ")
+		}
+		return quarantinePlanLoadedMsg{err: fmt.Errorf("%s", message)}
+	}
+	if plan.ProtocolVersion != 1 {
+		return quarantinePlanLoadedMsg{err: fmt.Errorf("unsupported bridge protocol %d", plan.ProtocolVersion)}
+	}
+	return quarantinePlanLoadedMsg{plan: plan}
 }
 
 func saveKeeper(groupID int, path string) tea.Cmd {
@@ -275,6 +348,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.statusMessage = verb + " · no files moved"
 		return m, loadDashboard
+	case quarantinePlanLoadedMsg:
+		m.planLoading = false
+		m.plan = msg.plan
+		m.planErr = msg.err
+		if m.planCursor >= len(m.plan.Items) {
+			m.planCursor = max(0, len(m.plan.Items)-1)
+		}
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.compact = msg.Width < 96
@@ -285,11 +365,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "1", "2", "3", "4", "5", "6", "7":
 			i := int(msg.String()[0] - '1')
 			m.selected, m.page = i, destinations[i].page
-			m.contentFocus = m.page == groups
+			m.contentFocus = m.page == groups || m.page == quarantine
 			m.inspecting = false
 			m.fileCursor = 0
 			m.confirmKeeper = false
 			m.confirmAction = ""
+			if m.page == quarantine {
+				m.planLoading = true
+				m.planErr = nil
+				return m, loadQuarantinePlan
+			}
 			return m, nil
 		}
 		if m.page == groups && m.contentFocus {
@@ -378,6 +463,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.page == quarantine && m.contentFocus {
+			switch msg.String() {
+			case "up", "k":
+				if m.planCursor > 0 { m.planCursor-- }
+			case "down", "j":
+				if m.planCursor < len(m.plan.Items)-1 { m.planCursor++ }
+			case "r":
+				m.planLoading = true
+				m.planErr = nil
+				return m, loadQuarantinePlan
+			case "esc", "left", "h":
+				m.contentFocus = false
+				m.page = home
+			}
+			return m, nil
+		}
 		switch msg.String() {
 		case "up", "k":
 			if m.selected > 0 { m.selected-- }
@@ -385,7 +486,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.selected < len(destinations)-1 { m.selected++ }
 		case "enter", "right", "l":
 			m.page = destinations[m.selected].page
-			m.contentFocus = m.page == groups
+			m.contentFocus = m.page == groups || m.page == quarantine
+			if m.page == quarantine {
+				m.planLoading = true
+				m.planErr = nil
+				return m, loadQuarantinePlan
+			}
 		case "esc", "left", "h":
 			m.page = home
 		}
@@ -563,6 +669,51 @@ func (m model) pageView(page screen, width int) string {
 				m.dashboard.Decisions.Actions["QUARANTINE"],
 				m.dashboard.Decisions.Actions["UNDECIDED"],
 				m.dashboard.Decisions.Favorites)
+		case quarantine:
+			if m.planLoading {
+				v[2] = "Scanning staged decisions and checking live paths…\n\nNo files or journal rows are being changed."
+				break
+			}
+			if m.planErr != nil {
+				v[2] = lipgloss.NewStyle().Bold(true).Foreground(danger).Render("PREVIEW UNAVAILABLE") +
+					"\n" + m.planErr.Error() + "\n\nR reload · H/← return"
+				break
+			}
+			if len(m.plan.Items) == 0 {
+				v[2] = "No copies are staged for quarantine.\n\nOpen Duplicate Groups, inspect a group, then press X on a nonkeeper copy.\n\nR reload · H/← return"
+				break
+			}
+			lines := []string{
+				fmt.Sprintf("%d staged · %s · %d ready · %d blocked", m.plan.TotalFiles, m.plan.TotalHuman, m.plan.ReadyFiles, m.plan.BlockedFiles),
+				"",
+			}
+			visible := max(3, min(8, m.height-24))
+			start := 0
+			if m.planCursor >= visible { start = m.planCursor-visible+1 }
+			end := min(len(m.plan.Items), start+visible)
+			for i := start; i < end; i++ {
+				item := m.plan.Items[i]
+				marker := "  "
+				if i == m.planCursor { marker = "▶ " }
+				line := fmt.Sprintf("%s%-7s Group %-5d %10s  %s", marker, item.Status, item.GroupID, item.SizeHuman, compactPath(item.Source, max(18, width-48)))
+				if i == m.planCursor {
+					line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line)
+				} else if item.Status == "BLOCKED" {
+					line = lipgloss.NewStyle().Foreground(danger).Render(line)
+				}
+				lines = append(lines, line)
+			}
+			item := m.plan.Items[m.planCursor]
+			lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("SOURCE"), compactPath(item.Source, max(24, width-10)))
+			lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(lime).Render("KEEPER"), compactPath(item.Keeper, max(24, width-10)))
+			lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(pink).Render("DESTINATION"), compactPath(item.Destination, max(24, width-10)))
+			if len(item.Warnings) > 0 {
+				lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(danger).Render("BLOCKED · "+strings.Join(item.Warnings, " · ")))
+			} else {
+				lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(lime).Render("READY · structural and live checks passed"))
+			}
+			lines = append(lines, "", "↑↓ inspect · R reload · H/← return · preview only")
+			v[2] = strings.Join(lines, "\n")
 		case history:
 			lines := []string{fmt.Sprintf("%d journaled runs", m.dashboard.Journal.Runs)}
 			for _, run := range m.dashboard.Journal.LatestRuns {
@@ -597,6 +748,8 @@ func (m model) View() tea.View {
 	}
 	if m.page == groups && m.contentFocus {
 		bridgeStatus = "GROUP INSPECTOR · Enter keeper · X stage · U undecided · C clear · files untouched"
+	} else if m.page == quarantine && m.contentFocus {
+		bridgeStatus = "QUARANTINE PREVIEW · R reload · no moves · no journal writes"
 	}
 	footerLine := keyStyle.Render(" FILES UNTOUCHED ") + " " +
 		lipgloss.NewStyle().Foreground(lime).Render("DECISIONS ENABLED") + "  " +
