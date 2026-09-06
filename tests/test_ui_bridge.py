@@ -11,10 +11,13 @@ from unittest.mock import patch
 from archive_keeper.ui_bridge import (
     PROTOCOL_VERSION,
     controlled_quarantine_apply,
+    controlled_restore_apply,
     dashboard_snapshot,
     main,
     quarantine_dry_run,
     quarantine_plan_snapshot,
+    restore_catalog_snapshot,
+    restore_plan_snapshot,
     select_keeper,
     set_file_action,
 )
@@ -490,6 +493,50 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(result["failed"], 1)
             self.assertTrue(staged.exists())
             self.assertEqual(destination.read_bytes(), b"do not overwrite")
+
+    def test_restore_catalog_preview_and_controlled_apply_round_trip(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            state = root / "journal.sqlite3"
+            keeper, staged = root / "keeper.bin", root / "copy-a.bin"
+            keeper.write_bytes(b"x" * 4096); staged.write_bytes(b"x" * 4096)
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+            self.assertTrue(set_file_action(report, decisions, 1, staged, "QUARANTINE")["ok"])
+            with patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True):
+                moved = controlled_quarantine_apply(report, state, decisions,
+                    "QUARANTINE UP TO 1 FILES", [root], run_id="ui-restore-test", limit=1)
+                catalog = restore_catalog_snapshot(state)
+                plan = restore_plan_snapshot(state, "ui-restore-test", [root])
+                restored = controlled_restore_apply(state, "ui-restore-test",
+                    "RESTORE UP TO 1 FILES", [root], limit=1)
+            self.assertTrue(moved["ok"])
+            self.assertEqual(catalog["runs"][0]["run_id"], "ui-restore-test")
+            self.assertEqual(plan["ready_files"], 1)
+            self.assertTrue(restored["ok"])
+            self.assertEqual(restored["restored"], 1)
+            self.assertEqual(restored["remaining"], 0)
+            self.assertTrue(staged.exists())
+            self.assertFalse((root / "ArchiveKeeper Quarantine" / "ui-restore-test" / "copy-a.bin").exists())
+
+    def test_restore_blocks_existing_original_and_requires_exact_confirmation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); state = root / "journal.sqlite3"; source = root / "original.bin"
+            destination = root / "quarantine" / "original.bin"; keeper = root / "keeper.bin"
+            source.write_bytes(b"do not overwrite"); destination.parent.mkdir(); destination.write_bytes(b"archived")
+            journal = __import__("archive_keeper.core", fromlist=["Journal"]).Journal(state)
+            journal.create_run("collision", root / "report.json", "apply")
+            journal.record_action("collision", 1, keeper, source, destination, 8, "moved")
+            journal.close()
+            with patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True):
+                plan = restore_plan_snapshot(state, "collision", [root])
+                rejected = controlled_restore_apply(state, "collision", "yes", [root], limit=1)
+            self.assertEqual(plan["blocked_files"], 1)
+            self.assertIn("no overwrite", plan["items"][0]["warnings"][0])
+            self.assertFalse(rejected["ok"])
+            self.assertEqual(source.read_bytes(), b"do not overwrite")
+            self.assertTrue(destination.exists())
 
 
 if __name__ == "__main__":
