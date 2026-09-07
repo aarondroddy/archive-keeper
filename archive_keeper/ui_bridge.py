@@ -221,6 +221,88 @@ def _journal_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
     return result
 
 
+def history_run_snapshot(path: Path, run_id: str) -> dict[str, Any]:
+    """Return one journal run and its actions without modifying the database."""
+    path = normalize_path(path)
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": False,
+        "mode": "read-only",
+        "operation": "history-run",
+        "run": {},
+        "actions": [],
+        "status_counts": {},
+        "total_actions": 0,
+        "total_bytes": 0,
+        "total_human": human_bytes(0),
+        "warnings": [],
+    }
+    if not path.is_file():
+        result["warnings"].append(f"journal database not found: {path}")
+        return result
+
+    try:
+        with closing(_readonly_connection(path)) as connection:
+            if not _table_exists(connection, "runs"):
+                result["warnings"].append("journal runs table not found")
+                return result
+            row = connection.execute(
+                "SELECT run_id, created_at, report_path, mode, status "
+                "FROM runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                result["warnings"].append(f"journal run not found: {run_id}")
+                return result
+
+            created_at = float(row[1])
+            result["run"] = {
+                "run_id": str(row[0]),
+                "created_at": created_at,
+                "created_at_human": dt.datetime.fromtimestamp(
+                    created_at, tz=dt.timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "report_path": str(row[2]),
+                "mode": str(row[3]),
+                "status": str(row[4]),
+            }
+
+            if _table_exists(connection, "actions"):
+                rows = connection.execute(
+                    "SELECT id, group_id, keeper, source, destination, size, "
+                    "status, COALESCE(message, ''), created_at, updated_at "
+                    "FROM actions WHERE run_id=? ORDER BY id",
+                    (run_id,),
+                ).fetchall()
+                result["actions"] = [
+                    {
+                        "id": int(action[0]),
+                        "group_id": int(action[1]),
+                        "keeper": str(action[2]),
+                        "source": str(action[3]),
+                        "destination": str(action[4]),
+                        "size": int(action[5]),
+                        "size_human": human_bytes(int(action[5])),
+                        "status": str(action[6]),
+                        "message": str(action[7]),
+                        "created_at": float(action[8]),
+                        "updated_at": float(action[9]),
+                    }
+                    for action in rows
+                ]
+
+            result["total_actions"] = len(result["actions"])
+            result["total_bytes"] = sum(item["size"] for item in result["actions"])
+            result["total_human"] = human_bytes(result["total_bytes"])
+            result["status_counts"] = dict(Counter(
+                item["status"] for item in result["actions"]
+            ))
+            result["ok"] = True
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+        result["warnings"].append(f"cannot read journal run {run_id}: {exc}")
+    return result
+
+
 def dashboard_snapshot(
     report: Path, state_db: Path, decisions_db: Path,
     mount_roots: list[Path] | None = None,
@@ -1009,6 +1091,9 @@ def build_parser() -> argparse.ArgumentParser:
     apply_run.add_argument("--limit", type=int, default=MAX_CONTROLLED_APPLY_FILES)
     apply_run.add_argument("--verify-timeout", type=float, default=30.0)
     apply_run.add_argument("--confirm", required=True)
+    history_run = subparsers.add_parser("history-run", help="Inspect one journal run read-only")
+    history_run.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
+    history_run.add_argument("--run-id", required=True)
     restore_catalog = subparsers.add_parser("restore-catalog", help="List restorable runs")
     restore_catalog.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
     restore_plan = subparsers.add_parser("restore-plan", help="Preview a no-overwrite restore")
@@ -1081,7 +1166,9 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
         return 0 if result["ok"] else 1
-    if args.command == "restore-catalog":
+    if args.command == "history-run":
+        result = history_run_snapshot(args.state_db, args.run_id)
+    elif args.command == "restore-catalog":
         result = restore_catalog_snapshot(args.state_db)
     elif args.command == "restore-plan":
         result = restore_plan_snapshot(args.state_db, args.run_id, args.mount_roots)
