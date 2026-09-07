@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -167,6 +168,29 @@ func TestHistoryRunListShowsSelectionAndReadOnlyControls(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("history list missing %q: %q", want, got)
 		}
+	}
+}
+
+func TestHistoryRunListScrollsWithSelection(t *testing.T) {
+	var m model
+	m.height = 24
+	m.dashboard.Journal.Runs = 12
+	for i := 0; i < 12; i++ {
+		m.dashboard.Journal.LatestRuns = append(m.dashboard.Journal.LatestRuns, struct {
+			RunID  string `json:"run_id"`
+			Mode   string `json:"mode"`
+			Status string `json:"status"`
+		}{RunID: fmt.Sprintf("run-%02d", i), Mode: "apply", Status: "complete"})
+	}
+	m.historyCursor = 9
+	got := m.historyView(100)
+	for _, want := range []string{"run-09", "↑ 4 earlier runs", "↓ 2 later runs"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("scrolled history list missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "run-00") {
+		t.Fatalf("history viewport should not render off-screen runs: %q", got)
 	}
 }
 
