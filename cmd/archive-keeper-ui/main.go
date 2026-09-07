@@ -1771,6 +1771,102 @@ func (m model) homeView(width int) string {
 	return frame("MISSION CONTROL", "Read-only overview · no files move from this screen", body, width, pink)
 }
 
+func historyStatusColor(status string) color.Color {
+	switch strings.ToLower(status) {
+	case "moved", "restored", "complete":
+		return lime
+	case "failed", "stale", "blocked", "timeout", "timed-out":
+		return danger
+	default:
+		return gold
+	}
+}
+
+func historyStatusSummary(counts map[string]int) string {
+	if len(counts) == 0 {
+		return "no recorded actions"
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts { keys = append(keys, key) }
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s %d", strings.ToUpper(key), counts[key]))
+	}
+	return strings.Join(parts, " · ")
+}
+
+func (m model) historyView(width int) string {
+	if !m.historyInspecting {
+		lines := []string{fmt.Sprintf("%d journaled runs", m.dashboard.Journal.Runs), ""}
+		for i, run := range m.dashboard.Journal.LatestRuns {
+			line := fmt.Sprintf("  ≋ %s  %-8s  %s", compactPath(run.RunID, 28), run.Mode, strings.ToUpper(run.Status))
+			if i == m.historyCursor {
+				line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render("▶" + line[1:])
+			} else {
+				line = lipgloss.NewStyle().Foreground(historyStatusColor(run.Status)).Render(line)
+			}
+			lines = append(lines, line)
+		}
+		if len(m.dashboard.Journal.LatestRuns) == 0 {
+			lines = append(lines, "No journaled runs yet.")
+		}
+		lines = append(lines, "", "↑↓ select · Enter inspect run · R reload · H/← home",
+			"", mutedText.Render("Operational source: journal.sqlite3 (opened read-only)"))
+		return strings.Join(lines, "\n")
+	}
+
+	if m.historyLoading {
+		return lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("OPENING FLIGHT RECORD…") +
+			"\nReading the selected run without modifying its journal."
+	}
+	if m.historyErr != nil {
+		return lipgloss.NewStyle().Bold(true).Foreground(danger).Render("HISTORY UNAVAILABLE") +
+			"\n" + m.historyErr.Error() + "\n\nR retry · H/← runs"
+	}
+
+	detail := m.historyDetail
+	lines := []string{
+		fmt.Sprintf("RUN %s", detail.Run.RunID),
+		fmt.Sprintf("%s · %s · %s", detail.Run.CreatedAtHuman, detail.Run.Mode, strings.ToUpper(detail.Run.Status)),
+		fmt.Sprintf("%d actions · %s · %s", detail.TotalActions, detail.TotalHuman, historyStatusSummary(detail.StatusCounts)),
+		"",
+	}
+	if len(detail.Actions) == 0 {
+		lines = append(lines, "No file actions were recorded for this run.")
+	} else {
+		visible := max(3, min(7, m.height-22))
+		start := 0
+		if m.historyActionCursor >= visible { start = m.historyActionCursor-visible+1 }
+		end := min(len(detail.Actions), start+visible)
+		for i := start; i < end; i++ {
+			action := detail.Actions[i]
+			line := fmt.Sprintf("  %-9s G%-4d %-9s %s",
+				strings.ToUpper(action.Status), action.GroupID, action.SizeHuman,
+				compactPath(action.Source, max(16, width-44)))
+			if i == m.historyActionCursor {
+				line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render("▶" + line[1:])
+			} else {
+				line = lipgloss.NewStyle().Foreground(historyStatusColor(action.Status)).Render(line)
+			}
+			lines = append(lines, line)
+		}
+		if end < len(detail.Actions) {
+			lines = append(lines, mutedText.Render(fmt.Sprintf("+%d later actions", len(detail.Actions)-end)))
+		}
+		action := detail.Actions[m.historyActionCursor]
+		lines = append(lines, "",
+			lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("SOURCE"), compactPath(action.Source, max(24, width-8)),
+			lipgloss.NewStyle().Bold(true).Foreground(lime).Render("KEEPER"), compactPath(action.Keeper, max(24, width-8)),
+			lipgloss.NewStyle().Bold(true).Foreground(pink).Render("DESTINATION"), compactPath(action.Destination, max(24, width-8)))
+		if action.Message != "" {
+			lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(gold).Render("MESSAGE"), action.Message)
+		}
+	}
+	lines = append(lines, "", "↑↓ inspect actions · R reload · H/← runs · read-only")
+	return strings.Join(lines, "\n")
+}
+
 func (m model) pageView(page screen, width int) string {
 	spec := map[screen][3]string{
 		groups: {"DUPLICATE CONSTELLATIONS", "Browse groups by size, type, location, or confidence", "Group list and side-by-side copy inspector\n\nFilters  / search  ·  Space  potential  ·  Copies  path map\n\nEvery group keeps at least one verified original."},
@@ -1779,7 +1875,7 @@ func (m model) pageView(page screen, width int) string {
 		restore: {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history: {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
 		settings: {"STORAGE ARRAY SETUP", "Detect roots, save configuration, and run a safe duplicate scan", ""},
-		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n8           storage setup / rmlint scan\n1–8         jump to screen\nq           quit\n\nA clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
+		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\n8           storage setup / rmlint scan\n1–8         jump to screen\nq           quit\n\nA clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
 	}
 	v := spec[page]
 	if page == settings {
@@ -1983,14 +2079,7 @@ func (m model) pageView(page screen, width int) string {
 			lines=append(lines,"","↑↓ inspect · A controlled restore · R reload · H/← runs")
 			v[2]=strings.Join(lines,"\n")
 		case history:
-			lines := []string{fmt.Sprintf("%d journaled runs", m.dashboard.Journal.Runs)}
-			for _, run := range m.dashboard.Journal.LatestRuns {
-				lines = append(lines, fmt.Sprintf("≋ %-24s  %-8s  %s", run.RunID, run.Mode, run.Status))
-			}
-			if len(m.dashboard.Journal.LatestRuns) == 0 {
-				lines = append(lines, "No journaled runs yet.")
-			}
-			v[2] = strings.Join(lines, "\n") + "\n\nOperational source: journal.sqlite3 (opened read-only)"
+			v[2] = m.historyView(width)
 		}
 	}
 	return frame(v[0], v[1], v[2], width, cyan)
@@ -2029,6 +2118,9 @@ func (m model) View() tea.View {
 		if m.scanRunning {
 			bridgeStatus = "RMLINT SCAN · read-only file inspection · no cleanup script"
 		}
+	} else if m.page == history && m.contentFocus {
+		bridgeStatus = "FLIGHT RECORDER · journal opened read-only"
+		if m.historyInspecting { bridgeStatus = "RUN INSPECTOR · ↑↓ actions · R reload · no journal writes" }
 	} else if m.page == restore && m.contentFocus {
 		bridgeStatus = "RESTORE PREVIEW · journaled moves only · no overwrite"
 		if m.confirmRestore { bridgeStatus = "FINAL RESTORE GATE · type the exact phrase · ← cancels" } else if m.restoring { bridgeStatus = "CONTROLLED RESTORE · bounded apply · journal enabled" }
