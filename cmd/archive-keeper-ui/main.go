@@ -1799,7 +1799,17 @@ func historyStatusSummary(counts map[string]int) string {
 func (m model) historyView(width int) string {
 	if !m.historyInspecting {
 		lines := []string{fmt.Sprintf("%d journaled runs", m.dashboard.Journal.Runs), ""}
-		for i, run := range m.dashboard.Journal.LatestRuns {
+		visible := max(3, min(8, m.height-18))
+		start := 0
+		if m.historyCursor >= visible {
+			start = m.historyCursor-visible+1
+		}
+		end := min(len(m.dashboard.Journal.LatestRuns), start+visible)
+		if start > 0 {
+			lines = append(lines, mutedText.Render(fmt.Sprintf("↑ %d earlier runs", start)))
+		}
+		for i := start; i < end; i++ {
+			run := m.dashboard.Journal.LatestRuns[i]
 			line := fmt.Sprintf("  ≋ %s  %-8s  %s", compactPath(run.RunID, 28), run.Mode, strings.ToUpper(run.Status))
 			if i == m.historyCursor {
 				line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render("▶" + line[1:])
@@ -1807,6 +1817,9 @@ func (m model) historyView(width int) string {
 				line = lipgloss.NewStyle().Foreground(historyStatusColor(run.Status)).Render(line)
 			}
 			lines = append(lines, line)
+		}
+		if end < len(m.dashboard.Journal.LatestRuns) {
+			lines = append(lines, mutedText.Render(fmt.Sprintf("↓ %d later runs", len(m.dashboard.Journal.LatestRuns)-end)))
 		}
 		if len(m.dashboard.Journal.LatestRuns) == 0 {
 			lines = append(lines, "No journaled runs yet.")
