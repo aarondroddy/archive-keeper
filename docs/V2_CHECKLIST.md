@@ -34,6 +34,8 @@ path to a production-ready v2.
 - [x] Restore catalog, live collision preview, controlled restore, and verified
   result.
 - [x] Journal-backed History summary.
+- [x] Read-only History drill-down with per-run status totals and navigable
+  action details: group, size, source, keeper, destination, and message.
 - [x] Help screen with navigation and safety keys.
 - [x] Magic Keyboard alternatives for Escape: `H`, Left Arrow, and `Ctrl-G`
   in confirmation input.
@@ -73,8 +75,6 @@ path to a production-ready v2.
 
 ### Workflow depth
 
-- [ ] Add History drill-down for individual actions, messages, timestamps, and
-  source/destination paths.
 - [ ] Add UI controls for safe reconcile and retry workflows.
 - [ ] Add search, filtering, sorting, and pagination beyond the largest groups.
 - [ ] Add bulk decision review while enforcing at least one keeper.
