@@ -1398,21 +1398,23 @@ func (m model) currentGroupFiles() []struct {
 }
 
 func galaxyGlyph(value, maximum int64, selected bool, phase int) string {
-	if selected && phase%2 == 0 {
-		return "◉"
-	}
 	if maximum <= 0 {
-		return "·"
+		return "·  "
 	}
 	ratio := float64(value) / float64(maximum)
+	glyph := "·  "
 	switch {
 	case ratio >= 0.66:
-		return "✹"
+		glyph = "✦✦✦"
 	case ratio >= 0.25:
-		return "✦"
-	default:
-		return "·"
+		glyph = "✦✦ "
+	case ratio >= 0.10:
+		glyph = "✦  "
 	}
+	if selected && phase%2 == 0 {
+		glyph = strings.NewReplacer("✦", "✹", "·", "•").Replace(glyph)
+	}
+	return glyph
 }
 
 func (m model) mountHealthView(width int) string {
@@ -1510,7 +1512,7 @@ func (m model) galaxyView(width int) string {
 		return "Mount telemetry is unavailable; press G for the list view."
 	}
 	mapView := lipgloss.JoinHorizontal(lipgloss.Top, panels...)
-	return fmt.Sprintf("LIVE ARRAY SCAN %s · star intensity = recoverable space\n\n%s\n\n↑↓ navigate systems · Enter inspect copies · G list view", scan, mapView)
+	return fmt.Sprintf("LIVE ARRAY SCAN %s · recoverable space: · faint  ✦ low  ✦✦ medium  ✦✦✦ high\n\n%s\n\n↑↓ navigate systems · Enter inspect copies · G list view", scan, mapView)
 }
 
 func (m model) storageSetupView(width int) string {
