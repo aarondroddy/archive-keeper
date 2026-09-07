@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"image/color"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ const (
 	restore
 	history
 	help
+	settings
 )
 
 type destination struct {
@@ -40,6 +43,26 @@ var destinations = []destination{
 	{"↶", "Restore", "bring files home", restore},
 	{"≋", "History", "read the flight log", history},
 	{"?", "Help", "keys and safety model", help},
+	{"⚙", "Storage Setup", "configure managed mounts", settings},
+}
+
+type mountCandidate struct {
+	Path       string
+	Filesystem string
+	Source     string
+}
+
+type uiConfig struct {
+	Version    int      `json:"version"`
+	MountRoots []string `json:"mount_roots"`
+	ReportPath string   `json:"report_path"`
+}
+
+type scanFinishedMsg struct {
+	reportPath string
+	backupPath string
+	output     string
+	err        error
 }
 
 type model struct {
@@ -54,6 +77,19 @@ type model struct {
 	groupCursor   int
 	galaxyMode    bool
 	scanPhase     int
+	setupCandidates []mountCandidate
+	setupSelected   map[string]bool
+	setupCursor     int
+	setupFirstRun   bool
+	setupMessage    string
+	configSource    string
+	reportPath      string
+	confirmScan     bool
+	scanRunning     bool
+	scanStartedAt   time.Time
+	scanCancel      context.CancelFunc
+	scanMessage     string
+	scanErr         error
 	fileCursor    int
 	inspecting    bool
 	confirmKeeper bool
@@ -276,6 +312,286 @@ type keeperResult struct {
 	ProtocolVersion int    `json:"protocol_version"`
 	OK              bool   `json:"ok"`
 	Error           string `json:"error"`
+}
+
+func decodeMountPath(value string) string {
+	return strings.NewReplacer("\\040", " ", "\\011", "\t", "\\012", "\n", "\\134", "\\").Replace(value)
+}
+
+func storageMountCandidate(path, filesystem string) bool {
+	if !(strings.HasPrefix(path, "/mnt/") || strings.HasPrefix(path, "/media/") || strings.HasPrefix(path, "/run/media/")) {
+		return false
+	}
+	pseudo := map[string]bool{
+		"autofs": true, "bpf": true, "cgroup": true, "cgroup2": true, "configfs": true,
+		"debugfs": true, "devpts": true, "devtmpfs": true, "fusectl": true, "hugetlbfs": true,
+		"mqueue": true, "nsfs": true, "overlay": true, "proc": true, "pstore": true,
+		"securityfs": true, "squashfs": true, "sysfs": true, "tmpfs": true, "tracefs": true,
+	}
+	return !pseudo[filesystem]
+}
+
+func parseMountCandidates(mountinfo string) []mountCandidate {
+	byPath := map[string]mountCandidate{}
+	for _, line := range strings.Split(mountinfo, "\n") {
+		parts := strings.SplitN(line, " - ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		left, right := strings.Fields(parts[0]), strings.Fields(parts[1])
+		if len(left) < 5 || len(right) < 2 {
+			continue
+		}
+		path := filepath.Clean(decodeMountPath(left[4]))
+		filesystem := right[0]
+		if !storageMountCandidate(path, filesystem) {
+			continue
+		}
+		byPath[path] = mountCandidate{Path: path, Filesystem: filesystem, Source: decodeMountPath(right[1])}
+	}
+	result := make([]mountCandidate, 0, len(byPath))
+	for _, candidate := range byPath {
+		result = append(result, candidate)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result
+}
+
+func discoverMountCandidates() ([]mountCandidate, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	return parseMountCandidates(string(data)), nil
+}
+
+func uiConfigPath() (string, error) {
+	if value := os.Getenv("ARCHIVE_KEEPER_UI_CONFIG"); value != "" {
+		return filepath.Clean(value), nil
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "archive-keeper", "ui.json"), nil
+}
+
+func loadUIConfig() (uiConfig, error) {
+	path, err := uiConfigPath()
+	if err != nil {
+		return uiConfig{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return uiConfig{}, err
+	}
+	var config uiConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return uiConfig{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return config, nil
+}
+
+func defaultReportPath() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "share", "archive-keeper", "rmlint.json")
+	}
+	return filepath.Join(".", "rmlint.json")
+}
+
+func saveUIConfig(config uiConfig) error {
+	if len(config.MountRoots) == 0 {
+		return fmt.Errorf("select at least one storage root")
+	}
+	clean := make([]string, 0, len(config.MountRoots))
+	seen := map[string]bool{}
+	for _, root := range config.MountRoots {
+		root = filepath.Clean(root)
+		if !filepath.IsAbs(root) {
+			return fmt.Errorf("storage root must be absolute: %s", root)
+		}
+		if !seen[root] {
+			seen[root] = true
+			clean = append(clean, root)
+		}
+	}
+	sort.Strings(clean)
+	config.Version = 1
+	config.MountRoots = clean
+	if config.ReportPath == "" {
+		config.ReportPath = defaultReportPath()
+	}
+	if !filepath.IsAbs(config.ReportPath) {
+		return fmt.Errorf("report path must be absolute: %s", config.ReportPath)
+	}
+	path, err := uiConfigPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
+}
+
+func mergeConfiguredCandidates(candidates []mountCandidate, roots []string) []mountCandidate {
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		seen[candidate.Path] = true
+	}
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		if !seen[root] {
+			candidates = append(candidates, mountCandidate{Path: root, Filesystem: "configured"})
+			seen[root] = true
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Path < candidates[j].Path })
+	return candidates
+}
+
+func configuredRootList() []string {
+	value := os.Getenv("ARCHIVE_KEEPER_MOUNT_ROOTS")
+	if value == "" {
+		return nil
+	}
+	roots := []string{}
+	for _, root := range filepath.SplitList(value) {
+		if root != "" {
+			roots = append(roots, filepath.Clean(root))
+		}
+	}
+	return roots
+}
+
+func applyRootConfiguration(roots []string) {
+	_ = os.Setenv("ARCHIVE_KEEPER_MOUNT_ROOTS", strings.Join(roots, string(os.PathListSeparator)))
+}
+
+func activeReportPath() string {
+	if value := os.Getenv("ARCHIVE_KEEPER_REPORT"); value != "" {
+		return value
+	}
+	return defaultReportPath()
+}
+
+func initialModel() model {
+	m := model{page: home, loading: true, galaxyMode: true, setupSelected: map[string]bool{}, reportPath: activeReportPath()}
+	candidates, err := discoverMountCandidates()
+	if err != nil {
+		m.setupMessage = "Mount discovery failed: " + err.Error()
+	}
+	roots := configuredRootList()
+	if len(roots) > 0 {
+		m.configSource = "environment override"
+	} else {
+		config, configErr := loadUIConfig()
+		if configErr == nil && len(config.MountRoots) > 0 {
+			roots = config.MountRoots
+			m.configSource = "saved configuration"
+			applyRootConfiguration(roots)
+			if config.ReportPath != "" {
+				m.reportPath = config.ReportPath
+				_ = os.Setenv("ARCHIVE_KEEPER_REPORT", config.ReportPath)
+			}
+		} else if configErr != nil && !os.IsNotExist(configErr) {
+			m.setupMessage = "Configuration could not be read: " + configErr.Error()
+		}
+	}
+	m.setupCandidates = mergeConfiguredCandidates(candidates, roots)
+	for _, root := range roots {
+		m.setupSelected[filepath.Clean(root)] = true
+	}
+	if len(roots) == 0 {
+		m.page = settings
+		m.selected = len(destinations) - 1
+		m.contentFocus = true
+		m.setupFirstRun = true
+		m.configSource = "first-run setup"
+		for _, candidate := range m.setupCandidates {
+			m.setupSelected[candidate.Path] = true
+		}
+	}
+	return m
+}
+
+func rmlintScanArgs(roots []string, tempPath string) []string {
+	args := append([]string{}, roots...)
+	return append(args, "-", "-T", "duplicates", "-o", "json:"+tempPath)
+}
+
+func runRmlintScan(ctx context.Context, roots []string, reportPath string) tea.Cmd {
+	return func() tea.Msg {
+		if len(roots) == 0 {
+			return scanFinishedMsg{err: fmt.Errorf("select at least one mounted storage root")}
+		}
+		if _, err := exec.LookPath("rmlint"); err != nil {
+			return scanFinishedMsg{err: fmt.Errorf("rmlint is not installed or not on PATH")}
+		}
+		reportPath = filepath.Clean(reportPath)
+		if !filepath.IsAbs(reportPath) {
+			return scanFinishedMsg{err: fmt.Errorf("report path must be absolute")}
+		}
+		reportDir := filepath.Dir(reportPath)
+		if err := os.MkdirAll(reportDir, 0700); err != nil {
+			return scanFinishedMsg{err: fmt.Errorf("create report directory: %w", err)}
+		}
+		temp, err := os.CreateTemp(reportDir, ".rmlint-scan-*.json")
+		if err != nil {
+			return scanFinishedMsg{err: fmt.Errorf("create temporary report: %w", err)}
+		}
+		tempPath := temp.Name()
+		if err := temp.Close(); err != nil {
+			_ = os.Remove(tempPath)
+			return scanFinishedMsg{err: fmt.Errorf("close temporary report: %w", err)}
+		}
+		_ = os.Remove(tempPath)
+		output, runErr := exec.CommandContext(ctx, "rmlint", rmlintScanArgs(roots, tempPath)...).CombinedOutput()
+		summary := strings.TrimSpace(string(output))
+		if len(summary) > 600 {
+			summary = summary[len(summary)-600:]
+		}
+		if runErr != nil {
+			_ = os.Remove(tempPath)
+			if ctx.Err() != nil {
+				return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint scan cancelled")}
+			}
+			return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint scan failed: %w", runErr)}
+		}
+		info, err := os.Stat(tempPath)
+		if err != nil || info.Size() == 0 {
+			_ = os.Remove(tempPath)
+			return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint did not produce a usable JSON report")}
+		}
+		if err := os.Chmod(tempPath, 0600); err != nil {
+			_ = os.Remove(tempPath)
+			return scanFinishedMsg{output: summary, err: fmt.Errorf("secure temporary report: %w", err)}
+		}
+		backupPath := ""
+		if _, err := os.Stat(reportPath); err == nil {
+			backupPath = reportPath + ".previous-" + time.Now().UTC().Format("20060102T150405Z")
+			if err := os.Rename(reportPath, backupPath); err != nil {
+				_ = os.Remove(tempPath)
+				return scanFinishedMsg{output: summary, err: fmt.Errorf("preserve previous report: %w", err)}
+			}
+		}
+		if err := os.Rename(tempPath, reportPath); err != nil {
+			if backupPath != "" {
+				_ = os.Rename(backupPath, reportPath)
+			}
+			_ = os.Remove(tempPath)
+			return scanFinishedMsg{output: summary, err: fmt.Errorf("activate new report: %w", err)}
+		}
+		return scanFinishedMsg{reportPath: reportPath, backupPath: backupPath, output: summary}
+	}
 }
 
 var (
@@ -599,6 +915,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scanTickMsg:
 		m.scanPhase = (m.scanPhase + 1) % 4
 		return m, scanTick()
+	case scanFinishedMsg:
+		m.scanRunning = false
+		m.scanCancel = nil
+		m.confirmScan = false
+		m.scanErr = msg.err
+		if msg.err != nil {
+			m.scanMessage = "SCAN FAILED · " + msg.err.Error()
+			if msg.output != "" {
+				m.scanMessage += " · " + strings.ReplaceAll(msg.output, "\n", " ")
+			}
+			return m, nil
+		}
+		m.scanMessage = "SCAN COMPLETE · active report: " + msg.reportPath
+		if msg.backupPath != "" {
+			m.scanMessage += " · previous report: " + msg.backupPath
+		}
+		m.loading = true
+		m.loadErr = nil
+		return m, loadDashboard
 	case dashboardLoadedMsg:
 		m.loading = false
 		m.dashboard = msg.snapshot
@@ -702,10 +1037,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch shortcut {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "1", "2", "3", "4", "5", "6", "7":
+		case "1", "2", "3", "4", "5", "6", "7", "8":
 			i := int(shortcut[0] - '1')
 			m.selected, m.page = i, destinations[i].page
-			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore
+			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore || m.page == settings
 			m.inspecting = false
 			m.fileCursor = 0
 			m.confirmKeeper = false
@@ -719,6 +1054,110 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadQuarantinePlan
 			}
 			if m.page == restore { m.restoreCatalogLoading = true; m.restoreCatalogErr = nil; m.restoreInspecting = false; return m, loadRestoreCatalog }
+			return m, nil
+		}
+		if m.page == settings && m.contentFocus {
+			if m.scanRunning {
+				switch shortcut {
+				case "x", "esc", "left", "h":
+					if m.scanCancel != nil {
+						m.scanCancel()
+						m.scanMessage = "CANCELLING RMLINT SCAN…"
+					}
+				}
+				return m, nil
+			}
+			if m.confirmScan {
+				switch shortcut {
+				case "enter":
+					roots := m.selectedSetupRoots()
+					if len(roots) == 0 {
+						m.scanErr = fmt.Errorf("select at least one mounted root")
+						m.scanMessage = "SCAN BLOCKED · " + m.scanErr.Error()
+						m.confirmScan = false
+						return m, nil
+					}
+					m.scanRunning = true
+					m.scanStartedAt = time.Now()
+					m.scanErr = nil
+					m.scanMessage = ""
+					ctx, cancel := context.WithCancel(context.Background())
+					m.scanCancel = cancel
+					return m, runRmlintScan(ctx, roots, m.reportPath)
+				case "esc", "left", "h":
+					m.confirmScan = false
+				}
+				return m, nil
+			}
+			switch shortcut {
+			case "up", "k":
+				if m.setupCursor > 0 {
+					m.setupCursor--
+				}
+			case "down", "j":
+				if m.setupCursor < len(m.setupCandidates)-1 {
+					m.setupCursor++
+				}
+			case "space", " ", "enter":
+				if m.setupCursor >= 0 && m.setupCursor < len(m.setupCandidates) {
+					path := m.setupCandidates[m.setupCursor].Path
+					m.setupSelected[path] = !m.setupSelected[path]
+				}
+			case "a":
+				for _, candidate := range m.setupCandidates {
+					m.setupSelected[candidate.Path] = true
+				}
+			case "n":
+				m.setupSelected = map[string]bool{}
+			case "r":
+				m.rescanSetupCandidates()
+			case "s":
+				roots := m.selectedSetupRoots()
+				if len(roots) == 0 {
+					m.setupMessage = "Select at least one mounted storage root before saving"
+					return m, nil
+				}
+				if err := saveUIConfig(uiConfig{Version: 1, MountRoots: roots, ReportPath: m.reportPath}); err != nil {
+					m.setupMessage = "Configuration save failed: " + err.Error()
+					return m, nil
+				}
+				applyRootConfiguration(roots)
+				_ = os.Setenv("ARCHIVE_KEEPER_REPORT", m.reportPath)
+				m.setupFirstRun = false
+				m.configSource = "saved configuration"
+				m.setupMessage = fmt.Sprintf("Saved %d managed storage root(s)", len(roots))
+				m.page = home
+				m.selected = 0
+				m.contentFocus = false
+				m.loading = true
+				m.loadErr = nil
+				return m, loadDashboard
+			case "f":
+				roots := m.selectedSetupRoots()
+				if len(roots) == 0 {
+					m.scanErr = fmt.Errorf("select at least one mounted root")
+					m.scanMessage = "SCAN BLOCKED · " + m.scanErr.Error()
+					return m, nil
+				}
+				if err := saveUIConfig(uiConfig{Version: 1, MountRoots: roots, ReportPath: m.reportPath}); err != nil {
+					m.scanErr = err
+					m.scanMessage = "SCAN BLOCKED · configuration save failed: " + err.Error()
+					return m, nil
+				}
+				applyRootConfiguration(roots)
+				_ = os.Setenv("ARCHIVE_KEEPER_REPORT", m.reportPath)
+				m.setupFirstRun = false
+				m.configSource = "saved configuration"
+				m.confirmScan = true
+				m.scanMessage = ""
+				m.scanErr = nil
+			case "esc", "left", "h":
+				if !m.setupFirstRun {
+					m.contentFocus = false
+					m.page = home
+					m.selected = 0
+				}
+			}
 			return m, nil
 		}
 		if m.page == groups && m.contentFocus {
@@ -882,7 +1321,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.selected < len(destinations)-1 { m.selected++ }
 		case "enter", "right", "l":
 			m.page = destinations[m.selected].page
-			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore
+			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore || m.page == settings
 			if m.page == quarantine {
 				m.planLoading = true
 				m.planErr = nil
@@ -1037,7 +1476,12 @@ func (m model) galaxyView(width int) string {
 		if root.Mounted {
 			status, accent = "ONLINE", lime
 		}
-		lines := []string{lipgloss.NewStyle().Bold(true).Foreground(accent).Render(strings.ToUpper(filepath.Base(root.Path))+" NEBULA"), mutedText.Render(status+" · "+root.Filesystem), ""}
+		baseStyle := lipgloss.NewStyle().Background(void)
+		lines := []string{
+			baseStyle.Bold(true).Foreground(accent).Render(strings.ToUpper(filepath.Base(root.Path)) + " NEBULA"),
+			baseStyle.Foreground(muted).Render(status + " · " + root.Filesystem),
+			"",
+		}
 		for _, index := range indices[start:end] {
 			group := groups[index]
 			selected := index == m.groupCursor
@@ -1049,24 +1493,125 @@ func (m model) galaxyView(width int) string {
 			if selected {
 				line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line)
 			} else {
-				line = lipgloss.NewStyle().Foreground(cyan).Render(line)
+				line = baseStyle.Foreground(cyan).Render(line)
 			}
 			lines = append(lines, line)
 		}
 		if end < len(indices) {
-			lines = append(lines, mutedText.Render(fmt.Sprintf("+%d systems beyond scan", len(indices)-end)))
+			lines = append(lines, baseStyle.Foreground(muted).Render(fmt.Sprintf("+%d systems beyond scan", len(indices)-end)))
 		}
 		if len(indices) == 0 {
-			lines = append(lines, mutedText.Render("· clear orbit"))
+			lines = append(lines, baseStyle.Foreground(muted).Render("· clear orbit"))
 		}
-		panelWidth := max(22, (width-8)/max(1, len(roots)))
-		panels = append(panels, lipgloss.NewStyle().Width(panelWidth).Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1).Render(strings.Join(lines, "\n")))
+		panelWidth := max(18, (width-24)/max(1, len(roots)))
+		panels = append(panels, lipgloss.NewStyle().Width(panelWidth).Border(lipgloss.RoundedBorder()).BorderForeground(accent).Background(void).Padding(0, 1).Render(strings.Join(lines, "\n")))
 	}
 	if len(panels) == 0 {
 		return "Mount telemetry is unavailable; press G for the list view."
 	}
 	mapView := lipgloss.JoinHorizontal(lipgloss.Top, panels...)
 	return fmt.Sprintf("LIVE ARRAY SCAN %s · star intensity = recoverable space\n\n%s\n\n↑↓ navigate systems · Enter inspect copies · G list view", scan, mapView)
+}
+
+func (m model) storageSetupView(width int) string {
+	lines := []string{}
+	if m.setupFirstRun {
+		lines = append(lines,
+			lipgloss.NewStyle().Bold(true).Foreground(pink).Render("WELCOME ABOARD"),
+			"Choose the mounted storage roots Archive Keeper may manage.",
+			"Setup records configuration only; it never mounts drives or moves files.",
+			"",
+		)
+	}
+	if len(m.setupCandidates) == 0 {
+		lines = append(lines,
+			lipgloss.NewStyle().Bold(true).Foreground(gold).Render("NO STORAGE MOUNTS DETECTED"),
+			"Mount a drive under /mnt, /media, or /run/media, then press R to rescan.",
+		)
+	} else {
+		for i, candidate := range m.setupCandidates {
+			cursor := "  "
+			if i == m.setupCursor {
+				cursor = "▶ "
+			}
+			check := "[ ]"
+			if m.setupSelected[candidate.Path] {
+				check = "[✓]"
+			}
+			status := "DETECTED"
+			statusColor := lime
+			if candidate.Filesystem == "configured" {
+				status = "NOT MOUNTED"
+				statusColor = danger
+			}
+			line := fmt.Sprintf("%s%s %-11s %-10s %s", cursor, check, status, candidate.Filesystem, compactPath(candidate.Path, max(18, width-39)))
+			style := lipgloss.NewStyle().Foreground(statusColor)
+			if i == m.setupCursor {
+				style = style.Bold(true).Foreground(void).Background(purple)
+			}
+			lines = append(lines, style.Render(line))
+			if i == m.setupCursor && candidate.Source != "" {
+				lines = append(lines, "    "+mutedText.Render("source: "+compactPath(candidate.Source, max(20, width-12))))
+			}
+		}
+	}
+	lines = append(lines, "", mutedText.Render("Report: "+compactPath(m.reportPath, max(24, width-10))))
+	if m.setupMessage != "" {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render(m.setupMessage))
+	}
+	if m.scanMessage != "" {
+		statusColor := lime
+		if m.scanErr != nil {
+			statusColor = danger
+		}
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(statusColor).Render(m.scanMessage))
+	}
+	if m.scanRunning {
+		elapsed := time.Since(m.scanStartedAt).Round(time.Second)
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("RMLINT SCAN RUNNING "+[]string{"◐", "◓", "◑", "◒"}[m.scanPhase%4]),
+			fmt.Sprintf("Elapsed %s · Archive files remain untouched · X/H/← cancel", elapsed))
+	} else if m.confirmScan {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("START RMLINT DUPLICATE SCAN?"),
+			"Enter confirms · H/← cancels · existing report is backed up after success")
+	}
+	if m.configSource != "" {
+		lines = append(lines, "", mutedText.Render("Configuration source: "+m.configSource))
+	}
+	if !m.scanRunning && !m.confirmScan {
+		lines = append(lines, "", "↑↓ choose · Space/Enter toggle · A all · N none · R rescan · S save · F scan")
+	}
+	if !m.setupFirstRun && !m.scanRunning {
+		lines = append(lines, "H/← return home")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) rescanSetupCandidates() {
+	previous := m.selectedSetupRoots()
+	discovered, err := discoverMountCandidates()
+	if err != nil {
+		m.setupMessage = "Storage rescan failed: " + err.Error()
+		return
+	}
+	m.setupCandidates = mergeConfiguredCandidates(discovered, previous)
+	m.setupSelected = map[string]bool{}
+	for _, root := range previous {
+		m.setupSelected[filepath.Clean(root)] = true
+	}
+	if m.setupCursor >= len(m.setupCandidates) {
+		m.setupCursor = max(0, len(m.setupCandidates)-1)
+	}
+	m.setupMessage = fmt.Sprintf("Detected %d storage mount(s)", len(discovered))
+}
+
+func (m model) selectedSetupRoots() []string {
+	roots := []string{}
+	for _, candidate := range m.setupCandidates {
+		if m.setupSelected[candidate.Path] {
+			roots = append(roots, candidate.Path)
+		}
+	}
+	return roots
 }
 
 func (m model) homeView(width int) string {
@@ -1107,9 +1652,14 @@ func (m model) pageView(page screen, width int) string {
 		quarantine: {"QUARANTINE AIRLOCK", "Preview first; mutation always requires explicit confirmation", "1  Inspect the generated plan\n2  Run a bounded dry pilot\n3  Verify source and keeper\n4  Confirm --apply\n\nSafety interlocks remain owned by the Python engine."},
 		restore: {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history: {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
-		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\n1–7         jump to screen\nq           quit\n\nA clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
+		settings: {"STORAGE ARRAY SETUP", "Detect roots, save configuration, and run a safe duplicate scan", ""},
+		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n8           storage setup / rmlint scan\n1–8         jump to screen\nq           quit\n\nA clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
 	}
 	v := spec[page]
+	if page == settings {
+		v[2] = m.storageSetupView(width)
+		return frame(v[0], v[1], v[2], width, pink)
+	}
 	if m.loadErr == nil && m.dashboard.ProtocolVersion == 1 {
 		switch page {
 		case groups:
@@ -1327,7 +1877,7 @@ func (m model) View() tea.View {
 	var rendered string
 	if m.compact {
 		rendered = logoStyle.Render("✦ ARCHIVE KEEPER · STORAGE GALAXY 2.0") + "\n" +
-			mutedText.Render("1 Home · 2 Groups · 3 Keepers · 4 Quarantine · 5 Restore · 6 History · 7 Help") +
+			mutedText.Render("1 Home · 2 Groups · 3 Keepers · 4 Quarantine · 5 Restore · 6 History · 7 Help · 8 Setup") +
 			"\n\n" + content
 	} else {
 		rendered = lipgloss.JoinHorizontal(lipgloss.Top, m.sidebar(), "  ", content)
@@ -1347,6 +1897,11 @@ func (m model) View() tea.View {
 			bridgeStatus = "FINAL SAFETY GATE · type the exact phrase · ← cancels"
 		} else if m.applying {
 			bridgeStatus = "CONTROLLED QUARANTINE · bounded apply · journal enabled"
+		}
+	} else if m.page == settings && m.contentFocus {
+		bridgeStatus = "STORAGE SETUP · detection and configuration only · files untouched"
+		if m.scanRunning {
+			bridgeStatus = "RMLINT SCAN · read-only file inspection · no cleanup script"
 		}
 	} else if m.page == restore && m.contentFocus {
 		bridgeStatus = "RESTORE PREVIEW · journaled moves only · no overwrite"
@@ -1372,7 +1927,7 @@ func (m model) View() tea.View {
 }
 
 func main() {
-	p := tea.NewProgram(model{page: home, loading: true, galaxyMode: true})
+	p := tea.NewProgram(initialModel())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "archive-keeper-ui:", err)
 		os.Exit(1)
