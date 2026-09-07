@@ -286,6 +286,28 @@ Before any applied run, confirm `/mnt/MyCloud1`, `/mnt/MyCloud2`, and
 directories. Keep the original `rmlint.json`, the journal database, and the
 decisions database backed up until the quarantine has been reviewed.
 
+## Storage Galaxy UI
+
+Build and launch the Bubble Tea interface:
+
+```bash
+go build -o archive-keeper-ui ./cmd/archive-keeper-ui
+./archive-keeper-ui
+```
+
+On first launch, Storage Setup detects mounted drives beneath `/mnt`,
+`/media`, and `/run/media`. Select the roots Archive Keeper may manage,
+then press `S` to save. Press `8` to reopen setup later.
+
+With `rmlint` installed, press `F` from Storage Setup and confirm with Enter
+to run a duplicate-only scan. The UI requests JSON output only; it never
+creates or runs rmlint's cleanup script. A successful report loads
+automatically, while an existing report is kept as a timestamped backup.
+A long scan can be cancelled with `X`, `H`, or Left Arrow.
+
+Advanced deployments may continue to use `ARCHIVE_KEEPER_MOUNT_ROOTS` and
+`ARCHIVE_KEEPER_REPORT`; environment variables override saved UI settings.
+
 ## Documentation
 
 - [Installation](docs/INSTALL.md)
