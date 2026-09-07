@@ -203,7 +203,7 @@ def _journal_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
                 result["runs"] = connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
                 rows = connection.execute(
                     "SELECT run_id, created_at, mode, status FROM runs "
-                    "ORDER BY created_at DESC LIMIT 5"
+                    "ORDER BY created_at DESC"
                 ).fetchall()
                 result["latest_runs"] = [
                     {"run_id": row[0], "created_at": row[1], "mode": row[2], "status": row[3]}
