@@ -305,6 +305,18 @@ creates or runs rmlint's cleanup script. A successful report loads
 automatically, while an existing report is kept as a timestamped backup.
 A long scan can be cancelled with `X`, `H`, or Left Arrow.
 
+To exercise scanning and the galaxy map without touching real storage, run
+the bundled fixture after building the UI:
+
+```bash
+./scripts/ui-galaxy-fixture.sh ./archive-keeper-ui
+```
+
+Inside the fixture UI, press `8`, `F`, Enter, then `2`. It creates four
+small duplicate groups spread across three temporary roots so the faint,
+low, medium, and high recoverable-space tiers are all visible. The fixture
+uses its own temporary report and configuration.
+
 Advanced deployments may continue to use `ARCHIVE_KEEPER_MOUNT_ROOTS` and
 `ARCHIVE_KEEPER_REPORT`; environment variables override saved UI settings.
 
