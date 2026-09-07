@@ -145,6 +145,31 @@ func TestUIConfigRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHistoryStatusSummaryIsDeterministic(t *testing.T) {
+	got := historyStatusSummary(map[string]int{"restored": 2, "failed": 1, "moved": 3})
+	want := "FAILED 1 · MOVED 3 · RESTORED 2"
+	if got != want {
+		t.Fatalf("unexpected history summary: %q", got)
+	}
+}
+
+func TestHistoryRunListShowsSelectionAndReadOnlyControls(t *testing.T) {
+	var m model
+	m.historyCursor = 0
+	m.dashboard.Journal.Runs = 1
+	m.dashboard.Journal.LatestRuns = append(m.dashboard.Journal.LatestRuns, struct {
+		RunID  string `json:"run_id"`
+		Mode   string `json:"mode"`
+		Status string `json:"status"`
+	}{RunID: "ui-history-test", Mode: "apply", Status: "restored"})
+	got := m.historyView(100)
+	for _, want := range []string{"ui-history-test", "RESTORED", "Enter inspect run", "opened read-only"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("history list missing %q: %q", want, got)
+		}
+	}
+}
+
 func TestRmlintScanArgsProduceJSONOnly(t *testing.T) {
 	got := rmlintScanArgs([]string{"/mnt/One", "/mnt/Two"}, "/tmp/report.json")
 	want := []string{"/mnt/One", "/mnt/Two", "-", "-T", "duplicates", "-o", "json:/tmp/report.json"}
