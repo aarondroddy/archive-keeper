@@ -14,6 +14,7 @@ from archive_keeper.ui_bridge import (
     controlled_quarantine_apply,
     controlled_restore_apply,
     dashboard_snapshot,
+    history_run_snapshot,
     main,
     quarantine_dry_run,
     quarantine_plan_snapshot,
@@ -572,6 +573,39 @@ class UIBridgeTests(unittest.TestCase):
         self.assertEqual(result["roots"][0]["status"], "ONLINE")
         self.assertEqual(result["roots"][0]["filesystem"], "cifs")
         self.assertEqual(result["roots"][1]["status"], "OFFLINE")
+
+
+    def test_history_run_snapshot_returns_read_only_action_details(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = root / "journal.sqlite3"
+            source = root / "source.bin"
+            destination = root / "quarantine" / "source.bin"
+            keeper = root / "keeper.bin"
+            journal = __import__("archive_keeper.core", fromlist=["Journal"]).Journal(state)
+            journal.create_run("history-test", root / "report.json", "apply")
+            journal.record_action(
+                "history-test", 7, keeper, source, destination, 4096, "moved", "verified"
+            )
+            journal.set_run_status("history-test", "complete")
+            journal.close()
+            before = self._sha256(state)
+
+            result = history_run_snapshot(state, "history-test")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["mode"], "read-only")
+            self.assertEqual(result["run"]["run_id"], "history-test")
+            self.assertEqual(result["run"]["status"], "complete")
+            self.assertEqual(result["total_actions"], 1)
+            self.assertEqual(result["total_bytes"], 4096)
+            self.assertEqual(result["status_counts"], {"moved": 1})
+            self.assertEqual(result["actions"][0]["group_id"], 7)
+            self.assertEqual(result["actions"][0]["source"], str(source))
+            self.assertEqual(result["actions"][0]["destination"], str(destination))
+            self.assertEqual(result["actions"][0]["keeper"], str(keeper))
+            self.assertEqual(result["actions"][0]["message"], "verified")
+            self.assertEqual(self._sha256(state), before)
 
 
 if __name__ == "__main__":
