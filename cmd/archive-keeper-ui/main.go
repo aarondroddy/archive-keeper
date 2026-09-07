@@ -124,6 +124,12 @@ type model struct {
 	restoring bool
 	restoreResult controlledRestoreResult
 	restoreErr error
+	historyCursor int
+	historyInspecting bool
+	historyDetail historyRunDetail
+	historyLoading bool
+	historyErr error
+	historyActionCursor int
 }
 
 type dashboardSnapshot struct {
@@ -182,6 +188,44 @@ type dashboardSnapshot struct {
 		} `json:"latest_runs"`
 	} `json:"journal"`
 	Warnings []string `json:"warnings"`
+}
+
+type historyRunDetail struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	OK              bool   `json:"ok"`
+	Mode            string `json:"mode"`
+	Operation       string `json:"operation"`
+	Run struct {
+		RunID          string  `json:"run_id"`
+		CreatedAt      float64 `json:"created_at"`
+		CreatedAtHuman string  `json:"created_at_human"`
+		ReportPath     string  `json:"report_path"`
+		Mode           string  `json:"mode"`
+		Status         string  `json:"status"`
+	} `json:"run"`
+	Actions []struct {
+		ID          int     `json:"id"`
+		GroupID     int     `json:"group_id"`
+		Keeper      string  `json:"keeper"`
+		Source      string  `json:"source"`
+		Destination string  `json:"destination"`
+		Size        int64   `json:"size"`
+		SizeHuman   string  `json:"size_human"`
+		Status      string  `json:"status"`
+		Message     string  `json:"message"`
+		CreatedAt   float64 `json:"created_at"`
+		UpdatedAt   float64 `json:"updated_at"`
+	} `json:"actions"`
+	StatusCounts map[string]int `json:"status_counts"`
+	TotalActions int            `json:"total_actions"`
+	TotalBytes   int64          `json:"total_bytes"`
+	TotalHuman   string         `json:"total_human"`
+	Warnings     []string       `json:"warnings"`
+}
+
+type historyRunLoadedMsg struct {
+	detail historyRunDetail
+	err    error
 }
 
 type dashboardLoadedMsg struct {
@@ -646,6 +690,32 @@ func loadDashboard() tea.Msg {
 	return dashboardLoadedMsg{snapshot: snapshot}
 }
 
+func loadHistoryRun(runID string) tea.Cmd {
+	return func() tea.Msg {
+		python, args := bridgeArgs("history-run")
+		if value := os.Getenv("ARCHIVE_KEEPER_STATE_DB"); value != "" {
+			args = append(args, "--state-db", value)
+		}
+		args = append(args, "--run-id", runID)
+		output, err := exec.Command(python, args...).CombinedOutput()
+		var detail historyRunDetail
+		if jsonErr := json.Unmarshal(output, &detail); jsonErr != nil {
+			if err != nil {
+				return historyRunLoadedMsg{err: fmt.Errorf("bridge command: %w", err)}
+			}
+			return historyRunLoadedMsg{err: fmt.Errorf("bridge JSON: %w", jsonErr)}
+		}
+		if err != nil || !detail.OK {
+			message := strings.Join(detail.Warnings, " · ")
+			if message == "" {
+				message = "journal run could not be loaded"
+			}
+			return historyRunLoadedMsg{detail: detail, err: fmt.Errorf("%s", message)}
+		}
+		return historyRunLoadedMsg{detail: detail}
+	}
+}
+
 func bridgeArgs(command string) (string, []string) {
 	python := os.Getenv("ARCHIVE_KEEPER_PYTHON")
 	if python == "" {
@@ -980,6 +1050,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyErr = msg.err
 		m.planLoading = true
 		return m, loadQuarantinePlan
+	case historyRunLoadedMsg:
+		m.historyLoading = false
+		m.historyDetail = msg.detail
+		m.historyErr = msg.err
+		if m.historyActionCursor >= len(m.historyDetail.Actions) {
+			m.historyActionCursor = max(0, len(m.historyDetail.Actions)-1)
+		}
 	case restoreCatalogLoadedMsg:
 		m.restoreCatalogLoading = false; m.restoreCatalog = msg.catalog; m.restoreCatalogErr = msg.err
 		if m.restoreCursor >= len(m.restoreCatalog.Runs) { m.restoreCursor = max(0, len(m.restoreCatalog.Runs)-1) }
@@ -1040,7 +1117,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "1", "2", "3", "4", "5", "6", "7", "8":
 			i := int(shortcut[0] - '1')
 			m.selected, m.page = i, destinations[i].page
-			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore || m.page == settings
+			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore || m.page == history || m.page == settings
 			m.inspecting = false
 			m.fileCursor = 0
 			m.confirmKeeper = false
@@ -1048,6 +1125,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.confirmDryRun = false
 			m.confirmApply = false
 			m.applyInput = ""
+			m.historyInspecting = false
+			m.historyActionCursor = 0
+			m.historyErr = nil
 			if m.page == quarantine {
 				m.planLoading = true
 				m.planErr = nil
@@ -1248,6 +1328,50 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.page == history && m.contentFocus {
+			if m.historyInspecting {
+				switch shortcut {
+				case "up", "k":
+					if m.historyActionCursor > 0 { m.historyActionCursor-- }
+				case "down", "j":
+					if m.historyActionCursor < len(m.historyDetail.Actions)-1 { m.historyActionCursor++ }
+				case "r":
+					if m.historyDetail.Run.RunID != "" {
+						m.historyLoading = true
+						m.historyErr = nil
+						return m, loadHistoryRun(m.historyDetail.Run.RunID)
+					}
+				case "esc", "left", "h":
+					m.historyInspecting = false
+					m.historyActionCursor = 0
+					m.historyErr = nil
+				}
+			} else {
+				switch shortcut {
+				case "up", "k":
+					if m.historyCursor > 0 { m.historyCursor-- }
+				case "down", "j":
+					if m.historyCursor < len(m.dashboard.Journal.LatestRuns)-1 { m.historyCursor++ }
+				case "enter", "right", "l":
+					if len(m.dashboard.Journal.LatestRuns) > 0 {
+						m.historyInspecting = true
+						m.historyLoading = true
+						m.historyErr = nil
+						m.historyActionCursor = 0
+						return m, loadHistoryRun(m.dashboard.Journal.LatestRuns[m.historyCursor].RunID)
+					}
+				case "r":
+					m.loading = true
+					m.loadErr = nil
+					return m, loadDashboard
+				case "esc", "left", "h":
+					m.contentFocus = false
+					m.page = home
+					m.selected = 0
+				}
+			}
+			return m, nil
+		}
 		if m.page == quarantine && m.contentFocus {
 			if m.confirmDryRun {
 				switch shortcut {
@@ -1321,7 +1445,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.selected < len(destinations)-1 { m.selected++ }
 		case "enter", "right", "l":
 			m.page = destinations[m.selected].page
-			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore || m.page == settings
+			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore || m.page == history || m.page == settings
 			if m.page == quarantine {
 				m.planLoading = true
 				m.planErr = nil
