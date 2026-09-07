@@ -1,6 +1,8 @@
 package main
 
 import (
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -94,5 +96,61 @@ func TestGalaxyViewUsesMountRegions(t *testing.T) {
 	got := m.galaxyView(120)
 	if !strings.Contains(got, "MYCLOUD1 NEBULA") || !strings.Contains(got, "G42") {
 		t.Fatalf("galaxy view did not render mount region and group: %q", got)
+	}
+}
+
+
+func TestParseMountCandidatesFiltersPseudoAndDecodesPaths(t *testing.T) {
+	mountInfo := strings.Join([]string{
+		"31 20 0:45 / /mnt/MyCloud1 rw,relatime - cifs //nas/MyCloud1 rw",
+		"32 20 0:46 / /mnt/Photo\\040Vault rw,relatime - nfs4 nas:/photos rw",
+		"33 20 0:47 / /proc rw,nosuid - proc proc rw",
+		"34 20 0:48 / /tmp rw,nosuid - tmpfs tmpfs rw",
+	}, "\n")
+	got := parseMountCandidates(mountInfo)
+	wantPaths := []string{"/mnt/MyCloud1", "/mnt/Photo Vault"}
+	if len(got) != len(wantPaths) {
+		t.Fatalf("expected %d storage mounts, got %#v", len(wantPaths), got)
+	}
+	for i, want := range wantPaths {
+		if got[i].Path != want {
+			t.Fatalf("candidate %d path = %q, want %q", i, got[i].Path, want)
+		}
+	}
+}
+
+func TestUIConfigRoundTrip(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "archive-keeper", "ui.json")
+	t.Setenv("ARCHIVE_KEEPER_UI_CONFIG", configPath)
+	want := uiConfig{
+		Version: 1,
+		MountRoots: []string{"/mnt/Zeta", "/mnt/Alpha", "/mnt/Zeta"},
+		ReportPath: filepath.Join(t.TempDir(), "rmlint.json"),
+	}
+	if err := saveUIConfig(want); err != nil {
+		t.Fatalf("saveUIConfig: %v", err)
+	}
+	got, err := loadUIConfig()
+	if err != nil {
+		t.Fatalf("loadUIConfig: %v", err)
+	}
+	if got.Version != 1 || got.ReportPath != want.ReportPath {
+		t.Fatalf("unexpected saved config: %#v", got)
+	}
+	if !reflect.DeepEqual(got.MountRoots, []string{"/mnt/Alpha", "/mnt/Zeta"}) {
+		t.Fatalf("mount roots were not normalized and sorted: %#v", got.MountRoots)
+	}
+}
+
+func TestRmlintScanArgsProduceJSONOnly(t *testing.T) {
+	got := rmlintScanArgs([]string{"/mnt/One", "/mnt/Two"}, "/tmp/report.json")
+	want := []string{"/mnt/One", "/mnt/Two", "-", "-T", "duplicates", "-o", "json:/tmp/report.json"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected rmlint arguments: %#v", got)
+	}
+	for _, arg := range got {
+		if strings.Contains(arg, "rmlint.sh") || arg == "sh" {
+			t.Fatalf("scan arguments must not produce or run a cleanup script: %#v", got)
+		}
 	}
 }
