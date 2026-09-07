@@ -1491,7 +1491,7 @@ func (m model) galaxyView(width int) string {
 			if selected {
 				marker = "▶ "
 			}
-			line := fmt.Sprintf("%s%s G%-5d %10s", marker, galaxyGlyph(group.RecoverableBytes, maximum, selected, m.scanPhase), group.GroupID, group.RecoverableHuman)
+			line := fmt.Sprintf("%s%s G%d %s", marker, galaxyGlyph(group.RecoverableBytes, maximum, selected, m.scanPhase), group.GroupID, group.RecoverableHuman)
 			if selected {
 				line = lipgloss.NewStyle().Bold(true).Foreground(void).Background(purple).Render(line)
 			} else {
