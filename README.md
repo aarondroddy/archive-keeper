@@ -309,7 +309,7 @@ To exercise scanning and the galaxy map without touching real storage, run
 the bundled fixture after building the UI:
 
 ```bash
-./scripts/ui-galaxy-fixture.sh ./archive-keeper-ui
+bash scripts/ui-galaxy-fixture.sh ./archive-keeper-ui
 ```
 
 Inside the fixture UI, press `8`, `F`, Enter, then `2`. It creates four
