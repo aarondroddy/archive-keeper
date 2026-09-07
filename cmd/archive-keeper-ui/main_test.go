@@ -53,17 +53,20 @@ func TestControlledRestoreConfirmationUsesBoundedLimit(t *testing.T) {
 }
 
 func TestGalaxyGlyphEncodesDensityAndSelectionPulse(t *testing.T) {
-	if got := galaxyGlyph(100, 100, false, 1); got != "✹" {
-		t.Fatalf("largest system should be a bright star: %q", got)
+	if got := galaxyGlyph(100, 100, false, 1); got != "✦✦✦" {
+		t.Fatalf("largest system should have three stars: %q", got)
 	}
-	if got := galaxyGlyph(30, 100, false, 1); got != "✦" {
-		t.Fatalf("medium system should be a star: %q", got)
+	if got := galaxyGlyph(30, 100, false, 1); got != "✦✦ " {
+		t.Fatalf("medium system should have two stars: %q", got)
 	}
-	if got := galaxyGlyph(5, 100, false, 1); got != "·" {
-		t.Fatalf("small system should be a point: %q", got)
+	if got := galaxyGlyph(12, 100, false, 1); got != "✦  " {
+		t.Fatalf("low system should have one star: %q", got)
 	}
-	if got := galaxyGlyph(5, 100, true, 2); got != "◉" {
-		t.Fatalf("selected system should pulse: %q", got)
+	if got := galaxyGlyph(5, 100, false, 1); got != "·  " {
+		t.Fatalf("faint system should be a point: %q", got)
+	}
+	if got := galaxyGlyph(30, 100, true, 2); got != "✹✹ " {
+		t.Fatalf("selected system should pulse without losing its tier: %q", got)
 	}
 }
 
