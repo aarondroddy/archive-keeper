@@ -23,6 +23,8 @@ verification, journal, dry-run, and explicit-apply safeguards.
 5. **Restore** — run selection, preview, collision inspection, and apply.
 6. **History** — journal outcomes, retry eligibility, and recovery paths.
 7. **Help** — contextual keys and safety explanations.
+8. **Storage Setup** — discover mounted storage, persist managed roots, and launch
+   a JSON-only rmlint duplicate scan.
 
 ## Integration boundary
 
@@ -82,3 +84,30 @@ star systems within that region. Star intensity is proportional to recoverable
 bytes, the selected system pulses during the live scan, arrow keys move between
 systems, and Enter opens the existing copy inspector. Press `G` to switch
 between Galaxy and the compact list fallback.
+
+
+## Portable storage setup and scanning
+
+On first launch without `ARCHIVE_KEEPER_MOUNT_ROOTS`, the UI opens Storage
+Setup. It discovers real mounts beneath `/mnt`, `/media`, and `/run/media`
+from kernel mount metadata. The operator explicitly selects the roots Archive
+Keeper may manage and presses `S` to save them. Setup is also available later
+with `8`.
+
+The selection and active report path are stored in
+`~/.config/archive-keeper/ui.json` with owner-only permissions. Environment
+variables still take precedence, so scripted and advanced deployments remain
+fully configurable. Storage Setup never mounts or unmounts a filesystem.
+
+Pressing `F` in Storage Setup opens a confirmation gate for a duplicate-only
+rmlint scan. The UI invokes rmlint directly with only the JSON formatter:
+
+`rmlint <selected roots> - -T duplicates -o json:<temporary report>`
+
+Specifying `-o json` overrides rmlint's default outputs, so this workflow does
+not create or execute `rmlint.sh`. The scan only reads archive files. Its JSON
+is written to a temporary file in the report directory; only a successful,
+non-empty scan becomes the active report. An existing report is first retained
+under a timestamped `.previous-...` name. The dashboard reloads after success.
+Press `X`, `H`, or Left Arrow to cancel a long-running scan. Quarantine
+remains a separate, explicitly staged and confirmed operation.
