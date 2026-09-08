@@ -83,23 +83,32 @@ func TestGalaxyViewUsesMountRegions(t *testing.T) {
 		Source     string `json:"source"`
 		Status     string `json:"status"`
 	}{Path: "/mnt/MyCloud1", Mounted: true, Filesystem: "cifs", Source: "//nas/MyCloud1", Status: "online"})
-	m.dashboard.Report.LargestGroups = append(m.dashboard.Report.LargestGroups, struct {
-		GroupID          int    `json:"group_id"`
-		Copies           int    `json:"copies"`
-		RecoverableBytes int64  `json:"recoverable_bytes"`
-		RecoverableHuman string `json:"recoverable_human"`
-		SamplePath       string `json:"sample_path"`
-		MountRoot        string `json:"mount_root"`
-		Files            []struct {
-			Path         string `json:"path"`
-			SizeHuman    string `json:"size_human"`
-			OriginalHint bool   `json:"original_hint"`
-			Checksum     string `json:"checksum"`
-		} `json:"files"`
-	}{GroupID: 42, Copies: 2, RecoverableBytes: 4096, RecoverableHuman: "4.00 KiB", MountRoot: "/mnt/MyCloud1"})
+	m.groupCatalog.Page = 1
+	m.groupCatalog.TotalPages = 1
+	m.groupCatalog.Items = append(m.groupCatalog.Items, duplicateGroup{
+		GroupID: 42, Copies: 2, RecoverableBytes: 4096,
+		RecoverableHuman: "4.00 KiB", MountRoot: "/mnt/MyCloud1",
+	})
 	got := m.galaxyView(120)
 	if !strings.Contains(got, "MYCLOUD1 NEBULA") || !strings.Contains(got, "G42") {
 		t.Fatalf("galaxy view did not render mount region and group: %q", got)
+	}
+}
+
+func TestGroupSortCyclesThroughEveryMode(t *testing.T) {
+	mode := "space-desc"
+	want := []string{"space-asc", "copies-desc", "path-asc", "group-asc", "space-desc"}
+	for _, expected := range want {
+		mode = nextGroupSort(mode)
+		if mode != expected { t.Fatalf("next sort = %q, want %q", mode, expected) }
+	}
+}
+
+func TestEveryPrimaryScreenHasBasicGuidance(t *testing.T) {
+	for _, page := range []screen{home, groups, decisions, quarantine, restore, history, settings} {
+		if guide := basicInstructions(page); !strings.Contains(guide, "BASIC GUIDE") {
+			t.Fatalf("screen %d has no basic guide: %q", page, guide)
+		}
 	}
 }
 

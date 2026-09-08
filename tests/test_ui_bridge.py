@@ -15,6 +15,7 @@ from archive_keeper.ui_bridge import (
     controlled_recovery_action,
     controlled_restore_apply,
     dashboard_snapshot,
+    group_catalog_snapshot,
     history_run_snapshot,
     main,
     quarantine_dry_run,
@@ -104,6 +105,36 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(before, {path: self._sha256(path) for path in (journal, decisions)})
             self.assertFalse(Path(str(journal) + "-wal").exists())
             self.assertFalse(Path(str(decisions) + "-wal").exists())
+
+    def test_group_catalog_search_filter_sort_and_pagination_are_read_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            alpha = root / "Alpha"
+            beta = root / "Beta"
+            entries = [{"description": "rmlint header"}]
+            for index, (folder, size) in enumerate(((alpha, 10), (beta, 30), (alpha, 20)), 1):
+                entries.extend([
+                    {"path": str(folder / f"keeper-{index}.bin"), "size": size,
+                     "type": "duplicate_file", "is_original": True},
+                    {"path": str(folder / f"copy-{index}.bin"), "size": size,
+                     "type": "duplicate_file"},
+                ])
+            entries.append({"description": "rmlint footer"})
+            report = root / "rmlint.json"
+            report.write_text(json.dumps(entries), encoding="utf-8")
+            before = self._sha256(report)
+
+            catalog = group_catalog_snapshot(
+                report, [alpha, beta], query="copy", root_filter=alpha,
+                sort_by="space-asc", page=1, page_size=5,
+            )
+
+            self.assertTrue(catalog["ok"])
+            self.assertEqual(catalog["mode"], "read-only")
+            self.assertEqual(catalog["total_groups"], 3)
+            self.assertEqual(catalog["filtered_groups"], 2)
+            self.assertEqual([item["recoverable_bytes"] for item in catalog["items"]], [10, 20])
+            self.assertEqual(before, self._sha256(report))
 
     def test_missing_inputs_are_structured_and_never_created(self):
         with tempfile.TemporaryDirectory() as td:

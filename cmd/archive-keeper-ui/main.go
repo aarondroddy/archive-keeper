@@ -65,6 +65,44 @@ type scanFinishedMsg struct {
 	err        error
 }
 
+type duplicateFile struct {
+	Path         string `json:"path"`
+	SizeHuman    string `json:"size_human"`
+	OriginalHint bool   `json:"original_hint"`
+	Checksum     string `json:"checksum"`
+}
+
+type duplicateGroup struct {
+	GroupID          int             `json:"group_id"`
+	Copies           int             `json:"copies"`
+	RecoverableBytes int64           `json:"recoverable_bytes"`
+	RecoverableHuman string          `json:"recoverable_human"`
+	SamplePath       string          `json:"sample_path"`
+	MountRoot        string          `json:"mount_root"`
+	Files            []duplicateFile `json:"files"`
+}
+
+type groupCatalog struct {
+	ProtocolVersion int              `json:"protocol_version"`
+	OK              bool             `json:"ok"`
+	Mode            string           `json:"mode"`
+	Query           string           `json:"query"`
+	RootFilter      string           `json:"root_filter"`
+	Sort            string           `json:"sort"`
+	Page            int              `json:"page"`
+	PageSize        int              `json:"page_size"`
+	TotalPages      int              `json:"total_pages"`
+	TotalGroups     int              `json:"total_groups"`
+	FilteredGroups  int              `json:"filtered_groups"`
+	Items           []duplicateGroup `json:"items"`
+	Warnings        []string         `json:"warnings"`
+}
+
+type groupCatalogLoadedMsg struct {
+	catalog groupCatalog
+	err     error
+}
+
 type model struct {
 	width, height int
 	selected      int
@@ -76,6 +114,14 @@ type model struct {
 	contentFocus  bool
 	groupCursor   int
 	galaxyMode    bool
+	groupCatalog  groupCatalog
+	groupLoading  bool
+	groupErr      error
+	groupQuery    string
+	groupSearchInput string
+	groupSearch   bool
+	groupSort     string
+	groupRoot     string
 	scanPhase     int
 	setupCandidates []mountCandidate
 	setupSelected   map[string]bool
@@ -149,20 +195,7 @@ type dashboardSnapshot struct {
 		Groups           int    `json:"groups"`
 		Files            int    `json:"files"`
 		RecoverableHuman string `json:"recoverable_human"`
-		LargestGroups    []struct {
-			GroupID          int    `json:"group_id"`
-			Copies           int    `json:"copies"`
-			RecoverableBytes int64  `json:"recoverable_bytes"`
-			RecoverableHuman string `json:"recoverable_human"`
-			SamplePath       string `json:"sample_path"`
-			MountRoot        string `json:"mount_root"`
-			Files            []struct {
-				Path         string `json:"path"`
-				SizeHuman    string `json:"size_human"`
-				OriginalHint bool   `json:"original_hint"`
-				Checksum     string `json:"checksum"`
-			} `json:"files"`
-		} `json:"largest_groups"`
+		LargestGroups    []duplicateGroup `json:"largest_groups"`
 	} `json:"report"`
 	Mounts struct {
 		AllReady bool `json:"all_ready"`
@@ -555,7 +588,7 @@ func activeReportPath() string {
 }
 
 func initialModel() model {
-	m := model{page: home, loading: true, galaxyMode: true, setupSelected: map[string]bool{}, reportPath: activeReportPath()}
+	m := model{page: home, loading: true, galaxyMode: true, groupSort: "space-desc", setupSelected: map[string]bool{}, reportPath: activeReportPath()}
 	candidates, err := discoverMountCandidates()
 	if err != nil {
 		m.setupMessage = "Mount discovery failed: " + err.Error()
@@ -715,6 +748,35 @@ func loadDashboard() tea.Msg {
 		return dashboardLoadedMsg{err: fmt.Errorf("unsupported bridge protocol %d", snapshot.ProtocolVersion)}
 	}
 	return dashboardLoadedMsg{snapshot: snapshot}
+}
+
+func loadGroupCatalog(query, root, sortMode string, page int) tea.Cmd {
+	return func() tea.Msg {
+		python, args := bridgeArgs("group-catalog")
+		if value := os.Getenv("ARCHIVE_KEEPER_REPORT"); value != "" {
+			args = append(args, "--report", value)
+		}
+		for _, mountRoot := range configuredRootList() {
+			args = append(args, "--mount-root", mountRoot)
+		}
+		args = append(args, "--query", query, "--sort", sortMode,
+			"--page", strconv.Itoa(page), "--page-size", "12")
+		if root != "" {
+			args = append(args, "--root-filter", root)
+		}
+		output, err := exec.Command(python, args...).CombinedOutput()
+		var catalog groupCatalog
+		if jsonErr := json.Unmarshal(output, &catalog); jsonErr != nil {
+			if err != nil { return groupCatalogLoadedMsg{err: fmt.Errorf("bridge command: %w", err)} }
+			return groupCatalogLoadedMsg{err: fmt.Errorf("bridge JSON: %w", jsonErr)}
+		}
+		if err != nil || !catalog.OK {
+			message := "duplicate groups could not be loaded"
+			if len(catalog.Warnings) > 0 { message = strings.Join(catalog.Warnings, "; ") }
+			return groupCatalogLoadedMsg{catalog: catalog, err: fmt.Errorf("%s", message)}
+		}
+		return groupCatalogLoadedMsg{catalog: catalog}
+	}
 }
 
 func loadHistoryRun(runID string) tea.Cmd {
@@ -1067,6 +1129,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.dashboard = msg.snapshot
 		m.loadErr = msg.err
+	case groupCatalogLoadedMsg:
+		m.groupLoading = false
+		m.groupCatalog = msg.catalog
+		m.groupErr = msg.err
+		if m.groupCursor >= len(m.groupCatalog.Items) {
+			m.groupCursor = max(0, len(m.groupCatalog.Items)-1)
+		}
 	case keeperSavedMsg:
 		m.savingKeeper = false
 		m.confirmKeeper = false
@@ -1141,6 +1210,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.compact = msg.Width < 96
 	case tea.KeyPressMsg:
 		shortcut := strings.ToLower(msg.String())
+		if m.groupSearch {
+			key := msg.String()
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				m.groupSearch = false
+				m.groupQuery = strings.TrimSpace(m.groupSearchInput)
+				m.groupCursor = 0
+				m.groupLoading = true
+				m.groupErr = nil
+				return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, 1)
+			case "esc", "left", "ctrl+g":
+				m.groupSearch = false
+				m.groupSearchInput = m.groupQuery
+			case "backspace", "ctrl+h":
+				runes := []rune(m.groupSearchInput)
+				if len(runes) > 0 { m.groupSearchInput = string(runes[:len(runes)-1]) }
+			default:
+				if key == "space" { m.groupSearchInput += " " } else if runes := []rune(key); len(runes) == 1 { m.groupSearchInput += key }
+			}
+			return m, nil
+		}
 		if m.confirmRecovery {
 			key := msg.String()
 			switch key {
@@ -1209,6 +1301,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if shortcut == "?" {
+			m.selected = 6
+			m.page = help
+			m.contentFocus = false
+			return m, nil
+		}
 		switch shortcut {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -1226,6 +1324,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyInspecting = false
 			m.historyActionCursor = 0
 			m.historyErr = nil
+			if m.page == groups {
+				m.groupLoading = true
+				m.groupErr = nil
+				m.groupCursor = 0
+				return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, max(1, m.groupCatalog.Page))
+			}
 			if m.page == quarantine {
 				m.planLoading = true
 				m.planErr = nil
@@ -1343,7 +1447,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				switch shortcut {
 				case "y", "enter":
 					if !m.savingKeeper {
-						group := m.dashboard.Report.LargestGroups[m.groupCursor]
+						group := m.groupCatalog.Items[m.groupCursor]
 						file := group.Files[m.fileCursor]
 						m.savingKeeper = true
 						m.statusMessage = "SAVING KEEPER DECISION…"
@@ -1359,7 +1463,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				switch shortcut {
 				case "y", "enter":
 					if !m.savingAction {
-						group := m.dashboard.Report.LargestGroups[m.groupCursor]
+						group := m.groupCatalog.Items[m.groupCursor]
 						file := group.Files[m.fileCursor]
 						m.savingAction = true
 						m.statusMessage = "SAVING STAGED DECISION…"
@@ -1372,6 +1476,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			switch shortcut {
+			case "/":
+				if !m.inspecting {
+					m.groupSearch = true
+					m.groupSearchInput = m.groupQuery
+				}
+			case "s":
+				if !m.inspecting {
+					m.groupSort = nextGroupSort(m.groupSort)
+					m.groupCursor = 0; m.groupLoading = true; m.groupErr = nil
+					return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, 1)
+				}
+			case "f":
+				if !m.inspecting {
+					m.groupRoot = m.nextGroupRoot()
+					m.groupCursor = 0; m.groupLoading = true; m.groupErr = nil
+					return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, 1)
+				}
+			case "pgup", "[":
+				if !m.inspecting && m.groupCatalog.Page > 1 {
+					m.groupCursor = 0; m.groupLoading = true
+					return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, m.groupCatalog.Page-1)
+				}
+			case "pgdown", "]":
+				if !m.inspecting && m.groupCatalog.Page < m.groupCatalog.TotalPages {
+					m.groupCursor = 0; m.groupLoading = true
+					return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, m.groupCatalog.Page+1)
+				}
 			case "g":
 				if !m.inspecting { m.galaxyMode = !m.galaxyMode }
 			case "up", "k":
@@ -1388,14 +1519,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.fileCursor < len(files)-1 {
 						m.fileCursor++
 					}
-				} else if m.groupCursor < len(m.dashboard.Report.LargestGroups)-1 {
+				} else if m.groupCursor < len(m.groupCatalog.Items)-1 {
 					m.groupCursor++
 				}
 			case "enter", "right", "l":
 				if m.inspecting {
 					m.confirmKeeper = true
 					m.statusMessage = "Confirm keeper selection"
-				} else if len(m.dashboard.Report.LargestGroups) > 0 {
+				} else if len(m.groupCatalog.Items) > 0 {
 					m.inspecting = true
 					m.fileCursor = 0
 				}
@@ -1567,6 +1698,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter", "right", "l":
 			m.page = destinations[m.selected].page
 			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore || m.page == history || m.page == settings
+			if m.page == groups {
+				m.groupLoading = true
+				m.groupErr = nil
+				m.groupCursor = 0
+				return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, max(1, m.groupCatalog.Page))
+			}
 			if m.page == quarantine {
 				m.planLoading = true
 				m.planErr = nil
@@ -1630,16 +1767,37 @@ func compactPath(path string, width int) string {
 	return string(characters[:left]) + "…" + string(characters[len(characters)-right:])
 }
 
-func (m model) currentGroupFiles() []struct {
-	Path         string `json:"path"`
-	SizeHuman    string `json:"size_human"`
-	OriginalHint bool   `json:"original_hint"`
-	Checksum     string `json:"checksum"`
-} {
-	if m.groupCursor < 0 || m.groupCursor >= len(m.dashboard.Report.LargestGroups) {
+func (m model) currentGroupFiles() []duplicateFile {
+	if m.groupCursor < 0 || m.groupCursor >= len(m.groupCatalog.Items) {
 		return nil
 	}
-	return m.dashboard.Report.LargestGroups[m.groupCursor].Files
+	return m.groupCatalog.Items[m.groupCursor].Files
+}
+
+func nextGroupSort(current string) string {
+	modes := []string{"space-desc", "space-asc", "copies-desc", "path-asc", "group-asc"}
+	for i, mode := range modes {
+		if current == mode { return modes[(i+1)%len(modes)] }
+	}
+	return modes[0]
+}
+
+func groupSortLabel(mode string) string {
+	labels := map[string]string{
+		"space-desc": "most space", "space-asc": "least space",
+		"copies-desc": "most copies", "path-asc": "path A–Z", "group-asc": "group number",
+	}
+	if label := labels[mode]; label != "" { return label }
+	return mode
+}
+
+func (m model) nextGroupRoot() string {
+	roots := []string{""}
+	for _, root := range m.dashboard.Mounts.Roots { roots = append(roots, root.Path) }
+	for i, root := range roots {
+		if root == m.groupRoot { return roots[(i+1)%len(roots)] }
+	}
+	return ""
 }
 
 func galaxyGlyph(value, maximum int64, selected bool, phase int) string {
@@ -1690,7 +1848,7 @@ func (m model) mountHealthView(width int) string {
 }
 
 func (m model) galaxyView(width int) string {
-	groups := m.dashboard.Report.LargestGroups
+	groups := m.groupCatalog.Items
 	if len(groups) == 0 {
 		return "No duplicate systems are loaded yet."
 	}
@@ -1757,7 +1915,7 @@ func (m model) galaxyView(width int) string {
 		return "Mount telemetry is unavailable; press G for the list view."
 	}
 	mapView := lipgloss.JoinHorizontal(lipgloss.Top, panels...)
-	return fmt.Sprintf("LIVE ARRAY SCAN %s · recoverable space: · faint  ✦ low  ✦✦ medium  ✦✦✦ high\n\n%s\n\n↑↓ navigate systems · Enter inspect copies · G list view", scan, mapView)
+	return fmt.Sprintf("LIVE ARRAY SCAN %s · recoverable space: · faint  ✦ low  ✦✦ medium  ✦✦✦ high\n\n%s\n\nPage %d/%d · ↑↓ choose · Enter inspect · [/ ] pages · / search · F root · S sort · G list", scan, mapView, m.groupCatalog.Page, max(1, m.groupCatalog.TotalPages))
 }
 
 func (m model) storageSetupView(width int) string {
@@ -1888,7 +2046,7 @@ func (m model) homeView(width int) string {
 			fmt.Sprintf("\n%d files charted across %d duplicate groups.", m.dashboard.Report.Files, m.dashboard.Report.Groups)
 	}
 	body := "Your storage universe, charted without moving a single byte.\n\n" + metrics +
-		"\n\n" + m.mountHealthView(width) + "\n\n" + status
+		"\n\n" + m.mountHealthView(width) + "\n\n" + status + "\n\n" + basicInstructions(home)
 	return frame("MISSION CONTROL", "Read-only overview · no files move from this screen", body, width, pink)
 }
 
@@ -2030,6 +2188,21 @@ func (m model) historyView(width int) string {
 	return strings.Join(lines, "\n")
 }
 
+func basicInstructions(page screen) string {
+	header := lipgloss.NewStyle().Bold(true).Foreground(gold).Render("BASIC GUIDE")
+	guides := map[screen]string{
+		home: "1) Use Storage Setup to choose drives.  2) Run/import an rmlint report.  3) Open Duplicate Groups.\nHome is a read-only overview; it never moves files.",
+		groups: "Choose a group, press Enter, then choose its keeper. Stage only unwanted copies with X.\nThis screen saves choices only; it never moves files.",
+		decisions: "This is your decision summary. To change a keeper or staged copy, return to Duplicate Groups.\nNothing moves until Quarantine passes its preview and confirmation gates.",
+		quarantine: "First press D for the safe dry pilot. If every check passes, press A and type the exact phrase shown.\nOnly the final confirmed A step can move staged files into quarantine; nothing is deleted.",
+		restore: "Choose a quarantine run, press Enter to preview it, then A to open the exact-phrase restore gate.\nRestore never overwrites an existing file; collisions are blocked.",
+		history: "Choose a run and press Enter to inspect its actions. T previews retry; C previews reconcile; A applies that clean preview.\nBrowsing is read-only. Recovery changes require their own exact confirmation phrase.",
+		settings: "Use ↑↓ and Space/Enter to choose mounted roots, then S to save. Press F only when you want an rmlint scan.\nA scan reads filenames/content to find duplicates but never runs rmlint's cleanup script or moves files.",
+	}
+	if guide := guides[page]; guide != "" { return header + "\n" + guide }
+	return ""
+}
+
 func (m model) pageView(page screen, width int) string {
 	spec := map[screen][3]string{
 		groups: {"DUPLICATE CONSTELLATIONS", "Browse groups by size, type, location, or confidence", "Group list and side-by-side copy inspector\n\nFilters  / search  ·  Space  potential  ·  Copies  path map\n\nEvery group keeps at least one verified original."},
@@ -2038,18 +2211,31 @@ func (m model) pageView(page screen, width int) string {
 		restore: {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history: {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
 		settings: {"STORAGE ARRAY SETUP", "Detect roots, save configuration, and run a safe duplicate scan", ""},
-		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\nT / C       retry / reconcile selected history action\nA           apply the last clean recovery preview\n8           storage setup / rmlint scan\n1–8         jump to screen\nq           quit\n\nA clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
+		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\n/           search duplicate paths\nF           filter groups by storage root\nS           change group sort order\n[ and ]     previous / next group page\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\n8           storage setup / rmlint scan\n1–8         jump to screen\n?           open this guide\nq           quit\n\nA clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
 	}
 	v := spec[page]
 	if page == settings {
 		v[2] = m.storageSetupView(width)
+		v[2] += "\n\n" + basicInstructions(settings)
 		return frame(v[0], v[1], v[2], width, pink)
 	}
 	if m.loadErr == nil && m.dashboard.ProtocolVersion == 1 {
 		switch page {
 		case groups:
-			if m.inspecting && m.groupCursor < len(m.dashboard.Report.LargestGroups) {
-				group := m.dashboard.Report.LargestGroups[m.groupCursor]
+			if m.groupSearch {
+				v[2] = "SEARCH FILE PATHS\n\n> " + m.groupSearchInput + "▌\n\nType part of a folder or filename. Enter searches · H/← cancels.\nThis only reads the rmlint report; it does not scan or move files."
+				return frame(v[0], v[1], v[2]+"\n\n"+basicInstructions(groups), width, cyan)
+			}
+			if m.groupLoading {
+				v[2] = "Loading this page from the rmlint report…\n\nFiles are being listed only; nothing is moved or changed."
+				break
+			}
+			if m.groupErr != nil {
+				v[2] = lipgloss.NewStyle().Bold(true).Foreground(danger).Render("GROUP LIST UNAVAILABLE") + "\n" + m.groupErr.Error() + "\n\nPress 2 to retry · H/← returns to the menu."
+				break
+			}
+			if m.inspecting && m.groupCursor < len(m.groupCatalog.Items) {
+				group := m.groupCatalog.Items[m.groupCursor]
 				files := group.Files
 				visible := max(5, m.height-18)
 				start := 0
@@ -2089,14 +2275,14 @@ func (m model) pageView(page screen, width int) string {
 					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · Enter keeper · X quarantine · U undecided · C clear · H/← back", m.fileCursor+1, len(files)))
 				}
 				if m.statusMessage != "" { lines = append(lines, "", m.statusMessage) }
-				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · keeper decisions enabled", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n"), width, cyan)
+				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · keeper decisions enabled", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n")+"\n\n"+basicInstructions(groups), width, cyan)
 			}
 			if m.galaxyMode {
 				v[2] = m.galaxyView(width)
 				break
 			}
 			lines := []string{}
-			for i, group := range m.dashboard.Report.LargestGroups {
+			for i, group := range m.groupCatalog.Items {
 				marker := "  "
 				if i == m.groupCursor { marker = "▶ " }
 				pathWidth := max(18, width-64)
@@ -2107,9 +2293,17 @@ func (m model) pageView(page screen, width int) string {
 				lines = append(lines, line)
 			}
 			if len(lines) == 0 {
-				lines = append(lines, "No duplicate groups are loaded yet.")
+				lines = append(lines, "No groups match this search and root filter.")
 			}
-			v[2] = strings.Join(lines, "\n") + "\n\n↑↓ select · Enter inspect copies · G galaxy view · H/← return to menu"
+			rootLabel := "all roots"
+			if m.groupRoot != "" { rootLabel = filepath.Base(m.groupRoot) }
+			queryLabel := "none"
+			if m.groupQuery != "" { queryLabel = m.groupQuery }
+			controls := fmt.Sprintf("Page %d/%d · %d of %d groups · search: %s · root: %s · sort: %s",
+				m.groupCatalog.Page, max(1, m.groupCatalog.TotalPages), m.groupCatalog.FilteredGroups,
+				m.groupCatalog.TotalGroups, compactPath(queryLabel, 20), rootLabel, groupSortLabel(m.groupSort))
+			v[2] = strings.Join(lines, "\n") + "\n\n" + controls +
+				"\n↑↓ choose · Enter inspect · [/] pages · / search · F root · S sort · G galaxy · H/← menu"
 		case decisions:
 			v[2] = fmt.Sprintf("★ KEEP       %d selected originals\n◇ QUARANTINE %d staged copies\n? UNDECIDED  %d marked for attention\n\n%d favorites saved.",
 				m.dashboard.Decisions.Keepers,
@@ -2245,6 +2439,7 @@ func (m model) pageView(page screen, width int) string {
 			v[2] = m.historyView(width)
 		}
 	}
+	if guide := basicInstructions(page); guide != "" { v[2] += "\n\n" + guide }
 	return frame(v[0], v[1], v[2], width, cyan)
 }
 

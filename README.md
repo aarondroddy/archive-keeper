@@ -305,6 +305,14 @@ creates or runs rmlint's cleanup script. A successful report loads
 automatically, while an existing report is kept as a timestamped backup.
 A long scan can be cancelled with `X`, `H`, or Left Arrow.
 
+Duplicate Groups now browses the complete report in small pages instead of
+stopping at the dashboard's 24 largest groups. Press `/` to search filenames
+and folders, `F` to cycle mounted-root filters, `S` to change the sort order,
+and `[` or `]` for the previous or next page. These controls only read the
+report. Every primary screen also includes a short basic guide explaining what
+to do next and whether that screen can move files; press `?` for the full key
+guide at any time.
+
 To exercise scanning and the galaxy map without touching real storage, run
 the bundled fixture after building the UI:
 

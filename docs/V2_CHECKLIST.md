@@ -41,6 +41,8 @@ path to a production-ready v2.
   in confirmation input.
 - [x] Named-space handling in exact confirmation phrases.
 - [x] Galaxy panel width/background fix for terminal wrapping artifacts.
+- [x] Plain-language basic guides on every workflow screen, with explicit notes
+  about which steps are read-only and which confirmed steps may move files.
 
 ### Portable configuration and scanning
 
@@ -77,7 +79,8 @@ path to a production-ready v2.
 ### Workflow depth
 
 - [x] Add action-scoped, preview-first UI controls for safe reconcile and retry workflows.
-- [ ] Add search, filtering, sorting, and pagination beyond the largest groups.
+- [x] Add report-wide path search, mount-root filtering, five sort modes, and
+  paginated group browsing beyond the 24-group dashboard preview.
 - [ ] Add bulk decision review while enforcing at least one keeper.
 - [ ] Add advanced settings for report path, state DB, decisions DB, quarantine
   name, preferred roots, protected roots, and exclusions.

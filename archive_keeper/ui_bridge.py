@@ -139,6 +139,107 @@ def _report_summary(path: Path, warnings: list[str], roots: list[Path]) -> dict[
     return result
 
 
+def _group_payload(group: Any, roots: list[Path]) -> dict[str, Any]:
+    """Serialize one report group without issuing live filesystem reads."""
+    return {
+        "group_id": group.group_id,
+        "copies": len(group.files),
+        "size": group.size,
+        "recoverable_bytes": group.recoverable_bytes,
+        "recoverable_human": human_bytes(group.recoverable_bytes),
+        "sample_path": str(group.files[0].path),
+        "mount_root": str(
+            mount_root_for(normalize_path(group.files[0].path), roots) or "Unmapped"
+        ),
+        "files": [
+            {
+                "path": str(item.path),
+                "size": item.size,
+                "size_human": human_bytes(item.size),
+                "original_hint": item.is_original_hint,
+                "checksum": item.checksum,
+            }
+            for item in group.files
+        ],
+    }
+
+
+def group_catalog_snapshot(
+    report: Path,
+    mount_roots: list[Path] | None = None,
+    query: str = "",
+    root_filter: Path | None = None,
+    sort_by: str = "space-desc",
+    page: int = 1,
+    page_size: int = 12,
+) -> dict[str, Any]:
+    """Return one searchable, sortable report page without touching archive files."""
+    roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
+    report = normalize_path(report)
+    page_size = min(50, max(5, int(page_size)))
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": False,
+        "mode": "read-only",
+        "operation": "group-catalog",
+        "query": query,
+        "root_filter": str(normalize_path(root_filter)) if root_filter else "",
+        "sort": sort_by,
+        "page": 1,
+        "page_size": page_size,
+        "total_pages": 0,
+        "total_groups": 0,
+        "filtered_groups": 0,
+        "items": [],
+        "warnings": [],
+    }
+    if not report.is_file():
+        result["warnings"].append(f"rmlint report not found: {report}")
+        return result
+    try:
+        groups = load_rmlint_groups(report)
+    except ArchiveKeeperError as exc:
+        result["warnings"].append(str(exc))
+        return result
+
+    result["total_groups"] = len(groups)
+    needle = query.strip().casefold()
+    filtered = []
+    normalized_filter = normalize_path(root_filter) if root_filter else None
+    for group in groups:
+        if needle and not any(needle in str(item.path).casefold() for item in group.files):
+            continue
+        if normalized_filter and not any(
+            mount_root_for(normalize_path(item.path), roots) == normalized_filter
+            for item in group.files
+        ):
+            continue
+        filtered.append(group)
+
+    sorters = {
+        "space-desc": lambda item: (-item.recoverable_bytes, item.group_id),
+        "space-asc": lambda item: (item.recoverable_bytes, item.group_id),
+        "copies-desc": lambda item: (-len(item.files), -item.recoverable_bytes, item.group_id),
+        "path-asc": lambda item: (str(item.files[0].path).casefold(), item.group_id),
+        "group-asc": lambda item: item.group_id,
+    }
+    if sort_by not in sorters:
+        result["warnings"].append(f"unsupported group sort: {sort_by}")
+        return result
+    filtered.sort(key=sorters[sort_by])
+    result["filtered_groups"] = len(filtered)
+    total_pages = (len(filtered) + page_size - 1) // page_size
+    page = min(max(1, int(page)), max(1, total_pages))
+    start = (page - 1) * page_size
+    result.update(
+        ok=True,
+        page=page,
+        total_pages=total_pages,
+        items=[_group_payload(group, roots) for group in filtered[start:start + page_size]],
+    )
+    return result
+
+
 def _decision_summary(path: Path, warnings: list[str]) -> dict[str, Any]:
     path = normalize_path(path)
     result: dict[str, Any] = {
@@ -1165,6 +1266,19 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
     dashboard.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
     dashboard.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
+    catalog = subparsers.add_parser(
+        "group-catalog", help="Browse one read-only page of duplicate groups"
+    )
+    catalog.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    catalog.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
+    catalog.add_argument("--query", default="")
+    catalog.add_argument("--root-filter", type=Path)
+    catalog.add_argument(
+        "--sort", choices=("space-desc", "space-asc", "copies-desc", "path-asc", "group-asc"),
+        default="space-desc",
+    )
+    catalog.add_argument("--page", type=int, default=1)
+    catalog.add_argument("--page-size", type=int, default=12)
     keeper = subparsers.add_parser("select-keeper", help="Validate and save one keeper decision")
     keeper.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     keeper.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
@@ -1245,6 +1359,14 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(dashboard_snapshot(args.report, args.state_db, args.decisions_db, args.mount_roots), sys.stdout)
         sys.stdout.write("\n")
         return 0
+    if args.command == "group-catalog":
+        result = group_catalog_snapshot(
+            args.report, args.mount_roots, args.query, args.root_filter,
+            args.sort, args.page, args.page_size,
+        )
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        return 0 if result["ok"] else 1
     if args.command == "select-keeper":
         result = select_keeper(args.report, args.decisions_db, args.group_id, args.keeper)
         json.dump(result, sys.stdout)
