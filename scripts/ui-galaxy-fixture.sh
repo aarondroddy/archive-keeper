@@ -34,8 +34,16 @@ make_pair 131072 "$lyra/low-a.bin" "$draco/low-b.bin"
 make_pair 393216 "$draco/medium-a.bin" "$orion/medium-b.bin"
 make_pair 1048576 "$orion/high-a.bin" "$draco/high-b.bin"
 
+# Add enough uniquely sized tiny pairs to force a second 12-group catalog page.
+# Every file remains inside the disposable fixture; real storage is never read.
+for index in $(seq 5 16); do
+    bytes=$((2048 + index))
+    make_pair "$bytes" "$orion/demo-${index}-a.bin" "$lyra/demo-${index}-b.bin"
+done
+
 printf '\nGalaxy fixture ready at %s\n' "$fixture_root"
 printf 'Inside the UI: press 8, then F, then Enter. After the scan, press 2.\n'
+printf 'Try / to search for demo-16, F to filter roots, S to sort, and [ or ] to change pages.\n'
 printf 'Expected intensity legend: · faint, ✦ low, ✦✦ medium, ✦✦✦ high.\n\n'
 
 ARCHIVE_KEEPER_MOUNT_ROOTS="$orion:$lyra:$draco" \
