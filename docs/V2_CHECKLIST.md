@@ -70,12 +70,13 @@ path to a production-ready v2.
 - [x] Restore the quarantined test file.
 - [x] Show RESTORE VERIFIED and the restored run in History.
 - [x] Return to an empty Restore catalog after restoration.
+- [x] Add an isolated recovery fixture for retry and reconciliation without a NAS scan.
 
 ## Still to do
 
 ### Workflow depth
 
-- [ ] Add UI controls for safe reconcile and retry workflows.
+- [x] Add action-scoped, preview-first UI controls for safe reconcile and retry workflows.
 - [ ] Add search, filtering, sorting, and pagination beyond the largest groups.
 - [ ] Add bulk decision review while enforcing at least one keeper.
 - [ ] Add advanced settings for report path, state DB, decisions DB, quarantine
