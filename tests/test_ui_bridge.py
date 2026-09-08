@@ -12,6 +12,7 @@ from archive_keeper.ui_bridge import (
     PROTOCOL_VERSION,
     _mount_summary,
     controlled_quarantine_apply,
+    controlled_recovery_action,
     controlled_restore_apply,
     dashboard_snapshot,
     history_run_snapshot,
@@ -606,6 +607,90 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(result["actions"][0]["keeper"], str(keeper))
             self.assertEqual(result["actions"][0]["message"], "verified")
             self.assertEqual(self._sha256(state), before)
+
+
+    def test_recovery_retry_is_preview_first_and_action_scoped(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = root / "journal.sqlite3"
+            keeper = root / "keeper.bin"
+            source = root / "retry.bin"
+            destination = root / "quarantine" / "retry.bin"
+            keeper.write_bytes(b"same bytes")
+            source.write_bytes(b"same bytes")
+            journal = __import__("archive_keeper.core", fromlist=["Journal"]).Journal(state)
+            journal.create_run("recovery-retry", root / "report.json", "apply")
+            journal.record_action(
+                "recovery-retry", 1, keeper, source, destination,
+                len(b"same bytes"), "failed", "simulated interruption",
+            )
+            action_id = journal.action_id("recovery-retry", source)
+            journal.close()
+
+            preview = controlled_recovery_action(
+                state, "recovery-retry", action_id, "retry",
+                mount_roots=[root], verify_timeout=2.0,
+            )
+            self.assertTrue(preview["ok"])
+            self.assertEqual(preview["mode"], "dry-run")
+            self.assertFalse(preview["journal_updated"])
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+
+            rejected = controlled_recovery_action(
+                state, "recovery-retry", action_id, "retry", True, "RETRY",
+                [root], 2.0,
+            )
+            self.assertFalse(rejected["ok"])
+            self.assertTrue(source.exists())
+
+            applied = controlled_recovery_action(
+                state, "recovery-retry", action_id, "retry", True,
+                f"RETRY ACTION {action_id}", [root], 2.0,
+            )
+            self.assertTrue(applied["ok"])
+            self.assertTrue(applied["journal_updated"])
+            self.assertEqual(applied["files_moved"], 1)
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.exists())
+
+    def test_recovery_reconcile_updates_only_proven_selected_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = root / "journal.sqlite3"
+            keeper = root / "keeper.bin"
+            source = root / "source.bin"
+            destination = root / "quarantine" / "source.bin"
+            keeper.write_bytes(b"proof")
+            source.write_bytes(b"proof")
+            destination.parent.mkdir()
+            destination.write_bytes(b"proof")
+            journal = __import__("archive_keeper.core", fromlist=["Journal"]).Journal(state)
+            journal.create_run("recovery-reconcile", root / "report.json", "apply")
+            journal.record_action(
+                "recovery-reconcile", 2, keeper, source, destination,
+                len(b"proof"), "failed", "simulated post-move uncertainty",
+            )
+            action_id = journal.action_id("recovery-reconcile", source)
+            journal.close()
+
+            preview = controlled_recovery_action(
+                state, "recovery-reconcile", action_id, "reconcile",
+                mount_roots=[root], verify_timeout=2.0,
+            )
+            self.assertTrue(preview["ok"])
+            self.assertEqual(preview["before_status"], "failed")
+            self.assertEqual(preview["after_status"], "failed")
+
+            applied = controlled_recovery_action(
+                state, "recovery-reconcile", action_id, "reconcile", True,
+                f"RECONCILE ACTION {action_id}", [root], 2.0,
+            )
+            self.assertTrue(applied["ok"])
+            self.assertTrue(applied["journal_updated"])
+            self.assertEqual(applied["after_status"], "reconciled")
+            self.assertTrue(source.exists())
+            self.assertTrue(destination.exists())
 
 
 if __name__ == "__main__":
