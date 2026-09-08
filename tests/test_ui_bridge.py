@@ -693,5 +693,46 @@ class UIBridgeTests(unittest.TestCase):
             self.assertTrue(destination.exists())
 
 
+    def test_recovery_bridge_subprocess_emits_json_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = root / "journal.sqlite3"
+            keeper = root / "keeper.bin"
+            source = root / "source.bin"
+            destination = root / "quarantine" / "source.bin"
+            keeper.write_bytes(b"same")
+            source.write_bytes(b"same")
+            journal = __import__("archive_keeper.core", fromlist=["Journal"]).Journal(state)
+            journal.create_run("json-recovery", root / "report.json", "apply")
+            journal.record_action(
+                "json-recovery", 1, keeper, source, destination,
+                len(b"same"), "failed", "fixture",
+            )
+            action_id = journal.action_id("json-recovery", source)
+            journal.close()
+
+            completed = subprocess.run(
+                [
+                    sys.executable, "-m", "archive_keeper.ui_bridge", "recover-action",
+                    "--state-db", str(state),
+                    "--run-id", "json-recovery",
+                    "--action-id", str(action_id),
+                    "--kind", "retry",
+                    "--mount-root", str(root),
+                    "--verify-timeout", "2",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            self.assertEqual(completed.returncode, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["mode"], "dry-run")
+            self.assertNotIn("Retry:", completed.stdout)
+            self.assertEqual(completed.stderr, "")
+
+
 if __name__ == "__main__":
     unittest.main()
