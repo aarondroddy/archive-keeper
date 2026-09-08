@@ -1972,7 +1972,7 @@ func (m model) historyView(width int) string {
 			"",
 			"Enter confirm · ← cancel",
 		}
-		if m.recoveryErr != nil { lines = append(lines, "", dangerText.Render(m.recoveryErr.Error())) }
+		if m.recoveryErr != nil { lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(danger).Render(m.recoveryErr.Error())) }
 		return strings.Join(lines, "\n")
 	}
 	lines := []string{
@@ -2015,7 +2015,7 @@ func (m model) historyView(width int) string {
 		if m.recoveryRunning {
 			lines = append(lines, "VERIFYING SELECTED ACTION…")
 		} else if m.recoveryErr != nil {
-			lines = append(lines, dangerText.Render("BLOCKED · "+m.recoveryErr.Error()))
+			lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(danger).Render("BLOCKED · "+m.recoveryErr.Error()))
 		} else if m.recoveryResult.ActionID == action.ID {
 			label := "PREVIEW READY"
 			if m.recoveryResult.Mode == "apply" { label = "RECOVERY COMPLETE" }
