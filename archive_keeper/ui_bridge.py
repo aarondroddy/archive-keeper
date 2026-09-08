@@ -10,7 +10,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -1118,7 +1118,7 @@ def controlled_recovery_action(
     )
     output = io.StringIO()
     try:
-        with redirect_stdout(output):
+        with redirect_stdout(output), redirect_stderr(output):
             exit_code = (
                 engine_retry(namespace)
                 if kind == "retry"
