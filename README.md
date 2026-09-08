@@ -317,6 +317,20 @@ small duplicate groups spread across three temporary roots so the faint,
 low, medium, and high recoverable-space tiers are all visible. The fixture
 uses its own temporary report and configuration.
 
+
+History also provides action-scoped recovery. Press `6`, open a run, select
+a failed, timed-out, or interrupted action, then press `T` for a retry preview
+or `C` for a reconciliation preview. A clean preview enables `A`, which
+requires the exact displayed confirmation phrase. Retry re-verifies and may
+move only that selected action; reconciliation never moves files and changes
+only a proven-safe journal row.
+
+Test both paths with tiny temporary files and no NAS scan:
+
+```bash
+bash scripts/ui-recovery-fixture.sh ./archive-keeper-ui
+```
+
 Advanced deployments may continue to use `ARCHIVE_KEEPER_MOUNT_ROOTS` and
 `ARCHIVE_KEEPER_REPORT`; environment variables override saved UI settings.
 
