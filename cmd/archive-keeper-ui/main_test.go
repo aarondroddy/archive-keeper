@@ -194,6 +194,23 @@ func TestHistoryRunListScrollsWithSelection(t *testing.T) {
 	}
 }
 
+func TestRecoveryConfirmationIsActionScoped(t *testing.T) {
+	if got := expectedRecoveryConfirmation("retry", 17); got != "RETRY ACTION 17" {
+		t.Fatalf("unexpected retry confirmation: %q", got)
+	}
+	if got := expectedRecoveryConfirmation("reconcile", 22); got != "RECONCILE ACTION 22" {
+		t.Fatalf("unexpected reconcile confirmation: %q", got)
+	}
+}
+
+func TestRecoveryConfirmationInputAcceptsNamedSpaceKey(t *testing.T) {
+	got := appendApplyConfirmationInput("RETRY", "space")
+	got = appendApplyConfirmationInput(got, "a")
+	if got != "RETRY A" {
+		t.Fatalf("space key was not added to recovery confirmation: %q", got)
+	}
+}
+
 func TestRmlintScanArgsProduceJSONOnly(t *testing.T) {
 	got := rmlintScanArgs([]string{"/mnt/One", "/mnt/Two"}, "/tmp/report.json")
 	want := []string{"/mnt/One", "/mnt/Two", "-", "-T", "duplicates", "-o", "json:/tmp/report.json"}
