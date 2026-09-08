@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import io
 import os
 import secrets
 import sqlite3
 import subprocess
 import sys
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ from .cli import (
     DEFAULT_REPORT,
     DEFAULT_ROOTS,
     DEFAULT_STATE,
+    reconcile as engine_reconcile,
+    retry as engine_retry,
 )
 from .core import (
     ArchiveKeeperError,
@@ -1038,6 +1041,116 @@ def controlled_restore_apply(
     return result
 
 
+
+def controlled_recovery_action(
+    state_db: Path,
+    run_id: str,
+    action_id: int,
+    kind: str,
+    apply: bool = False,
+    confirmation: str = "",
+    mount_roots: list[Path] | None = None,
+    verify_timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Preview or apply one journal recovery action through the proven CLI engine."""
+    kind = kind.lower()
+    expected_confirmation = f"{kind.upper()} ACTION {action_id}"
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": False,
+        "mode": "apply" if apply else "dry-run",
+        "operation": f"recovery-{kind}",
+        "kind": kind,
+        "run_id": run_id,
+        "action_id": action_id,
+        "expected_confirmation": expected_confirmation,
+        "journal_updated": False,
+        "files_moved": 0,
+        "before_status": "",
+        "after_status": "",
+        "output": "",
+        "error": "",
+    }
+    if kind not in {"retry", "reconcile"}:
+        result["error"] = "recovery kind must be retry or reconcile"
+        return result
+    if action_id <= 0:
+        result["error"] = "action id must be a positive integer"
+        return result
+    if apply and confirmation != expected_confirmation:
+        result["error"] = f"confirmation must exactly match: {expected_confirmation}"
+        return result
+
+    before = history_run_snapshot(state_db, run_id)
+    if not before["ok"]:
+        result["error"] = "; ".join(before["warnings"]) or "journal run is unavailable"
+        return result
+    selected = next((item for item in before["actions"] if item["id"] == action_id), None)
+    if selected is None:
+        result["error"] = f"action {action_id} was not found in run {run_id}"
+        return result
+    result["before_status"] = selected["status"]
+    allowed = {"retry": {"failed", "timeout", "moving"}, "reconcile": {"failed", "timeout"}}
+    if selected["status"] not in allowed[kind]:
+        result["error"] = (
+            f"{kind} is unavailable for action status {selected['status']}; "
+            f"expected {', '.join(sorted(allowed[kind]))}"
+        )
+        return result
+
+    roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
+    namespace = argparse.Namespace(
+        action_id=action_id,
+        allow_sample_verified=False,
+        apply=apply,
+        deep_verify=False,
+        exclude=[],
+        limit=1,
+        min_free_gib=0.0,
+        mount_roots=roots,
+        prefer=[],
+        protect=[],
+        run_id=run_id,
+        sample_verify=False,
+        state_db=normalize_path(state_db),
+        status=None,
+        verify_timeout=max(0.1, float(verify_timeout)),
+    )
+    output = io.StringIO()
+    try:
+        with redirect_stdout(output):
+            exit_code = (
+                engine_retry(namespace)
+                if kind == "retry"
+                else engine_reconcile(namespace)
+            )
+    except (ArchiveKeeperError, OSError, sqlite3.Error, ValueError) as exc:
+        result["output"] = output.getvalue().strip()
+        result["error"] = f"{kind} failed: {exc}"
+        return result
+
+    result["output"] = output.getvalue().strip()
+    after = history_run_snapshot(state_db, run_id)
+    current = next(
+        (item for item in after.get("actions", []) if item["id"] == action_id),
+        selected,
+    )
+    result["after_status"] = current["status"]
+    result["journal_updated"] = bool(apply and current["status"] != selected["status"])
+    result["files_moved"] = int(
+        apply and kind == "retry" and current["status"] == "moved"
+        and selected["status"] != "moved"
+    )
+    if exit_code:
+        result["error"] = (
+            result["output"].splitlines()[-1]
+            if result["output"]
+            else f"{kind} returned status {exit_code}"
+        )
+        return result
+    result["ok"] = True
+    return result
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="archive-keeper-ui-bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1094,6 +1207,17 @@ def build_parser() -> argparse.ArgumentParser:
     history_run = subparsers.add_parser("history-run", help="Inspect one journal run read-only")
     history_run.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
     history_run.add_argument("--run-id", required=True)
+    recovery = subparsers.add_parser(
+        "recover-action", help="Preview or apply one bounded journal recovery action"
+    )
+    recovery.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
+    recovery.add_argument("--run-id", required=True)
+    recovery.add_argument("--action-id", type=int, required=True)
+    recovery.add_argument("--kind", choices=("retry", "reconcile"), required=True)
+    recovery.add_argument("--apply", action="store_true")
+    recovery.add_argument("--confirm", default="")
+    recovery.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
+    recovery.add_argument("--verify-timeout", type=float, default=30.0)
     restore_catalog = subparsers.add_parser("restore-catalog", help="List restorable runs")
     restore_catalog.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
     restore_plan = subparsers.add_parser("restore-plan", help="Preview a no-overwrite restore")
@@ -1168,6 +1292,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["ok"] else 1
     if args.command == "history-run":
         result = history_run_snapshot(args.state_db, args.run_id)
+    elif args.command == "recover-action":
+        result = controlled_recovery_action(
+            args.state_db,
+            args.run_id,
+            args.action_id,
+            args.kind,
+            args.apply,
+            args.confirm,
+            args.mount_roots,
+            args.verify_timeout,
+        )
     elif args.command == "restore-catalog":
         result = restore_catalog_snapshot(args.state_db)
     elif args.command == "restore-plan":
