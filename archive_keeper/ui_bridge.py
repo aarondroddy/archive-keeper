@@ -14,7 +14,7 @@ from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, cli as cli_module
 from .cli import (
     DEFAULT_DECISIONS,
     DEFAULT_QUARANTINE_NAME,
@@ -1117,6 +1117,10 @@ def controlled_recovery_action(
         verify_timeout=max(0.1, float(verify_timeout)),
     )
     output = io.StringIO()
+    tracker_class = cli_module.ProgressTracker
+    cli_module.ProgressTracker = lambda label, total=None: tracker_class(
+        label, total=total, stream=output
+    )
     try:
         with redirect_stdout(output), redirect_stderr(output):
             exit_code = (
@@ -1128,6 +1132,8 @@ def controlled_recovery_action(
         result["output"] = output.getvalue().strip()
         result["error"] = f"{kind} failed: {exc}"
         return result
+    finally:
+        cli_module.ProgressTracker = tracker_class
 
     result["output"] = output.getvalue().strip()
     after = history_run_snapshot(state_db, run_id)
