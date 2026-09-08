@@ -1458,6 +1458,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.confirmRecovery = true
 							m.recoveryInput = ""
 							m.recoveryErr = nil
+						} else {
+							m.recoveryErr = fmt.Errorf("run T retry preview or C reconcile preview for this action first")
 						}
 					}
 				case "esc", "left", "h":
