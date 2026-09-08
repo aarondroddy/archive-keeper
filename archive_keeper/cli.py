@@ -185,6 +185,10 @@ def build_parser():
         "--verify-timeout", type=float, default=300.0,
         help="Maximum seconds for each SHA-256 comparison (default: 300).",
     )
+    reconcile_parser.add_argument(
+        "--action-id", type=int,
+        help="Reconcile exactly one journal action id from this run.",
+    )
 
     retry_parser = sub.add_parser(
         "retry",
@@ -893,6 +897,13 @@ def reconcile(args):
     applied = 0
     try:
         rows = list(journal.iter_actions(args.run_id, ("failed", "timeout")))
+        if getattr(args, "action_id", None) is not None:
+            if args.action_id <= 0:
+                raise ArchiveKeeperError("--action-id must be a positive integer")
+            rows = [
+                row for row in rows
+                if journal.action_id(args.run_id, normalize_path(row[2])) == args.action_id
+            ]
         if not rows:
             print(f"No failed/timeout actions found for run {args.run_id}")
             return 0
