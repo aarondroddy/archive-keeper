@@ -130,6 +130,12 @@ type model struct {
 	historyLoading bool
 	historyErr error
 	historyActionCursor int
+	recoveryRunning bool
+	recoveryKind string
+	recoveryResult recoveryResult
+	recoveryErr error
+	confirmRecovery bool
+	recoveryInput string
 }
 
 type dashboardSnapshot struct {
@@ -226,6 +232,27 @@ type historyRunDetail struct {
 type historyRunLoadedMsg struct {
 	detail historyRunDetail
 	err    error
+}
+
+type recoveryResult struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	OK              bool   `json:"ok"`
+	Mode            string `json:"mode"`
+	Kind            string `json:"kind"`
+	RunID           string `json:"run_id"`
+	ActionID        int    `json:"action_id"`
+	ExpectedConfirm string `json:"expected_confirmation"`
+	JournalUpdated  bool   `json:"journal_updated"`
+	FilesMoved      int    `json:"files_moved"`
+	BeforeStatus    string `json:"before_status"`
+	AfterStatus     string `json:"after_status"`
+	Output          string `json:"output"`
+	Error           string `json:"error"`
+}
+
+type recoveryFinishedMsg struct {
+	result recoveryResult
+	err error
 }
 
 type dashboardLoadedMsg struct {
@@ -716,6 +743,38 @@ func loadHistoryRun(runID string) tea.Cmd {
 	}
 }
 
+func runRecoveryAction(kind, runID string, actionID int, apply bool, confirmation string) tea.Cmd {
+	return func() tea.Msg {
+		python, args := bridgeArgs("recover-action")
+		if value := os.Getenv("ARCHIVE_KEEPER_STATE_DB"); value != "" {
+			args = append(args, "--state-db", value)
+		}
+		args = append(args, "--run-id", runID, "--action-id", strconv.Itoa(actionID), "--kind", kind)
+		for _, root := range configuredRootList() {
+			args = append(args, "--mount-root", root)
+		}
+		if apply {
+			args = append(args, "--apply", "--confirm", confirmation)
+		}
+		output, err := exec.Command(python, args...).CombinedOutput()
+		var result recoveryResult
+		if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
+			if err != nil { return recoveryFinishedMsg{err: fmt.Errorf("bridge command: %w", err)} }
+			return recoveryFinishedMsg{err: fmt.Errorf("bridge JSON: %w", jsonErr)}
+		}
+		if err != nil || !result.OK {
+			message := result.Error
+			if message == "" { message = "recovery action did not complete" }
+			return recoveryFinishedMsg{result: result, err: fmt.Errorf("%s", message)}
+		}
+		return recoveryFinishedMsg{result: result}
+	}
+}
+
+func expectedRecoveryConfirmation(kind string, actionID int) string {
+	return fmt.Sprintf("%s ACTION %d", strings.ToUpper(kind), actionID)
+}
+
 func bridgeArgs(command string) (string, []string) {
 	python := os.Getenv("ARCHIVE_KEEPER_PYTHON")
 	if python == "" {
@@ -1057,6 +1116,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.historyActionCursor >= len(m.historyDetail.Actions) {
 			m.historyActionCursor = max(0, len(m.historyDetail.Actions)-1)
 		}
+	case recoveryFinishedMsg:
+		m.recoveryRunning = false
+		m.confirmRecovery = false
+		m.recoveryInput = ""
+		m.recoveryResult = msg.result
+		m.recoveryErr = msg.err
+		if msg.result.Mode == "apply" && m.historyDetail.Run.RunID != "" {
+			m.historyLoading = true
+			return m, tea.Batch(loadDashboard, loadHistoryRun(m.historyDetail.Run.RunID))
+		}
 	case restoreCatalogLoadedMsg:
 		m.restoreCatalogLoading = false; m.restoreCatalog = msg.catalog; m.restoreCatalogErr = msg.err
 		if m.restoreCursor >= len(m.restoreCatalog.Runs) { m.restoreCursor = max(0, len(m.restoreCatalog.Runs)-1) }
@@ -1072,6 +1141,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.compact = msg.Width < 96
 	case tea.KeyPressMsg:
 		shortcut := strings.ToLower(msg.String())
+		if m.confirmRecovery {
+			key := msg.String()
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				if !m.dashboard.Mounts.AllReady {
+					m.recoveryErr = fmt.Errorf("mount array is not ready")
+					return m, nil
+				}
+				expected := expectedRecoveryConfirmation(m.recoveryKind, m.recoveryResult.ActionID)
+				if m.recoveryInput == expected && !m.recoveryRunning {
+					m.recoveryRunning = true
+					m.recoveryErr = nil
+					return m, runRecoveryAction(m.recoveryKind, m.recoveryResult.RunID, m.recoveryResult.ActionID, true, m.recoveryInput)
+				}
+				m.recoveryErr = fmt.Errorf("confirmation phrase does not match")
+			case "backspace", "ctrl+h":
+				runes := []rune(m.recoveryInput)
+				if len(runes) > 0 { m.recoveryInput = string(runes[:len(runes)-1]) }
+			case "left", "ctrl+g":
+				m.confirmRecovery = false
+				m.recoveryInput = ""
+				m.recoveryErr = nil
+			default:
+				m.recoveryInput = appendApplyConfirmationInput(m.recoveryInput, key)
+			}
+			return m, nil
+		}
 		if m.confirmRestore {
 			key := msg.String()
 			switch key {
@@ -1340,6 +1438,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.historyLoading = true
 						m.historyErr = nil
 						return m, loadHistoryRun(m.historyDetail.Run.RunID)
+					}
+				case "t", "c":
+					if !m.recoveryRunning && m.historyActionCursor < len(m.historyDetail.Actions) {
+						action := m.historyDetail.Actions[m.historyActionCursor]
+						kind := "retry"
+						if shortcut == "c" { kind = "reconcile" }
+						m.recoveryRunning = true
+						m.recoveryKind = kind
+						m.recoveryErr = nil
+						m.recoveryResult = recoveryResult{}
+						return m, runRecoveryAction(kind, m.historyDetail.Run.RunID, action.ID, false, "")
+					}
+				case "a":
+					if m.historyActionCursor < len(m.historyDetail.Actions) {
+						action := m.historyDetail.Actions[m.historyActionCursor]
+						if m.recoveryResult.OK && m.recoveryResult.Mode == "dry-run" &&
+							m.recoveryResult.ActionID == action.ID {
+							m.confirmRecovery = true
+							m.recoveryInput = ""
+							m.recoveryErr = nil
+						}
 					}
 				case "esc", "left", "h":
 					m.historyInspecting = false
@@ -1839,6 +1958,23 @@ func (m model) historyView(width int) string {
 	}
 
 	detail := m.historyDetail
+	if m.confirmRecovery {
+		expected := expectedRecoveryConfirmation(m.recoveryKind, m.recoveryResult.ActionID)
+		lines := []string{
+			lipgloss.NewStyle().Bold(true).Foreground(gold).Render("CONTROLLED RECOVERY GATE"),
+			fmt.Sprintf("%s selected action %d only.", strings.ToUpper(m.recoveryKind), m.recoveryResult.ActionID),
+			"No overwrite · live verification · journal enabled",
+			"",
+			"Type exactly:",
+			lipgloss.NewStyle().Bold(true).Foreground(pink).Render(expected),
+			"",
+			"> " + m.recoveryInput,
+			"",
+			"Enter confirm · ← cancel",
+		}
+		if m.recoveryErr != nil { lines = append(lines, "", dangerText.Render(m.recoveryErr.Error())) }
+		return strings.Join(lines, "\n")
+	}
 	lines := []string{
 		fmt.Sprintf("RUN %s", detail.Run.RunID),
 		fmt.Sprintf("%s · %s · %s", detail.Run.CreatedAtHuman, detail.Run.Mode, strings.ToUpper(detail.Run.Status)),
@@ -1875,8 +2011,20 @@ func (m model) historyView(width int) string {
 		if action.Message != "" {
 			lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(gold).Render("MESSAGE"), action.Message)
 		}
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("RECOVERY CONTROL"))
+		if m.recoveryRunning {
+			lines = append(lines, "VERIFYING SELECTED ACTION…")
+		} else if m.recoveryErr != nil {
+			lines = append(lines, dangerText.Render("BLOCKED · "+m.recoveryErr.Error()))
+		} else if m.recoveryResult.ActionID == action.ID {
+			label := "PREVIEW READY"
+			if m.recoveryResult.Mode == "apply" { label = "RECOVERY COMPLETE" }
+			lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(lime).Render(
+				fmt.Sprintf("%s · %s · %s → %s", label, strings.ToUpper(m.recoveryResult.Kind),
+					strings.ToUpper(m.recoveryResult.BeforeStatus), strings.ToUpper(m.recoveryResult.AfterStatus))))
+		}
 	}
-	lines = append(lines, "", "↑↓ inspect actions · R reload · H/← runs · read-only")
+	lines = append(lines, "", "↑↓ actions · T retry preview · C reconcile preview · A apply preview · R reload · H/← runs")
 	return strings.Join(lines, "\n")
 }
 
