@@ -730,7 +730,8 @@ class UIBridgeTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["mode"], "dry-run")
-            self.assertNotIn("Retry:", completed.stdout)
+            self.assertIn("Retry summary", payload["output"])
+            self.assertTrue(completed.stdout.lstrip().startswith("{"))
             self.assertEqual(completed.stderr, "")
 
 
