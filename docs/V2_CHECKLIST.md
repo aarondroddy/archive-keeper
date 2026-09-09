@@ -91,7 +91,9 @@ path to a production-ready v2.
   preferred root without automatically changing the saved keeper.
 - [ ] Add richer live rmlint progress when the installed version exposes
   machine-readable progress.
-- [ ] Add a post-scan summary before switching reports.
+- [x] Add a beginner-friendly post-scan summary with duration, scanned roots,
+  result counts, active/backup report paths, empty results, errors, and direct
+  navigation to Duplicate Groups.
 - [ ] Add a guided Mount Storage wizard for local/removable disks, SMB/CIFS,
   and NFS. Start with previewed temporary mounts; keep persistent boot-time
   mount changes behind a separate explicit confirmation and never store sudo

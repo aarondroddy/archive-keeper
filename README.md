@@ -320,6 +320,14 @@ creates or runs rmlint's cleanup script. A successful report loads
 automatically, while an existing report is kept as a timestamped backup.
 A long scan can be cancelled with `X`, `H`, or Left Arrow.
 
+When the scan ends, a dedicated summary explains what happened before you
+leave Storage Setup. It shows the elapsed time, roots checked, duplicate-group
+and file counts, potentially recoverable space, active report, and any backup.
+An empty scan says explicitly that no duplicates were found. A failed scan
+explains the error and confirms that the previous report remains active.
+Press Enter, `G`, or `2` to review discovered groups; press `H`, Left Arrow,
+or `R` to return to Storage Setup. The summary never moves or deletes files.
+
 Duplicate Groups now browses the complete report in small pages instead of
 stopping at the dashboard's 24 largest groups. Press `/` to search filenames
 and folders, `F` to cycle mounted-root filters, `S` to change the sort order,

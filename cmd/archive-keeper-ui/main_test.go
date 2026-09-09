@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCompactPathLeavesShortPathsAlone(t *testing.T) {
@@ -282,6 +283,77 @@ func TestRmlintScanArgsProduceJSONOnly(t *testing.T) {
 	for _, arg := range got {
 		if strings.Contains(arg, "rmlint.sh") || arg == "sh" {
 			t.Fatalf("scan arguments must not produce or run a cleanup script: %#v", got)
+		}
+	}
+}
+
+func TestPostScanSummaryExplainsSuccessfulResultsAndNextSteps(t *testing.T) {
+	var m model
+	m.scanSummaryVisible = true
+	m.scanDuration = 2 * time.Second
+	m.scanRoots = []string{"/tmp/Orion", "/tmp/Lyra"}
+	m.scanReportPath = "/tmp/rmlint.json"
+	m.scanBackupPath = "/tmp/rmlint.json.previous"
+	m.dashboard.Report.Groups = 4
+	m.dashboard.Report.Files = 8
+	m.dashboard.Report.RecoverableHuman = "1.50 MiB"
+
+	got := m.scanSummaryView(100)
+	for _, want := range []string{
+		"SCAN COMPLETE",
+		"No files were moved or deleted",
+		"Duration: 2s",
+		"Storage roots checked: 2",
+		"Duplicate groups: 4",
+		"Files charted: 8",
+		"Potentially recoverable: 1.50 MiB",
+		"Active report: /tmp/rmlint.json",
+		"Previous report backup: /tmp/rmlint.json.previous",
+		"Enter/G or 2 opens Duplicate Groups",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("successful scan summary missing %q: %q", want, got)
+		}
+	}
+}
+
+func TestPostScanSummaryClearlyReportsNoDuplicates(t *testing.T) {
+	var m model
+	m.scanDuration = time.Second
+	m.scanRoots = []string{"/tmp/Orion"}
+	m.scanReportPath = "/tmp/rmlint.json"
+	m.dashboard.Report.RecoverableHuman = "0.00 B"
+
+	got := m.scanSummaryView(100)
+	for _, want := range []string{"SCAN COMPLETE", "Duplicate groups: 0", "NO DUPLICATES FOUND", "nothing to review or quarantine"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("empty scan summary missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "opens Duplicate Groups") {
+		t.Fatalf("empty scan summary must not offer an unavailable results action: %q", got)
+	}
+}
+
+func TestPostScanSummaryExplainsFailureAndPreservesPriorReport(t *testing.T) {
+	var m model
+	m.scanDuration = 3 * time.Second
+	m.scanRoots = []string{"/tmp/Orion"}
+	m.scanErr = fmt.Errorf("rmlint scan failed")
+	m.scanOutput = "permission denied\nexit status 1"
+
+	got := m.scanSummaryView(100)
+	for _, want := range []string{
+		"SCAN DID NOT COMPLETE",
+		"previous report remains active",
+		"files were not changed",
+		"WHAT HAPPENED",
+		"rmlint scan failed",
+		"Technical detail: permission denied exit status 1",
+		"return to Storage Setup",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("failed scan summary missing %q: %q", want, got)
 		}
 	}
 }

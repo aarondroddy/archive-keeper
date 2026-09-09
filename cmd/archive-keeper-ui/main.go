@@ -152,6 +152,12 @@ type model struct {
 	scanCancel      context.CancelFunc
 	scanMessage     string
 	scanErr         error
+	scanSummaryVisible bool
+	scanDuration       time.Duration
+	scanRoots          []string
+	scanReportPath     string
+	scanBackupPath     string
+	scanOutput         string
 	fileCursor    int
 	inspecting    bool
 	confirmKeeper bool
@@ -1285,6 +1291,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scanCancel = nil
 		m.confirmScan = false
 		m.scanErr = msg.err
+		m.scanDuration = time.Since(m.scanStartedAt).Round(time.Second)
+		m.scanReportPath = msg.reportPath
+		m.scanBackupPath = msg.backupPath
+		m.scanOutput = msg.output
+		m.scanSummaryVisible = true
 		if msg.err != nil {
 			m.scanMessage = "SCAN FAILED · " + msg.err.Error()
 			if msg.output != "" {
@@ -1517,6 +1528,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "1", "2", "3", "4", "5", "6", "7", "8":
+			m.scanSummaryVisible = false
 			i := int(shortcut[0] - '1')
 			m.selected, m.page = i, destinations[i].page
 			m.contentFocus = m.page == groups || m.page == quarantine || m.page == restore || m.page == history || m.page == settings
@@ -1556,6 +1568,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.scanSummaryVisible {
+				switch shortcut {
+				case "enter", "g":
+					if m.scanErr == nil && !m.loading && m.dashboard.Report.Groups > 0 {
+						m.scanSummaryVisible = false
+						m.selected = 1
+						m.page = groups
+						m.contentFocus = true
+						m.groupCursor = 0
+						m.groupLoading = true
+						m.groupErr = nil
+						return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, 1)
+					}
+				case "r", "esc", "left", "h":
+					m.scanSummaryVisible = false
+					m.scanMessage = ""
+				}
+				return m, nil
+			}
 			if m.confirmScan {
 				switch shortcut {
 				case "enter":
@@ -1568,6 +1599,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.scanRunning = true
 					m.scanStartedAt = time.Now()
+					m.scanRoots = append([]string{}, roots...)
+					m.scanSummaryVisible = false
 					m.scanErr = nil
 					m.scanMessage = ""
 					ctx, cancel := context.WithCancel(context.Background())
@@ -2182,6 +2215,9 @@ func (m model) galaxyView(width int) string {
 }
 
 func (m model) storageSetupView(width int) string {
+	if m.scanSummaryVisible {
+		return m.scanSummaryView(width)
+	}
 	if m.advancedMode {
 		lines := []string{
 			lipgloss.NewStyle().Bold(true).Foreground(pink).Render("ADVANCED CONFIGURATION"),
@@ -2281,6 +2317,58 @@ func (m model) storageSetupView(width int) string {
 	}
 	if !m.setupFirstRun && !m.scanRunning {
 		lines = append(lines, "H/← return home")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) scanSummaryView(width int) string {
+	status := lipgloss.NewStyle().Bold(true).Foreground(lime).Render("SCAN COMPLETE")
+	explanation := "rmlint created a new duplicate report. No files were moved or deleted."
+	if m.scanErr != nil {
+		status = lipgloss.NewStyle().Bold(true).Foreground(danger).Render("SCAN DID NOT COMPLETE")
+		explanation = "The previous report remains active and your files were not changed."
+	}
+	lines := []string{status, explanation, "", fmt.Sprintf("Duration: %s", m.scanDuration)}
+	if len(m.scanRoots) > 0 {
+		lines = append(lines, fmt.Sprintf("Storage roots checked: %d", len(m.scanRoots)))
+		for _, root := range m.scanRoots {
+			lines = append(lines, "  • "+compactPath(root, max(24, width-8)))
+		}
+	}
+	if m.scanErr != nil {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(danger).Render("WHAT HAPPENED"), m.scanErr.Error())
+		if detail := strings.TrimSpace(strings.ReplaceAll(m.scanOutput, "\n", " ")); detail != "" {
+			lines = append(lines, mutedText.Render("Technical detail: "+compactPath(detail, max(28, width-20))))
+		}
+		lines = append(lines, "", "R/H/← return to Storage Setup · F can start a new scan after returning")
+		return strings.Join(lines, "\n")
+	}
+	if m.loading {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("READING THE NEW REPORT…"),
+			"Archive Keeper is calculating the friendly summary now.")
+	} else if m.loadErr != nil {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("REPORT SAVED, SUMMARY UNAVAILABLE"), m.loadErr.Error())
+	} else {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("RESULTS"),
+			fmt.Sprintf("Duplicate groups: %d", m.dashboard.Report.Groups),
+			fmt.Sprintf("Files charted: %d", m.dashboard.Report.Files),
+			fmt.Sprintf("Potentially recoverable: %s", m.dashboard.Report.RecoverableHuman))
+		if m.dashboard.Report.Groups == 0 {
+			lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(lime).Render("NO DUPLICATES FOUND"),
+				"There is nothing to review or quarantine from this scan.")
+		}
+	}
+	if m.scanReportPath != "" {
+		lines = append(lines, "", "Active report: "+compactPath(m.scanReportPath, max(24, width-17)))
+	}
+	if m.scanBackupPath != "" {
+		lines = append(lines, "Previous report backup: "+compactPath(m.scanBackupPath, max(24, width-26)))
+	} else {
+		lines = append(lines, mutedText.Render("No older report needed to be backed up."))
+	}
+	lines = append(lines, "", "R/H/← return to Storage Setup · 1 Home")
+	if !m.loading && m.loadErr == nil && m.dashboard.Report.Groups > 0 {
+		lines = append(lines, "Enter/G or 2 opens Duplicate Groups")
 	}
 	return strings.Join(lines, "\n")
 }

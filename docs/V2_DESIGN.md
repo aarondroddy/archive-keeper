@@ -32,6 +32,14 @@ protection, and exclusion settings without moving files. Paths are validated
 as absolute, the quarantine destination is restricted to one folder name, and
 the complete configuration is saved with owner-only permissions.
 
+After each confirmed rmlint scan, Storage Setup becomes a post-scan summary
+before the operator enters the report. It reports duration and scanned roots,
+then group count, file count, recoverable space, and active/backup report
+locations. Zero-result and failed scans receive explicit explanations; a
+failure keeps the previous report active. Successful non-empty results link
+directly to Duplicate Groups. This state is informational and never moves or
+deletes files.
+
 Every workflow screen carries a plain-language basic guide. The guide states
 what the screen is for, the next keys to press, and whether the current step is
 read-only, decision-only, or capable of a confirmed file move.
