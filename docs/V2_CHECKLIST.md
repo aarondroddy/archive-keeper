@@ -92,6 +92,10 @@ path to a production-ready v2.
 - [ ] Add richer live rmlint progress when the installed version exposes
   machine-readable progress.
 - [ ] Add a post-scan summary before switching reports.
+- [ ] Add a guided Mount Storage wizard for local/removable disks, SMB/CIFS,
+  and NFS. Start with previewed temporary mounts; keep persistent boot-time
+  mount changes behind a separate explicit confirmation and never store sudo
+  or share passwords in the UI configuration.
 
 ### Packaging and reliability
 
