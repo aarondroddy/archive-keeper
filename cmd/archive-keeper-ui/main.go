@@ -53,9 +53,15 @@ type mountCandidate struct {
 }
 
 type uiConfig struct {
-	Version    int      `json:"version"`
-	MountRoots []string `json:"mount_roots"`
-	ReportPath string   `json:"report_path"`
+	Version          int      `json:"version"`
+	MountRoots       []string `json:"mount_roots"`
+	ReportPath       string   `json:"report_path"`
+	StateDBPath      string   `json:"state_db_path"`
+	DecisionsDBPath  string   `json:"decisions_db_path"`
+	QuarantineName   string   `json:"quarantine_name"`
+	PreferredRoots   []string `json:"preferred_roots"`
+	ProtectedRoots   []string `json:"protected_roots"`
+	ExcludedRoots    []string `json:"excluded_roots"`
 }
 
 type scanFinishedMsg struct {
@@ -130,6 +136,16 @@ type model struct {
 	setupMessage    string
 	configSource    string
 	reportPath      string
+	stateDBPath     string
+	decisionsDBPath string
+	quarantineName  string
+	preferredRoots  []string
+	protectedRoots  []string
+	excludedRoots   []string
+	advancedMode    bool
+	advancedCursor  int
+	advancedEditing bool
+	advancedInput   string
 	confirmScan     bool
 	scanRunning     bool
 	scanStartedAt   time.Time
@@ -520,6 +536,62 @@ func defaultReportPath() string {
 	return filepath.Join(".", "rmlint.json")
 }
 
+func defaultStateDBPath() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "state", "archive-keeper", "journal.sqlite3")
+	}
+	return filepath.Join(".", "journal.sqlite3")
+}
+
+func defaultDecisionsDBPath() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "state", "archive-keeper", "decisions.sqlite3")
+	}
+	return filepath.Join(".", "decisions.sqlite3")
+}
+
+func normalizeAbsolutePaths(values []string) ([]string, error) {
+	clean := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" { continue }
+		value = filepath.Clean(value)
+		if !filepath.IsAbs(value) { return nil, fmt.Errorf("path must be absolute: %s", value) }
+		if !seen[value] { seen[value] = true; clean = append(clean, value) }
+	}
+	sort.Strings(clean)
+	return clean, nil
+}
+
+func splitPathSetting(value string) []string {
+	if strings.TrimSpace(value) == "" { return nil }
+	return filepath.SplitList(value)
+}
+
+func joinPathSetting(values []string) string {
+	return strings.Join(values, string(os.PathListSeparator))
+}
+
+func pathWithinAny(path string, roots []string) bool {
+	path = filepath.Clean(path)
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		rel, err := filepath.Rel(root, path)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) { return true }
+	}
+	return false
+}
+
+func (m model) preferredFileCursor(group duplicateGroup) int {
+	for i, file := range group.Files {
+		if pathWithinAny(file.Path, m.preferredRoots) {
+			return i
+		}
+	}
+	return 0
+}
+
 func saveUIConfig(config uiConfig) error {
 	if len(config.MountRoots) == 0 {
 		return fmt.Errorf("select at least one storage root")
@@ -545,6 +617,18 @@ func saveUIConfig(config uiConfig) error {
 	if !filepath.IsAbs(config.ReportPath) {
 		return fmt.Errorf("report path must be absolute: %s", config.ReportPath)
 	}
+	if config.StateDBPath == "" { config.StateDBPath = defaultStateDBPath() }
+	if config.DecisionsDBPath == "" { config.DecisionsDBPath = defaultDecisionsDBPath() }
+	if !filepath.IsAbs(config.StateDBPath) { return fmt.Errorf("state database path must be absolute: %s", config.StateDBPath) }
+	if !filepath.IsAbs(config.DecisionsDBPath) { return fmt.Errorf("decisions database path must be absolute: %s", config.DecisionsDBPath) }
+	if config.QuarantineName == "" { config.QuarantineName = "ArchiveKeeper Quarantine" }
+	if config.QuarantineName == "." || config.QuarantineName == ".." || filepath.Base(config.QuarantineName) != config.QuarantineName {
+		return fmt.Errorf("quarantine name must be one folder name")
+	}
+	var err error
+	if config.PreferredRoots, err = normalizeAbsolutePaths(config.PreferredRoots); err != nil { return fmt.Errorf("preferred roots: %w", err) }
+	if config.ProtectedRoots, err = normalizeAbsolutePaths(config.ProtectedRoots); err != nil { return fmt.Errorf("protected roots: %w", err) }
+	if config.ExcludedRoots, err = normalizeAbsolutePaths(config.ExcludedRoots); err != nil { return fmt.Errorf("exclusions: %w", err) }
 	path, err := uiConfigPath()
 	if err != nil {
 		return err
@@ -597,6 +681,16 @@ func applyRootConfiguration(roots []string) {
 	_ = os.Setenv("ARCHIVE_KEEPER_MOUNT_ROOTS", strings.Join(roots, string(os.PathListSeparator)))
 }
 
+func applyAdvancedConfiguration(config uiConfig) {
+	_ = os.Setenv("ARCHIVE_KEEPER_REPORT", config.ReportPath)
+	_ = os.Setenv("ARCHIVE_KEEPER_STATE_DB", config.StateDBPath)
+	_ = os.Setenv("ARCHIVE_KEEPER_DECISIONS_DB", config.DecisionsDBPath)
+	_ = os.Setenv("ARCHIVE_KEEPER_QUARANTINE_NAME", config.QuarantineName)
+	_ = os.Setenv("ARCHIVE_KEEPER_PREFERRED_ROOTS", joinPathSetting(config.PreferredRoots))
+	_ = os.Setenv("ARCHIVE_KEEPER_PROTECTED_ROOTS", joinPathSetting(config.ProtectedRoots))
+	_ = os.Setenv("ARCHIVE_KEEPER_EXCLUDED_ROOTS", joinPathSetting(config.ExcludedRoots))
+}
+
 func activeReportPath() string {
 	if value := os.Getenv("ARCHIVE_KEEPER_REPORT"); value != "" {
 		return value
@@ -605,28 +699,50 @@ func activeReportPath() string {
 }
 
 func initialModel() model {
-	m := model{page: home, loading: true, galaxyMode: true, groupSort: "space-desc", setupSelected: map[string]bool{}, reportPath: activeReportPath()}
+	m := model{
+		page: home, loading: true, galaxyMode: true, groupSort: "space-desc",
+		setupSelected: map[string]bool{}, reportPath: activeReportPath(),
+		stateDBPath: defaultStateDBPath(), decisionsDBPath: defaultDecisionsDBPath(),
+		quarantineName: "ArchiveKeeper Quarantine",
+	}
 	candidates, err := discoverMountCandidates()
 	if err != nil {
 		m.setupMessage = "Mount discovery failed: " + err.Error()
 	}
+	config, configErr := loadUIConfig()
+	if configErr == nil {
+		if config.ReportPath != "" { m.reportPath = config.ReportPath }
+		if config.StateDBPath != "" { m.stateDBPath = config.StateDBPath }
+		if config.DecisionsDBPath != "" { m.decisionsDBPath = config.DecisionsDBPath }
+		if config.QuarantineName != "" { m.quarantineName = config.QuarantineName }
+		m.preferredRoots = append([]string{}, config.PreferredRoots...)
+		m.protectedRoots = append([]string{}, config.ProtectedRoots...)
+		m.excludedRoots = append([]string{}, config.ExcludedRoots...)
+	}
+	for _, override := range []struct{ env string; target *string }{
+		{"ARCHIVE_KEEPER_REPORT", &m.reportPath},
+		{"ARCHIVE_KEEPER_STATE_DB", &m.stateDBPath},
+		{"ARCHIVE_KEEPER_DECISIONS_DB", &m.decisionsDBPath},
+		{"ARCHIVE_KEEPER_QUARANTINE_NAME", &m.quarantineName},
+	} { if value := os.Getenv(override.env); value != "" { *override.target = value } }
+	if value := os.Getenv("ARCHIVE_KEEPER_PREFERRED_ROOTS"); value != "" { m.preferredRoots = splitPathSetting(value) }
+	if value := os.Getenv("ARCHIVE_KEEPER_PROTECTED_ROOTS"); value != "" { m.protectedRoots = splitPathSetting(value) }
+	if value := os.Getenv("ARCHIVE_KEEPER_EXCLUDED_ROOTS"); value != "" { m.excludedRoots = splitPathSetting(value) }
 	roots := configuredRootList()
 	if len(roots) > 0 {
 		m.configSource = "environment override"
 	} else {
-		config, configErr := loadUIConfig()
 		if configErr == nil && len(config.MountRoots) > 0 {
 			roots = config.MountRoots
 			m.configSource = "saved configuration"
 			applyRootConfiguration(roots)
-			if config.ReportPath != "" {
-				m.reportPath = config.ReportPath
-				_ = os.Setenv("ARCHIVE_KEEPER_REPORT", config.ReportPath)
-			}
 		} else if configErr != nil && !os.IsNotExist(configErr) {
 			m.setupMessage = "Configuration could not be read: " + configErr.Error()
 		}
 	}
+	applyAdvancedConfiguration(uiConfig{ReportPath: m.reportPath, StateDBPath: m.stateDBPath,
+		DecisionsDBPath: m.decisionsDBPath, QuarantineName: m.quarantineName,
+		PreferredRoots: m.preferredRoots, ProtectedRoots: m.protectedRoots, ExcludedRoots: m.excludedRoots})
 	m.setupCandidates = mergeConfiguredCandidates(candidates, roots)
 	for _, root := range roots {
 		m.setupSelected[filepath.Clean(root)] = true
@@ -882,6 +998,7 @@ func loadQuarantinePlan() tea.Msg {
 			}
 		}
 	}
+	args = safetyRuleArgs(args)
 	output, err := exec.Command(python, args...).CombinedOutput()
 	var plan quarantinePlan
 	if jsonErr := json.Unmarshal(output, &plan); jsonErr != nil {
@@ -922,6 +1039,7 @@ func runQuarantineDryRun() tea.Msg {
 			if root != "" { args = append(args, "--mount-root", root) }
 		}
 	}
+	args = safetyRuleArgs(args)
 	output, err := exec.Command(python, args...).CombinedOutput()
 	var result dryRunResult
 	if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
@@ -983,6 +1101,17 @@ func mountRootArgs(args []string) []string {
 	}
 	return args
 }
+func safetyRuleArgs(args []string) []string {
+	for _, setting := range []struct{ env, flag string }{
+		{"ARCHIVE_KEEPER_PROTECTED_ROOTS", "--protect"},
+		{"ARCHIVE_KEEPER_EXCLUDED_ROOTS", "--exclude"},
+	} {
+		for _, root := range splitPathSetting(os.Getenv(setting.env)) {
+			if root != "" { args = append(args, setting.flag, root) }
+		}
+	}
+	return args
+}
 func loadRestoreCatalog() tea.Msg {
 	python, args := restoreBridgeArgs("restore-catalog")
 	output, err := exec.Command(python, args...).CombinedOutput()
@@ -1029,6 +1158,7 @@ func runControlledApply(confirmation string) tea.Cmd {
 				if root != "" { args = append(args, "--mount-root", root) }
 			}
 		}
+		args = safetyRuleArgs(args)
 		args = append(args, "--confirm", confirmation)
 		output, err := exec.Command(python, args...).CombinedOutput()
 		var result controlledApplyResult
@@ -1091,6 +1221,7 @@ func saveFileAction(groupID int, path, action string) tea.Cmd {
 			}
 		}
 		args = append(args, "--group-id", strconv.Itoa(groupID), "--path", path, "--action", action)
+		args = safetyRuleArgs(args)
 		output, err := exec.Command(python, args...).CombinedOutput()
 		var result keeperResult
 		if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
@@ -1120,6 +1251,7 @@ func saveBulkGroup(groupID int) tea.Cmd {
 			if value := os.Getenv(setting.env); value != "" { args = append(args, setting.flag, value) }
 		}
 		args = append(args, "--group-id", strconv.Itoa(groupID))
+		args = safetyRuleArgs(args)
 		output, err := exec.Command(python, args...).CombinedOutput()
 		var result bulkStageResult
 		if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
@@ -1284,6 +1416,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.advancedEditing {
+			key := msg.String()
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				if err := m.setAdvancedSetting(m.advancedCursor, m.advancedInput); err != nil {
+					m.setupMessage = "SETTING NOT SAVED · " + err.Error()
+				} else {
+					m.advancedEditing = false
+					m.setupMessage = "Value accepted · press S to save all settings"
+				}
+			case "esc", "ctrl+g":
+				m.advancedEditing = false
+				m.setupMessage = "Edit cancelled"
+			case "backspace", "ctrl+h":
+				runes := []rune(m.advancedInput)
+				if len(runes) > 0 { m.advancedInput = string(runes[:len(runes)-1]) }
+			default:
+				if key == "space" { m.advancedInput += " " } else if runes := []rune(key); len(runes) == 1 { m.advancedInput += key }
+			}
+			return m, nil
+		}
 		if m.confirmRecovery {
 			key := msg.String()
 			switch key {
@@ -1423,6 +1578,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.advancedMode {
+				settings := m.advancedSettings()
+				switch shortcut {
+				case "up", "k":
+					if m.advancedCursor > 0 { m.advancedCursor-- }
+				case "down", "j":
+					if m.advancedCursor < len(settings)-1 { m.advancedCursor++ }
+				case "enter", "right", "l":
+					if m.advancedCursor >= 0 && m.advancedCursor < len(settings) {
+						m.advancedInput = settings[m.advancedCursor].value
+						m.advancedEditing = true
+						m.setupMessage = "Editing " + settings[m.advancedCursor].label
+					}
+				case "s":
+					roots := m.selectedSetupRoots()
+					if err := m.saveCurrentConfiguration(roots); err != nil {
+						m.setupMessage = "Configuration save failed: " + err.Error()
+					} else {
+						m.configSource = "saved configuration"
+						m.setupMessage = "Advanced settings saved · runtime configuration reloaded"
+						m.loading = true; m.loadErr = nil
+						return m, loadDashboard
+					}
+				case "e", "esc", "left", "h":
+					m.advancedMode = false
+					m.setupMessage = "Returned to storage-root setup"
+				}
+				return m, nil
+			}
 			switch shortcut {
 			case "up", "k":
 				if m.setupCursor > 0 {
@@ -1451,12 +1635,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setupMessage = "Select at least one mounted storage root before saving"
 					return m, nil
 				}
-				if err := saveUIConfig(uiConfig{Version: 1, MountRoots: roots, ReportPath: m.reportPath}); err != nil {
+				if err := m.saveCurrentConfiguration(roots); err != nil {
 					m.setupMessage = "Configuration save failed: " + err.Error()
 					return m, nil
 				}
-				applyRootConfiguration(roots)
-				_ = os.Setenv("ARCHIVE_KEEPER_REPORT", m.reportPath)
 				m.setupFirstRun = false
 				m.configSource = "saved configuration"
 				m.setupMessage = fmt.Sprintf("Saved %d managed storage root(s)", len(roots))
@@ -1473,18 +1655,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.scanMessage = "SCAN BLOCKED · " + m.scanErr.Error()
 					return m, nil
 				}
-				if err := saveUIConfig(uiConfig{Version: 1, MountRoots: roots, ReportPath: m.reportPath}); err != nil {
+				if err := m.saveCurrentConfiguration(roots); err != nil {
 					m.scanErr = err
 					m.scanMessage = "SCAN BLOCKED · configuration save failed: " + err.Error()
 					return m, nil
 				}
-				applyRootConfiguration(roots)
-				_ = os.Setenv("ARCHIVE_KEEPER_REPORT", m.reportPath)
 				m.setupFirstRun = false
 				m.configSource = "saved configuration"
 				m.confirmScan = true
 				m.scanMessage = ""
 				m.scanErr = nil
+			case "e":
+				m.advancedMode = true
+				m.advancedCursor = 0
+				m.setupMessage = "Advanced settings · Enter edits the selected value"
 			case "esc", "left", "h":
 				if !m.setupFirstRun {
 					m.contentFocus = false
@@ -1595,7 +1779,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusMessage = "Confirm keeper selection"
 				} else if len(m.groupCatalog.Items) > 0 {
 					m.inspecting = true
-					m.fileCursor = 0
+					m.fileCursor = m.preferredFileCursor(m.groupCatalog.Items[m.groupCursor])
 				}
 			case "x":
 				if m.inspecting {
@@ -1998,6 +2182,37 @@ func (m model) galaxyView(width int) string {
 }
 
 func (m model) storageSetupView(width int) string {
+	if m.advancedMode {
+		lines := []string{
+			lipgloss.NewStyle().Bold(true).Foreground(pink).Render("ADVANCED CONFIGURATION"),
+			"Choose a setting and press Enter to edit it. Nothing here moves files.",
+			"Use absolute paths. Separate multiple rule paths with a colon (:).",
+			"",
+		}
+		settings := m.advancedSettings()
+		for i, setting := range settings {
+			cursor := "  "
+			if i == m.advancedCursor { cursor = "▶ " }
+			value := setting.value
+			if value == "" { value = "(none)" }
+			line := fmt.Sprintf("%s%-20s %s", cursor, setting.label, compactPath(value, max(20, width-25)))
+			style := lipgloss.NewStyle().Foreground(cyan)
+			if i == m.advancedCursor { style = style.Bold(true).Foreground(void).Background(purple) }
+			lines = append(lines, style.Render(line))
+			if i == m.advancedCursor {
+				lines = append(lines, "    "+mutedText.Render(setting.help))
+			}
+		}
+		if m.advancedEditing {
+			lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("EDIT VALUE"),
+				m.advancedInput+"█", "Enter accepts · Ctrl-G cancels · S saves after editing")
+		} else {
+			lines = append(lines, "", "↑↓ choose · Enter edit · S save all · E/H/← return to drives")
+		}
+		if m.setupMessage != "" { lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render(m.setupMessage)) }
+		lines = append(lines, "", mutedText.Render("Protected and excluded roots are hard safety rules; preferred roots guide keeper choice."))
+		return strings.Join(lines, "\n")
+	}
 	lines := []string{}
 	if m.setupFirstRun {
 		lines = append(lines,
@@ -2062,7 +2277,7 @@ func (m model) storageSetupView(width int) string {
 		lines = append(lines, "", mutedText.Render("Configuration source: "+m.configSource))
 	}
 	if !m.scanRunning && !m.confirmScan {
-		lines = append(lines, "", "↑↓ choose · Space/Enter toggle · A all · N none · R rescan · S save · F scan")
+		lines = append(lines, "", "↑↓ choose · Space/Enter toggle · A all · N none · R rescan · S save · F scan · E advanced")
 	}
 	if !m.setupFirstRun && !m.scanRunning {
 		lines = append(lines, "H/← return home")
@@ -2096,6 +2311,66 @@ func (m model) selectedSetupRoots() []string {
 		}
 	}
 	return roots
+}
+
+type advancedSetting struct {
+	label string
+	help  string
+	value string
+}
+
+func (m model) advancedSettings() []advancedSetting {
+	return []advancedSetting{
+		{"Report path", "Where rmlint JSON is read and successful scans are saved.", m.reportPath},
+		{"Journal database", "Records every applied move so quarantine can be restored.", m.stateDBPath},
+		{"Decisions database", "Stores keepers and staged choices; it never contains file data.", m.decisionsDBPath},
+		{"Quarantine folder", "One folder name created inside each managed storage root.", m.quarantineName},
+		{"Preferred roots", "Keeper preference order; separate multiple absolute paths with a colon.", joinPathSetting(m.preferredRoots)},
+		{"Protected roots", "Files beneath these absolute paths must never be quarantined.", joinPathSetting(m.protectedRoots)},
+		{"Exclusions", "Trees Archive Keeper should ignore; separate paths with a colon.", joinPathSetting(m.excludedRoots)},
+	}
+}
+
+func (m *model) setAdvancedSetting(index int, value string) error {
+	value = strings.TrimSpace(value)
+	switch index {
+	case 0:
+		if !filepath.IsAbs(value) { return fmt.Errorf("report path must be absolute") }
+		m.reportPath = filepath.Clean(value)
+	case 1:
+		if !filepath.IsAbs(value) { return fmt.Errorf("journal database path must be absolute") }
+		m.stateDBPath = filepath.Clean(value)
+	case 2:
+		if !filepath.IsAbs(value) { return fmt.Errorf("decisions database path must be absolute") }
+		m.decisionsDBPath = filepath.Clean(value)
+	case 3:
+		if value == "" || value == "." || value == ".." || filepath.Base(value) != value { return fmt.Errorf("enter one folder name, without slashes") }
+		m.quarantineName = value
+	case 4, 5, 6:
+		paths, err := normalizeAbsolutePaths(splitPathSetting(value))
+		if err != nil { return err }
+		if index == 4 { m.preferredRoots = paths }
+		if index == 5 { m.protectedRoots = paths }
+		if index == 6 { m.excludedRoots = paths }
+	default:
+		return fmt.Errorf("unknown setting")
+	}
+	return nil
+}
+
+func (m model) currentUIConfig(roots []string) uiConfig {
+	return uiConfig{Version: 1, MountRoots: roots, ReportPath: m.reportPath,
+		StateDBPath: m.stateDBPath, DecisionsDBPath: m.decisionsDBPath,
+		QuarantineName: m.quarantineName, PreferredRoots: m.preferredRoots,
+		ProtectedRoots: m.protectedRoots, ExcludedRoots: m.excludedRoots}
+}
+
+func (m *model) saveCurrentConfiguration(roots []string) error {
+	config := m.currentUIConfig(roots)
+	if err := saveUIConfig(config); err != nil { return err }
+	applyRootConfiguration(roots)
+	applyAdvancedConfiguration(config)
+	return nil
 }
 
 func (m model) homeView(width int) string {
@@ -2276,7 +2551,7 @@ func basicInstructions(page screen) string {
 		quarantine: "First press D for the safe dry pilot. If every check passes, press A and type the exact phrase shown.\nOnly the final confirmed A step can move staged files into quarantine; nothing is deleted.",
 		restore: "Choose a quarantine run, press Enter to preview it, then A to open the exact-phrase restore gate.\nRestore never overwrites an existing file; collisions are blocked.",
 		history: "Choose a run and press Enter to inspect its actions. T previews retry; C previews reconcile; A applies that clean preview.\nBrowsing is read-only. Recovery changes require their own exact confirmation phrase.",
-		settings: "Use ↑↓ and Space/Enter to choose mounted roots, then S to save. Press F only when you want an rmlint scan.\nA scan reads filenames/content to find duplicates but never runs rmlint's cleanup script or moves files.",
+		settings: "Use ↑↓ and Space/Enter to choose mounted roots, then S to save. Press E for explained advanced paths and safety rules. Press F only when you want an rmlint scan.\nA scan reads filenames/content to find duplicates but never runs rmlint's cleanup script or moves files.",
 	}
 	if guide := guides[page]; guide != "" { return header + "\n" + guide }
 	return ""
@@ -2289,8 +2564,8 @@ func (m model) pageView(page screen, width int) string {
 		quarantine: {"QUARANTINE AIRLOCK", "Preview first; mutation always requires explicit confirmation", "1  Inspect the generated plan\n2  Run a bounded dry pilot\n3  Verify source and keeper\n4  Confirm --apply\n\nSafety interlocks remain owned by the Python engine."},
 		restore: {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history: {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
-		settings: {"STORAGE ARRAY SETUP", "Detect roots, save configuration, and run a safe duplicate scan", ""},
-		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\n/           search duplicate paths\nF           filter groups by storage root\nS           change group sort order\n[ and ]     previous / next group page\nX           stage one copy for quarantine\nB           review/stage every nonkeeper\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\n8           storage setup / rmlint scan\n1–8         jump to screen\nShift+/ (?) open this guide\nq           quit\n\nBulk staging requires a saved keeper and never stages it. A clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
+		settings: {"STORAGE ARRAY SETUP", "Choose drives, configure safety rules, and run a safe duplicate scan", ""},
+		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\n/           search duplicate paths\nF           filter groups by storage root\nS           change group sort order\n[ and ]     previous / next group page\nX           stage one copy for quarantine\nB           review/stage every nonkeeper\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\n8           storage setup / rmlint scan\nE           advanced setup fields\n1–8         jump to screen\nShift+/ (?) open this guide\nq           quit\n\nBulk staging requires a saved keeper and never stages it. Protected and excluded roots are hard safety rules. A clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
 	}
 	v := spec[page]
 	if page == settings {
@@ -2329,8 +2604,14 @@ func (m model) pageView(page screen, width int) string {
 					actionKey := groupKey + "\n" + files[i].Path
 					if m.dashboard.Decisions.KeeperPaths[groupKey] == files[i].Path {
 						hint = "KEEPER"
+					} else if pathWithinAny(files[i].Path, m.protectedRoots) {
+						hint = "PROTECTED"
+					} else if pathWithinAny(files[i].Path, m.excludedRoots) {
+						hint = "EXCLUDED"
 					} else if action := m.dashboard.Decisions.FileActions[actionKey]; action != "" {
 						hint = action
+					} else if pathWithinAny(files[i].Path, m.preferredRoots) {
+						hint = "PREFERRED"
 					} else if files[i].OriginalHint {
 						hint = "ORIGINAL HINT"
 					}
@@ -2357,7 +2638,8 @@ func (m model) pageView(page screen, width int) string {
 					lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render(prompt),
 						"Enter/Y confirm · N/H/← cancel · no archive files move")
 				} else {
-					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · Enter keeper · X one copy · B all nonkeepers · U undecided · C clear · H/← back", m.fileCursor+1, len(files)))
+					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · Enter keeper · X one copy · B all nonkeepers · U undecided · C clear · H/← back", m.fileCursor+1, len(files)),
+						mutedText.Render("PREFERRED is suggested first; PROTECTED and EXCLUDED copies cannot be staged."))
 				}
 				if m.statusMessage != "" { lines = append(lines, "", m.statusMessage) }
 				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · keeper decisions enabled", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n")+"\n\n"+basicInstructions(groups), width, cyan)

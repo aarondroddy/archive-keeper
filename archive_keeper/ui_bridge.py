@@ -33,6 +33,7 @@ from .core import (
     mount_root_for,
     move_noreplace,
     normalize_path,
+    path_is_within,
     quarantine_destination,
 )
 from .decisions import DecisionStore
@@ -473,7 +474,13 @@ def select_keeper(report: Path, decisions_db: Path, group_id: int, keeper: Path)
 
 
 def set_file_action(
-    report: Path, decisions_db: Path, group_id: int, target: Path, action: str
+    report: Path,
+    decisions_db: Path,
+    group_id: int,
+    target: Path,
+    action: str,
+    protected_roots: list[Path] | None = None,
+    excluded_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Stage or clear one file decision without moving an archive file."""
     report = normalize_path(report)
@@ -524,6 +531,15 @@ def set_file_action(
         if target == keeper and action != "CLEAR":
             result["error"] = "the selected keeper cannot be staged for quarantine"
             return result
+        if action == "QUARANTINE":
+            protected = [normalize_path(root) for root in (protected_roots or [])]
+            excluded = [normalize_path(root) for root in (excluded_roots or [])]
+            if any(path_is_within(target, root) for root in protected):
+                result["error"] = "the selected copy is beneath a protected root"
+                return result
+            if any(path_is_within(target, root) for root in excluded):
+                result["error"] = "the selected copy is beneath an excluded root"
+                return result
 
         store = DecisionStore(decisions_db)
         try:
@@ -540,7 +556,13 @@ def set_file_action(
     return result
 
 
-def bulk_stage_group(report: Path, decisions_db: Path, group_id: int) -> dict[str, Any]:
+def bulk_stage_group(
+    report: Path,
+    decisions_db: Path,
+    group_id: int,
+    protected_roots: list[Path] | None = None,
+    excluded_roots: list[Path] | None = None,
+) -> dict[str, Any]:
     """Stage every nonkeeper in one group atomically without moving files."""
     report = normalize_path(report)
     decisions_db = normalize_path(decisions_db)
@@ -580,6 +602,19 @@ def bulk_stage_group(report: Path, decisions_db: Path, group_id: int) -> dict[st
         members = [normalize_path(item.path) for item in group.files]
         if keeper not in members:
             result["error"] = "saved keeper is no longer a member of this duplicate group"
+            return result
+        nonkeepers = [path for path in members if path != keeper]
+        protected = [normalize_path(root) for root in (protected_roots or [])]
+        excluded = [normalize_path(root) for root in (excluded_roots or [])]
+        if any(path_is_within(path, root) for path in nonkeepers for root in protected):
+            result["error"] = (
+                "bulk staging refused because a nonkeeper is beneath a protected root"
+            )
+            return result
+        if any(path_is_within(path, root) for path in nonkeepers for root in excluded):
+            result["error"] = (
+                "bulk staging refused because a nonkeeper is beneath an excluded root"
+            )
             return result
         store = DecisionStore(decisions_db)
         try:
@@ -634,6 +669,8 @@ def quarantine_plan_snapshot(
     mount_roots: list[Path] | None = None,
     quarantine_name: str = DEFAULT_QUARANTINE_NAME,
     run_id: str = PREVIEW_RUN_ID,
+    protected_roots: list[Path] | None = None,
+    excluded_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Build a read-only plan from explicit QUARANTINE decisions.
 
@@ -643,6 +680,8 @@ def quarantine_plan_snapshot(
     report = normalize_path(report)
     decisions_db = normalize_path(decisions_db)
     roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
+    protected = [normalize_path(root) for root in (protected_roots or [])]
+    excluded = [normalize_path(root) for root in (excluded_roots or [])]
     warnings: list[str] = []
     result: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
@@ -725,6 +764,10 @@ def quarantine_plan_snapshot(
             destination = quarantine_destination(source, source_root, quarantine_name, run_id)
             if not root_mounted[source_root]:
                 reasons.append(f"source mount is unavailable: {source_root}")
+        if any(path_is_within(source, root) for root in protected):
+            reasons.append("source is beneath a protected root")
+        if any(path_is_within(source, root) for root in excluded):
+            reasons.append("source is beneath an excluded root")
         if keeper is not None:
             if keeper_root is None:
                 reasons.append("keeper is outside configured mount roots")
@@ -775,11 +818,14 @@ def quarantine_dry_run(
     run_id: str = PREVIEW_RUN_ID,
     limit: int = 10,
     verify_timeout: float = 5.0,
+    protected_roots: list[Path] | None = None,
+    excluded_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Run bounded engine preflight checks without moving files or writing a journal."""
     roots = [normalize_path(root) for root in (mount_roots or DEFAULT_ROOTS)]
     plan = quarantine_plan_snapshot(
-        report, decisions_db, roots, quarantine_name, run_id
+        report, decisions_db, roots, quarantine_name, run_id,
+        protected_roots, excluded_roots,
     )
     result: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
@@ -864,6 +910,8 @@ def controlled_quarantine_apply(
     run_id: str | None = None,
     limit: int = MAX_CONTROLLED_APPLY_FILES,
     verify_timeout: float = 30.0,
+    protected_roots: list[Path] | None = None,
+    excluded_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Move only explicitly staged files behind a strict confirmation gate."""
     limit = int(limit)
@@ -903,7 +951,8 @@ def controlled_quarantine_apply(
     )
     result["run_id"] = run_id
     plan = quarantine_plan_snapshot(
-        report, decisions_db, roots, quarantine_name, run_id
+        report, decisions_db, roots, quarantine_name, run_id,
+        protected_roots, excluded_roots,
     )
     if not plan["ok"]:
         result["error"] = "; ".join(plan["warnings"]) or "cannot build quarantine plan"
@@ -1348,12 +1397,16 @@ def build_parser() -> argparse.ArgumentParser:
     file_action.add_argument(
         "--action", choices=("QUARANTINE", "UNDECIDED", "CLEAR"), required=True
     )
+    file_action.add_argument("--protect", action="append", type=Path, default=[])
+    file_action.add_argument("--exclude", action="append", type=Path, default=[])
     bulk_stage = subparsers.add_parser(
         "bulk-stage-group", help="Stage every nonkeeper in one duplicate group"
     )
     bulk_stage.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     bulk_stage.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
     bulk_stage.add_argument("--group-id", type=int, required=True)
+    bulk_stage.add_argument("--protect", action="append", type=Path, default=[])
+    bulk_stage.add_argument("--exclude", action="append", type=Path, default=[])
     preview = subparsers.add_parser(
         "quarantine-plan", help="Emit a read-only preview of explicitly staged files"
     )
@@ -1362,6 +1415,8 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--mount-root", action="append", type=Path, dest="mount_roots")
     preview.add_argument("--quarantine-name", default=DEFAULT_QUARANTINE_NAME)
     preview.add_argument("--run-id", default=PREVIEW_RUN_ID)
+    preview.add_argument("--protect", action="append", type=Path, default=[])
+    preview.add_argument("--exclude", action="append", type=Path, default=[])
     dry_run = subparsers.add_parser(
         "quarantine-dry-run", help="Verify a bounded set of staged files without mutation"
     )
@@ -1372,6 +1427,8 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument("--run-id", default=PREVIEW_RUN_ID)
     dry_run.add_argument("--limit", type=int, default=10)
     dry_run.add_argument("--verify-timeout", type=float, default=5.0)
+    dry_run.add_argument("--protect", action="append", type=Path, default=[])
+    dry_run.add_argument("--exclude", action="append", type=Path, default=[])
     apply_run = subparsers.add_parser(
         "quarantine-apply", help="Move an explicitly confirmed bounded set of staged files"
     )
@@ -1384,6 +1441,8 @@ def build_parser() -> argparse.ArgumentParser:
     apply_run.add_argument("--limit", type=int, default=MAX_CONTROLLED_APPLY_FILES)
     apply_run.add_argument("--verify-timeout", type=float, default=30.0)
     apply_run.add_argument("--confirm", required=True)
+    apply_run.add_argument("--protect", action="append", type=Path, default=[])
+    apply_run.add_argument("--exclude", action="append", type=Path, default=[])
     history_run = subparsers.add_parser("history-run", help="Inspect one journal run read-only")
     history_run.add_argument("--state-db", type=Path, default=DEFAULT_STATE)
     history_run.add_argument("--run-id", required=True)
@@ -1434,13 +1493,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["ok"] else 1
     if args.command == "set-file-action":
         result = set_file_action(
-            args.report, args.decisions_db, args.group_id, args.path, args.action
+            args.report, args.decisions_db, args.group_id, args.path, args.action,
+            args.protect, args.exclude,
         )
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
         return 0 if result["ok"] else 1
     if args.command == "bulk-stage-group":
-        result = bulk_stage_group(args.report, args.decisions_db, args.group_id)
+        result = bulk_stage_group(
+            args.report, args.decisions_db, args.group_id, args.protect, args.exclude
+        )
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
         return 0 if result["ok"] else 1
@@ -1451,6 +1513,8 @@ def main(argv: list[str] | None = None) -> int:
             args.mount_roots,
             args.quarantine_name,
             args.run_id,
+            args.protect,
+            args.exclude,
         )
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
@@ -1464,6 +1528,8 @@ def main(argv: list[str] | None = None) -> int:
             args.run_id,
             args.limit,
             args.verify_timeout,
+            args.protect,
+            args.exclude,
         )
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
@@ -1479,6 +1545,8 @@ def main(argv: list[str] | None = None) -> int:
             args.run_id,
             args.limit,
             args.verify_timeout,
+            args.protect,
+            args.exclude,
         )
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")

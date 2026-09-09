@@ -299,6 +299,21 @@ On first launch, Storage Setup detects mounted drives beneath `/mnt`,
 `/media`, and `/run/media`. Select the roots Archive Keeper may manage,
 then press `S` to save. Press `8` to reopen setup later.
 
+Press `E` in Storage Setup for Advanced Configuration. Each field includes a
+plain-language explanation and validates before it is accepted. You can set
+the rmlint report, journal database, decisions database, quarantine folder
+name, preferred keeper roots, protected roots, and excluded roots. Multiple
+rule paths are separated with `:` on Linux. `S` saves everything to
+`~/.config/archive-keeper/ui.json` with owner-only permissions and reloads the
+runtime configuration.
+
+Preferred roots are suggestions: the copy inspector starts on a matching copy
+and labels it `PREFERRED`. Protected and excluded roots are hard rules. The UI
+refuses to stage matching copies, and the quarantine preview, dry pilot, and
+final apply all recheck the rules so an older staged decision cannot bypass a
+new rule. Excluded copies may still appear in an rmlint report, but Archive
+Keeper will not stage or move them.
+
 With `rmlint` installed, press `F` from Storage Setup and confirm with Enter
 to run a duplicate-only scan. The UI requests JSON output only; it never
 creates or runs rmlint's cleanup script. A successful report loads
@@ -332,7 +347,8 @@ bash scripts/ui-galaxy-fixture.sh ./archive-keeper-ui
 Inside the fixture UI, press `8`, `F`, Enter, then `2`. It creates four
 small duplicate groups spread across three temporary roots so the faint,
 low, medium, and high recoverable-space tiers are all visible. The fixture
-uses its own temporary report and configuration.
+uses its own temporary report and configuration. This is the quick UI test:
+it scans only tiny generated files under `/tmp`, never the selected NAS drives.
 
 
 History also provides action-scoped recovery. Press `6`, open a run, select
@@ -348,8 +364,12 @@ Test both paths with tiny temporary files and no NAS scan:
 bash scripts/ui-recovery-fixture.sh ./archive-keeper-ui
 ```
 
-Advanced deployments may continue to use `ARCHIVE_KEEPER_MOUNT_ROOTS` and
-`ARCHIVE_KEEPER_REPORT`; environment variables override saved UI settings.
+Advanced deployments may continue to use `ARCHIVE_KEEPER_MOUNT_ROOTS`,
+`ARCHIVE_KEEPER_REPORT`, `ARCHIVE_KEEPER_STATE_DB`,
+`ARCHIVE_KEEPER_DECISIONS_DB`, `ARCHIVE_KEEPER_QUARANTINE_NAME`,
+`ARCHIVE_KEEPER_PREFERRED_ROOTS`, `ARCHIVE_KEEPER_PROTECTED_ROOTS`, and
+`ARCHIVE_KEEPER_EXCLUDED_ROOTS`; environment variables override saved UI
+settings.
 
 ## Documentation
 

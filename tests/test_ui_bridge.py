@@ -208,6 +208,32 @@ class UIBridgeTests(unittest.TestCase):
                 count = connection.execute("SELECT COUNT(*) FROM file_decisions").fetchone()[0]
             self.assertEqual(count, 0)
 
+    def test_file_action_rejects_protected_and_excluded_copies(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            keeper = root / "keeper.bin"
+            copy = root / "copy-a.bin"
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+
+            protected = set_file_action(
+                report, decisions, 1, copy, "QUARANTINE", [copy], []
+            )
+            excluded = set_file_action(
+                report, decisions, 1, copy, "QUARANTINE", [], [copy]
+            )
+
+            self.assertFalse(protected["ok"])
+            self.assertIn("protected root", protected["error"])
+            self.assertFalse(excluded["ok"])
+            self.assertIn("excluded root", excluded["error"])
+            with sqlite3.connect(decisions) as connection:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM file_decisions"
+                ).fetchone()[0]
+            self.assertEqual(count, 0)
+
     def test_main_emits_one_json_document(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -292,6 +318,27 @@ class UIBridgeTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("choose a keeper", result["error"])
             self.assertFalse((root / "missing.sqlite3").exists())
+
+    def test_bulk_stage_group_rejects_protected_nonkeeper_atomically(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            self.assertTrue(
+                select_keeper(report, decisions, 1, root / "keeper.bin")["ok"]
+            )
+
+            result = bulk_stage_group(
+                report, decisions, 1, [root / "copy-b.bin"], []
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertIn("protected root", result["error"])
+            with sqlite3.connect(decisions) as connection:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM file_decisions"
+                ).fetchone()[0]
+            self.assertEqual(count, 0)
 
     def test_selecting_keeper_clears_conflicting_file_action(self):
         with tempfile.TemporaryDirectory() as td:
@@ -397,6 +444,31 @@ class UIBridgeTests(unittest.TestCase):
 
             self.assertEqual(plan["blocked_files"], 1)
             self.assertIn("collision", " ".join(plan["items"][0]["warnings"]))
+
+    def test_quarantine_plan_rechecks_new_protection_for_old_staged_choice(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            keeper = root / "keeper.bin"
+            copy = root / "copy-a.bin"
+            keeper.write_bytes(b"same")
+            copy.write_bytes(b"same")
+            self.assertTrue(select_keeper(report, decisions, 1, keeper)["ok"])
+            self.assertTrue(
+                set_file_action(report, decisions, 1, copy, "QUARANTINE")["ok"]
+            )
+
+            with patch("archive_keeper.ui_bridge.os.path.ismount", return_value=True):
+                plan = quarantine_plan_snapshot(
+                    report, decisions, [root], protected_roots=[copy]
+                )
+
+            self.assertEqual(plan["ready_files"], 0)
+            self.assertEqual(plan["blocked_files"], 1)
+            self.assertIn(
+                "protected root", " ".join(plan["items"][0]["warnings"])
+            )
 
     def test_quarantine_dry_run_is_bounded_and_never_mutates(self):
         with tempfile.TemporaryDirectory() as td:

@@ -26,6 +26,12 @@ verification, journal, dry-run, and explicit-apply safeguards.
 7. **Help** — contextual keys and safety explanations.
 8. **Storage Setup** — detected mounts, saved roots, and confirmed rmlint scans.
 
+Storage Setup has a guided Advanced Configuration screen opened with `E`.
+It edits the report, journal, decisions, quarantine folder, keeper-preference,
+protection, and exclusion settings without moving files. Paths are validated
+as absolute, the quarantine destination is restricted to one folder name, and
+the complete configuration is saved with owner-only permissions.
+
 Every workflow screen carries a plain-language basic guide. The guide states
 what the screen is for, the next keys to press, and whether the current step is
 read-only, decision-only, or capable of a confirmed file move.
@@ -49,6 +55,9 @@ Optional environment variables let a development build use non-default inputs:
 - `ARCHIVE_KEEPER_DECISIONS_DB`
 - `ARCHIVE_KEEPER_MOUNT_ROOTS`
 - `ARCHIVE_KEEPER_QUARANTINE_NAME`
+- `ARCHIVE_KEEPER_PREFERRED_ROOTS`
+- `ARCHIVE_KEEPER_PROTECTED_ROOTS`
+- `ARCHIVE_KEEPER_EXCLUDED_ROOTS`
 - `ARCHIVE_KEEPER_VERIFY_TIMEOUT`
 - `ARCHIVE_KEEPER_APPLY_LIMIT` (1–10; invalid values fall back to 10)
 
@@ -58,6 +67,14 @@ After saving a keeper, the operator may open a group-wide review that previews
 the protected keeper and nonkeeper count before atomically staging every other
 copy. The bridge rejects a missing or stale keeper and never stages the keeper
 path. This bulk operation records decisions only and cannot move archive files.
+
+Preferred roots influence presentation rather than silently changing a manual
+decision: the inspector selects and labels the first matching copy. Protected
+and excluded roots are enforced as hard, boundary-safe path rules by the Python
+bridge. They are checked when a single decision is staged, before an atomic
+bulk decision is committed, when the quarantine plan is built, during the dry
+pilot, and again for controlled apply. Rechecking at every boundary prevents a
+stale decision created before a rule change from being moved later.
 
 Controlled quarantine is available only after a clean bounded dry pilot. The
 operator must then type the exact phrase shown by the UI. Apply is capped at 10

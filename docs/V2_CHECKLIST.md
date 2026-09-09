@@ -83,8 +83,12 @@ path to a production-ready v2.
   paginated group browsing beyond the 24-group dashboard preview.
 - [x] Add confirmed bulk decision review that atomically stages every
   nonkeeper while validating and protecting the group's saved keeper.
-- [ ] Add advanced settings for report path, state DB, decisions DB, quarantine
+- [x] Add guided advanced settings for report path, state DB, decisions DB, quarantine
   name, preferred roots, protected roots, and exclusions.
+- [x] Enforce protected and excluded roots at single staging, atomic bulk
+  staging, quarantine preview, dry pilot, and controlled apply boundaries.
+- [x] Highlight preferred copies and open group review on the first matching
+  preferred root without automatically changing the saved keeper.
 - [ ] Add richer live rmlint progress when the installed version exposes
   machine-readable progress.
 - [ ] Add a post-scan summary before switching reports.
@@ -93,7 +97,8 @@ path to a production-ready v2.
 
 - [ ] Package/install the Go UI with the Python engine.
 - [ ] Add a stable launcher such as `archive-keeper ui`.
-- [ ] Add CI checks for Go formatting/tests, Python tests, and builds.
+- [x] Add CI checks for Go formatting/vet/tests, Python bridge tests, and the
+  Go build.
 - [ ] Add PTY end-to-end tests for keyboard input, tmux, resize, reconnect, and
   redraw.
 - [ ] Test Setup on local disks, CIFS, NFS, removable media, and offline mounts.

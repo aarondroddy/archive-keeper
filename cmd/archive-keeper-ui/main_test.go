@@ -146,6 +146,12 @@ func TestUIConfigRoundTrip(t *testing.T) {
 		Version: 1,
 		MountRoots: []string{"/mnt/Zeta", "/mnt/Alpha", "/mnt/Zeta"},
 		ReportPath: filepath.Join(t.TempDir(), "rmlint.json"),
+		StateDBPath: filepath.Join(t.TempDir(), "journal.sqlite3"),
+		DecisionsDBPath: filepath.Join(t.TempDir(), "decisions.sqlite3"),
+		QuarantineName: "ArchiveKeeper Safe Hold",
+		PreferredRoots: []string{"/mnt/Zeta/Favorites"},
+		ProtectedRoots: []string{"/mnt/Alpha/Originals"},
+		ExcludedRoots: []string{"/mnt/Alpha/Cache"},
 	}
 	if err := saveUIConfig(want); err != nil {
 		t.Fatalf("saveUIConfig: %v", err)
@@ -154,11 +160,51 @@ func TestUIConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadUIConfig: %v", err)
 	}
-	if got.Version != 1 || got.ReportPath != want.ReportPath {
+	if got.Version != 1 || got.ReportPath != want.ReportPath ||
+		got.StateDBPath != want.StateDBPath || got.DecisionsDBPath != want.DecisionsDBPath ||
+		got.QuarantineName != want.QuarantineName {
 		t.Fatalf("unexpected saved config: %#v", got)
 	}
 	if !reflect.DeepEqual(got.MountRoots, []string{"/mnt/Alpha", "/mnt/Zeta"}) {
 		t.Fatalf("mount roots were not normalized and sorted: %#v", got.MountRoots)
+	}
+	if !reflect.DeepEqual(got.PreferredRoots, want.PreferredRoots) ||
+		!reflect.DeepEqual(got.ProtectedRoots, want.ProtectedRoots) ||
+		!reflect.DeepEqual(got.ExcludedRoots, want.ExcludedRoots) {
+		t.Fatalf("advanced path rules were not preserved: %#v", got)
+	}
+}
+
+func TestAdvancedSettingValidationAndPreferredCursor(t *testing.T) {
+	var m model
+	if err := m.setAdvancedSetting(3, "nested/folder"); err == nil {
+		t.Fatal("quarantine folder accepted a path instead of one folder name")
+	}
+	if err := m.setAdvancedSetting(5, "relative/path"); err == nil {
+		t.Fatal("protected roots accepted a relative path")
+	}
+	if err := m.setAdvancedSetting(5, "/mnt/Protected:/mnt/Protected"); err != nil {
+		t.Fatalf("valid protected roots rejected: %v", err)
+	}
+	if !reflect.DeepEqual(m.protectedRoots, []string{"/mnt/Protected"}) {
+		t.Fatalf("protected roots were not normalized: %#v", m.protectedRoots)
+	}
+	m.preferredRoots = []string{"/mnt/Favorite"}
+	group := duplicateGroup{Files: []duplicateFile{
+		{Path: "/mnt/Other/copy.bin"},
+		{Path: "/mnt/Favorite/keeper.bin"},
+	}}
+	if got := m.preferredFileCursor(group); got != 1 {
+		t.Fatalf("preferred file cursor = %d, want 1", got)
+	}
+}
+
+func TestPathWithinAnyUsesPathBoundaries(t *testing.T) {
+	if !pathWithinAny("/mnt/Protected/child/file.bin", []string{"/mnt/Protected"}) {
+		t.Fatal("child path was not recognized as protected")
+	}
+	if pathWithinAny("/mnt/Protected-ish/file.bin", []string{"/mnt/Protected"}) {
+		t.Fatal("similar path escaped boundary-safe matching")
 	}
 }
 
