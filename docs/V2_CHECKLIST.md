@@ -97,8 +97,8 @@ path to a production-ready v2.
 
 - [ ] Package/install the Go UI with the Python engine.
 - [ ] Add a stable launcher such as `archive-keeper ui`.
-- [x] Add CI checks for Go formatting/vet/tests, Python bridge tests, and the
-  Go build.
+- [x] Add CI checks for Go vet/tests, Python bridge tests, and the Go build.
+- [ ] Add an explicit Go formatting check to CI.
 - [ ] Add PTY end-to-end tests for keyboard input, tmux, resize, reconnect, and
   redraw.
 - [ ] Test Setup on local disks, CIFS, NFS, removable media, and offline mounts.
