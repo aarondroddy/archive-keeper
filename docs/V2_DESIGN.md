@@ -54,6 +54,10 @@ Optional environment variables let a development build use non-default inputs:
 
 The largest recoverable groups can be opened in a copy-by-copy inspector.
 Keeper selection and quarantine staging write only to `decisions.sqlite3`.
+After saving a keeper, the operator may open a group-wide review that previews
+the protected keeper and nonkeeper count before atomically staging every other
+copy. The bridge rejects a missing or stale keeper and never stages the keeper
+path. This bulk operation records decisions only and cannot move archive files.
 
 Controlled quarantine is available only after a clean bounded dry pilot. The
 operator must then type the exact phrase shown by the UI. Apply is capped at 10

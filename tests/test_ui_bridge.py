@@ -11,6 +11,7 @@ from unittest.mock import patch
 from archive_keeper.ui_bridge import (
     PROTOCOL_VERSION,
     _mount_summary,
+    bulk_stage_group,
     controlled_quarantine_apply,
     controlled_recovery_action,
     controlled_restore_apply,
@@ -257,6 +258,40 @@ class UIBridgeTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("not a member", result["error"])
             self.assertFalse(decisions.exists())
+
+    def test_bulk_stage_group_protects_keeper_and_stages_every_other_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            decisions = root / "decisions.sqlite3"
+            selected = select_keeper(report, decisions, 1, root / "keeper.bin")
+            self.assertTrue(selected["ok"])
+            before = self._sha256(report)
+
+            result = bulk_stage_group(report, decisions, 1)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["files_moved"], 0)
+            self.assertEqual(result["staged"], 2)
+            self.assertEqual(result["keeper_path"], str(root / "keeper.bin"))
+            with sqlite3.connect(decisions) as connection:
+                rows = connection.execute(
+                    "SELECT path, action FROM file_decisions WHERE group_id=1 ORDER BY path"
+                ).fetchall()
+            self.assertEqual(rows, [
+                (str(root / "copy-a.bin"), "QUARANTINE"),
+                (str(root / "copy-b.bin"), "QUARANTINE"),
+            ])
+            self.assertEqual(before, self._sha256(report))
+
+    def test_bulk_stage_group_requires_a_saved_keeper(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            result = bulk_stage_group(report, root / "missing.sqlite3", 1)
+            self.assertFalse(result["ok"])
+            self.assertIn("choose a keeper", result["error"])
+            self.assertFalse((root / "missing.sqlite3").exists())
 
     def test_selecting_keeper_clears_conflicting_file_action(self):
         with tempfile.TemporaryDirectory() as td:

@@ -140,8 +140,10 @@ type model struct {
 	inspecting    bool
 	confirmKeeper bool
 	confirmAction string
+	confirmBulk   bool
 	savingKeeper  bool
 	savingAction  bool
+	savingBulk    bool
 	statusMessage string
 	plan          quarantinePlan
 	planLoading   bool
@@ -304,6 +306,21 @@ type actionSavedMsg struct {
 	path    string
 	action  string
 	err     error
+}
+
+type bulkSavedMsg struct {
+	groupID int
+	staged  int
+	err     error
+}
+
+type bulkStageResult struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	OK              bool   `json:"ok"`
+	GroupID         int    `json:"group_id"`
+	Staged          int    `json:"staged"`
+	KeeperPath      string `json:"keeper_path"`
+	Error           string `json:"error"`
 }
 
 type quarantinePlan struct {
@@ -1093,6 +1110,31 @@ func saveFileAction(groupID int, path, action string) tea.Cmd {
 	}
 }
 
+func saveBulkGroup(groupID int) tea.Cmd {
+	return func() tea.Msg {
+		python, args := bridgeArgs("bulk-stage-group")
+		for _, setting := range []struct{ env, flag string }{
+			{"ARCHIVE_KEEPER_REPORT", "--report"},
+			{"ARCHIVE_KEEPER_DECISIONS_DB", "--decisions-db"},
+		} {
+			if value := os.Getenv(setting.env); value != "" { args = append(args, setting.flag, value) }
+		}
+		args = append(args, "--group-id", strconv.Itoa(groupID))
+		output, err := exec.Command(python, args...).CombinedOutput()
+		var result bulkStageResult
+		if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
+			if err != nil { return bulkSavedMsg{groupID: groupID, err: fmt.Errorf("bridge command: %w", err)} }
+			return bulkSavedMsg{groupID: groupID, err: fmt.Errorf("bridge JSON: %w", jsonErr)}
+		}
+		if err != nil || !result.OK {
+			message := result.Error
+			if message == "" { message = "bulk decisions were not saved" }
+			return bulkSavedMsg{groupID: groupID, err: fmt.Errorf("%s", message)}
+		}
+		return bulkSavedMsg{groupID: result.GroupID, staged: result.Staged}
+	}
+}
+
 type scanTickMsg time.Time
 
 func scanTick() tea.Cmd {
@@ -1157,6 +1199,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			verb = "STAGED DECISION CLEARED"
 		}
 		m.statusMessage = verb + " · no files moved"
+		return m, loadDashboard
+	case bulkSavedMsg:
+		m.savingBulk = false
+		m.confirmBulk = false
+		if msg.err != nil {
+			m.statusMessage = "BULK STAGING BLOCKED · " + msg.err.Error()
+			return m, nil
+		}
+		m.statusMessage = fmt.Sprintf("GROUP %d REVIEWED · %d nonkeepers staged · keeper protected · no files moved", msg.groupID, msg.staged)
 		return m, loadDashboard
 	case quarantinePlanLoadedMsg:
 		m.planLoading = false
@@ -1318,6 +1369,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fileCursor = 0
 			m.confirmKeeper = false
 			m.confirmAction = ""
+			m.confirmBulk = false
 			m.confirmDryRun = false
 			m.confirmApply = false
 			m.applyInput = ""
@@ -1459,6 +1511,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.confirmBulk {
+				switch shortcut {
+				case "y", "enter":
+					if !m.savingBulk && m.groupCursor < len(m.groupCatalog.Items) {
+						group := m.groupCatalog.Items[m.groupCursor]
+						m.savingBulk = true
+						m.statusMessage = "SAVING BULK GROUP DECISIONS…"
+						return m, saveBulkGroup(group.GroupID)
+					}
+				case "n", "esc", "left", "h":
+					m.confirmBulk = false
+					m.statusMessage = "Bulk staging cancelled"
+				}
+				return m, nil
+			}
 			if m.confirmAction != "" {
 				switch shortcut {
 				case "y", "enter":
@@ -1535,6 +1602,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.confirmAction = "QUARANTINE"
 					m.statusMessage = "Confirm quarantine staging"
 				}
+			case "b":
+				if m.inspecting && m.groupCursor < len(m.groupCatalog.Items) {
+					group := m.groupCatalog.Items[m.groupCursor]
+					keeper := m.dashboard.Decisions.KeeperPaths[strconv.Itoa(group.GroupID)]
+					if keeper == "" {
+						m.statusMessage = "BULK STAGING BLOCKED · choose and save a keeper first"
+					} else {
+						m.confirmBulk = true
+						m.statusMessage = fmt.Sprintf("Review: keep 1 and stage %d nonkeepers", max(0, len(group.Files)-1))
+					}
+				}
 			case "u":
 				if m.inspecting {
 					m.confirmAction = "UNDECIDED"
@@ -1551,6 +1629,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.fileCursor = 0
 					m.confirmKeeper = false
 					m.confirmAction = ""
+					m.confirmBulk = false
 				} else {
 					m.contentFocus = false
 				}
@@ -2192,7 +2271,7 @@ func basicInstructions(page screen) string {
 	header := lipgloss.NewStyle().Bold(true).Foreground(gold).Render("BASIC GUIDE")
 	guides := map[screen]string{
 		home: "1) Use Storage Setup to choose drives.  2) Run/import an rmlint report.  3) Open Duplicate Groups.\nHome is a read-only overview; it never moves files.",
-		groups: "Choose a group, press Enter, then choose its keeper. Stage only unwanted copies with X.\nThis screen saves choices only; it never moves files.",
+		groups: "Choose a group and press Enter. Save its keeper first; X stages one copy and B reviews all nonkeepers.\nThis screen saves choices only; it never moves files.",
 		decisions: "This is your decision summary. To change a keeper or staged copy, return to Duplicate Groups.\nNothing moves until Quarantine passes its preview and confirmation gates.",
 		quarantine: "First press D for the safe dry pilot. If every check passes, press A and type the exact phrase shown.\nOnly the final confirmed A step can move staged files into quarantine; nothing is deleted.",
 		restore: "Choose a quarantine run, press Enter to preview it, then A to open the exact-phrase restore gate.\nRestore never overwrites an existing file; collisions are blocked.",
@@ -2211,7 +2290,7 @@ func (m model) pageView(page screen, width int) string {
 		restore: {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history: {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
 		settings: {"STORAGE ARRAY SETUP", "Detect roots, save configuration, and run a safe duplicate scan", ""},
-		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\n/           search duplicate paths\nF           filter groups by storage root\nS           change group sort order\n[ and ]     previous / next group page\nX           stage quarantine\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\n8           storage setup / rmlint scan\n1–8         jump to screen\n?           open this guide\nq           quit\n\nA clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
+		help: {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\n/           search duplicate paths\nF           filter groups by storage root\nS           change group sort order\n[ and ]     previous / next group page\nX           stage one copy for quarantine\nB           review/stage every nonkeeper\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\n8           storage setup / rmlint scan\n1–8         jump to screen\nShift+/ (?) open this guide\nq           quit\n\nBulk staging requires a saved keeper and never stages it. A clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
 	}
 	v := spec[page]
 	if page == settings {
@@ -2264,6 +2343,12 @@ func (m model) pageView(page screen, width int) string {
 				if m.confirmKeeper {
 					lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("SAVE THIS COPY AS KEEPER?"),
 						"Enter/Y confirm · N/H/← cancel · this records a decision only")
+				} else if m.confirmBulk {
+					keeper := m.dashboard.Decisions.KeeperPaths[strconv.Itoa(group.GroupID)]
+					lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render(
+						fmt.Sprintf("KEEP 1 · STAGE %d NONKEEPERS?", max(0, len(files)-1))),
+						"Protected keeper: "+compactPath(keeper, max(24, width-24)),
+						"Enter/Y confirm · N/H/← cancel · decisions only; no files move")
 				} else if m.confirmAction != "" {
 					prompt := "STAGE " + m.confirmAction + " FOR THIS COPY?"
 					if m.confirmAction == "CLEAR" {
@@ -2272,7 +2357,7 @@ func (m model) pageView(page screen, width int) string {
 					lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render(prompt),
 						"Enter/Y confirm · N/H/← cancel · no archive files move")
 				} else {
-					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · Enter keeper · X quarantine · U undecided · C clear · H/← back", m.fileCursor+1, len(files)))
+					lines = append(lines, "", fmt.Sprintf("Copy %d of %d · Enter keeper · X one copy · B all nonkeepers · U undecided · C clear · H/← back", m.fileCursor+1, len(files)))
 				}
 				if m.statusMessage != "" { lines = append(lines, "", m.statusMessage) }
 				return frame(fmt.Sprintf("CONSTELLATION %d", group.GroupID), fmt.Sprintf("%d copies · %s recoverable · keeper decisions enabled", group.Copies, group.RecoverableHuman), strings.Join(lines, "\n")+"\n\n"+basicInstructions(groups), width, cyan)
@@ -2463,7 +2548,7 @@ func (m model) View() tea.View {
 	}
 	if m.page == groups && m.contentFocus {
 		bridgeStatus = "GALAXY MAP · ↑↓ systems · Enter inspect · G list · files untouched"
-		if m.inspecting { bridgeStatus = "GROUP INSPECTOR · Enter keeper · X stage · U undecided · C clear · files untouched" }
+		if m.inspecting { bridgeStatus = "GROUP INSPECTOR · Enter keeper · X one · B all nonkeepers · decisions only" }
 	} else if m.page == quarantine && m.contentFocus {
 		bridgeStatus = "QUARANTINE PREVIEW · D dry pilot · R reload · no moves · no journal writes"
 		if m.confirmApply {

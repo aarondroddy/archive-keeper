@@ -112,6 +112,13 @@ func TestEveryPrimaryScreenHasBasicGuidance(t *testing.T) {
 	}
 }
 
+func TestBulkStageResultIsDecisionOnly(t *testing.T) {
+	result := bulkStageResult{ProtocolVersion: 1, OK: true, GroupID: 7, Staged: 3, KeeperPath: "/keeper"}
+	if !result.OK || result.Staged != 3 || result.KeeperPath == "" {
+		t.Fatalf("unexpected bulk stage result: %#v", result)
+	}
+}
+
 
 func TestParseMountCandidatesFiltersPseudoAndDecodesPaths(t *testing.T) {
 	mountInfo := strings.Join([]string{

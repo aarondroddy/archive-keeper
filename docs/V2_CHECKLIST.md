@@ -81,7 +81,8 @@ path to a production-ready v2.
 - [x] Add action-scoped, preview-first UI controls for safe reconcile and retry workflows.
 - [x] Add report-wide path search, mount-root filtering, five sort modes, and
   paginated group browsing beyond the 24-group dashboard preview.
-- [ ] Add bulk decision review while enforcing at least one keeper.
+- [x] Add confirmed bulk decision review that atomically stages every
+  nonkeeper while validating and protecting the group's saved keeper.
 - [ ] Add advanced settings for report path, state DB, decisions DB, quarantine
   name, preferred roots, protected roots, and exclusions.
 - [ ] Add richer live rmlint progress when the installed version exposes

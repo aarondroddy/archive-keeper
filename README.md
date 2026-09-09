@@ -313,6 +313,15 @@ report. Every primary screen also includes a short basic guide explaining what
 to do next and whether that screen can move files; press `?` for the full key
 guide at any time.
 
+Inside a group, select the copy that must remain and press Enter to save it as
+the keeper. Press `B` to review a group-wide decision that stages every other
+copy for quarantine. The confirmation screen names the protected keeper and
+shows the exact number of nonkeepers that will be staged. The bridge refuses
+the operation unless the saved keeper is still a member of the group, and the
+transaction can never add that keeper to the quarantine decisions. This is a
+decisions-only step: no files move until the separate dry-pilot and controlled
+apply workflow succeeds.
+
 To exercise scanning and the galaxy map without touching real storage, run
 the bundled fixture after building the UI:
 

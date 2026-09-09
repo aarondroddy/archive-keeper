@@ -540,6 +540,60 @@ def set_file_action(
     return result
 
 
+def bulk_stage_group(report: Path, decisions_db: Path, group_id: int) -> dict[str, Any]:
+    """Stage every nonkeeper in one group atomically without moving files."""
+    report = normalize_path(report)
+    decisions_db = normalize_path(decisions_db)
+    result: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": False,
+        "operation": "bulk-stage-group",
+        "files_moved": 0,
+        "group_id": group_id,
+        "staged": 0,
+        "keeper_path": "",
+    }
+    try:
+        groups = load_rmlint_groups(report)
+    except ArchiveKeeperError as exc:
+        result["error"] = str(exc)
+        return result
+    group = next((item for item in groups if item.group_id == group_id), None)
+    if group is None:
+        result["error"] = f"duplicate group not found in report: {group_id}"
+        return result
+    if not decisions_db.is_file():
+        result["error"] = f"choose a keeper for group {group_id} first"
+        return result
+    try:
+        with closing(_readonly_connection(decisions_db)) as connection:
+            if not _table_exists(connection, "keeper_decisions"):
+                result["error"] = f"choose a keeper for group {group_id} first"
+                return result
+            row = connection.execute(
+                "SELECT keeper_path FROM keeper_decisions WHERE group_id=?", (group_id,)
+            ).fetchone()
+        if row is None:
+            result["error"] = f"choose a keeper for group {group_id} first"
+            return result
+        keeper = normalize_path(row[0])
+        members = [normalize_path(item.path) for item in group.files]
+        if keeper not in members:
+            result["error"] = "saved keeper is no longer a member of this duplicate group"
+            return result
+        store = DecisionStore(decisions_db)
+        try:
+            result["staged"] = store.stage_all_nonkeepers(group_id, members, keeper)
+        finally:
+            store.close()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        result["error"] = f"cannot stage group decisions: {exc}"
+        return result
+    result["keeper_path"] = str(keeper)
+    result["ok"] = True
+    return result
+
+
 def _bounded_path_probe(paths: list[Path]) -> tuple[dict[str, str], str | None]:
     """Inspect a small set of live paths without allowing a stale NAS to hang the UI."""
     script = (
@@ -1294,6 +1348,12 @@ def build_parser() -> argparse.ArgumentParser:
     file_action.add_argument(
         "--action", choices=("QUARANTINE", "UNDECIDED", "CLEAR"), required=True
     )
+    bulk_stage = subparsers.add_parser(
+        "bulk-stage-group", help="Stage every nonkeeper in one duplicate group"
+    )
+    bulk_stage.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    bulk_stage.add_argument("--decisions-db", type=Path, default=DEFAULT_DECISIONS)
+    bulk_stage.add_argument("--group-id", type=int, required=True)
     preview = subparsers.add_parser(
         "quarantine-plan", help="Emit a read-only preview of explicitly staged files"
     )
@@ -1376,6 +1436,11 @@ def main(argv: list[str] | None = None) -> int:
         result = set_file_action(
             args.report, args.decisions_db, args.group_id, args.path, args.action
         )
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        return 0 if result["ok"] else 1
+    if args.command == "bulk-stage-group":
+        result = bulk_stage_group(args.report, args.decisions_db, args.group_id)
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
         return 0 if result["ok"] else 1
