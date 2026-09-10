@@ -416,7 +416,7 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             ).stdout
             self.assertIn("DUPLICATE CONSTELLATIONS", captured)
             self.assertIn("FILES UNTOUCHED", captured)
-            second.send(b"q")
+            second.send(b"\x02d")  # Detach the client; keyboard exit is tested separately.
             self.assertEqual(second.wait(timeout=20), 0)
         finally:
             first.close(force=True)

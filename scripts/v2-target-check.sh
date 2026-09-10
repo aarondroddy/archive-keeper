@@ -48,12 +48,24 @@ cp "$ui_binary" "$stage/archive_keeper/bin/archive-keeper-ui"
 chmod 755 "$stage/archive_keeper/bin/archive-keeper-ui"
 wheelhouse="$check_root/wheelhouse"
 mkdir -p "$wheelhouse"
-if ! python3 -c 'import setuptools.build_meta' >/dev/null 2>&1; then
+build_python="$(command -v python3)"
+if ! "$build_python" -c 'import setuptools.build_meta' >/dev/null 2>&1; then
+    if [[ -x /usr/bin/python3 ]] \
+        && /usr/bin/python3 -c 'import setuptools.build_meta' >/dev/null 2>&1 \
+        && /usr/bin/python3 -m pip --version >/dev/null 2>&1; then
+        build_python=/usr/bin/python3
+    else
+        printf 'Target check stopped: no Python with pip and setuptools.build_meta was found.\n' >&2
+        printf 'On Kali, install them with: sudo apt install python3-pip python3-setuptools\n' >&2
+        exit 1
+    fi
+fi
+if ! "$build_python" -m pip --version >/dev/null 2>&1; then
     printf 'Target check stopped: the system Python needs setuptools to build the isolated wheel.\n' >&2
-    printf 'On Kali, install it with: sudo apt install python3-setuptools\n' >&2
+    printf 'On Kali, install it with: sudo apt install python3-pip\n' >&2
     exit 1
 fi
-python3 -m pip wheel --quiet --no-deps --no-build-isolation \
+"$build_python" -m pip wheel --quiet --no-deps --no-build-isolation \
     --wheel-dir "$wheelhouse" "$stage"
 python3 -m venv "$check_root/venv"
 "$check_root/venv/bin/pip" install --quiet --no-deps "$wheelhouse"/*.whl
