@@ -81,7 +81,11 @@ source .venv/bin/activate
 archive-keeper --help
 ```
 
-The installer creates an isolated Python virtual environment. The full-screen interface uses only Python standard-library components.
+The installer creates an isolated Python virtual environment and installs the
+complete safety engine plus the bundled Storage Galaxy executable. Official
+combined release archives do not require Go on the user's machine. A raw
+development checkout can build the interface during installation when Go is
+available.
 
 Optional system helpers for richer previews:
 
@@ -96,6 +100,17 @@ Verify the installed version:
 ```bash
 archive-keeper --version
 ```
+
+Launch Storage Galaxy from the same installation:
+
+```bash
+archive-keeper ui
+```
+
+`archive-keeper ui --health-check` verifies that the bundled interface can be
+started without opening the full-screen application. Existing commands such
+as `analyze`, `plan`, `quarantine`, `restore`, `retry`, and `reconcile` remain
+part of the same package.
 
 ## Open the visual reviewer
 
@@ -295,6 +310,9 @@ go build -o archive-keeper-ui ./cmd/archive-keeper-ui
 ./archive-keeper-ui
 ```
 
+Installed combined packages use `archive-keeper ui`; the direct binary command
+above is retained for source-tree development.
+
 On first launch, Storage Setup detects mounted drives beneath `/mnt`,
 `/media`, and `/run/media`. Select the roots Archive Keeper may manage,
 then press `S` to save. Press `8` to reopen setup later.
@@ -349,7 +367,7 @@ To exercise scanning and the galaxy map without touching real storage, run
 the bundled fixture after building the UI:
 
 ```bash
-bash scripts/ui-galaxy-fixture.sh ./archive-keeper-ui
+bash scripts/ui-galaxy-fixture.sh
 ```
 
 Inside the fixture UI, press `8`, `F`, Enter, then `2`. It creates four

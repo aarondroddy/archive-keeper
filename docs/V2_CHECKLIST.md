@@ -101,8 +101,10 @@ path to a production-ready v2.
 
 ### Packaging and reliability
 
-- [ ] Package/install the Go UI with the Python engine.
-- [ ] Add a stable launcher such as `archive-keeper ui`.
+- [x] Package/install the Go UI with the Python engine in platform-specific
+  combined archives and wheels.
+- [x] Add the stable `archive-keeper ui` launcher with bundled-binary discovery
+  and an installation health check.
 - [x] Add CI checks for Go vet/tests, Python bridge tests, and the Go build.
 - [ ] Add an explicit Go formatting check to CI.
 - [ ] Add PTY end-to-end tests for keyboard input, tmux, resize, reconnect, and

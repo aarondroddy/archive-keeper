@@ -44,6 +44,16 @@ Every workflow screen carries a plain-language basic guide. The guide states
 what the screen is for, the next keys to press, and whether the current step is
 read-only, decision-only, or capable of a confirmed file move.
 
+## Combined installation
+
+Archive Keeper is distributed as one platform-specific package containing the
+Python safety engine and a prebuilt Storage Galaxy executable. The existing
+`archive-keeper` entry point retains every command-line workflow and adds
+`archive-keeper ui` as the stable graphical-terminal launcher. End users do not
+need Go; maintainers compile and embed the UI while building the release. A
+health-check mode verifies the packaged executable without entering alternate
+screen mode.
+
 ## Integration boundary
 
 The Go application will consume a versioned JSON protocol emitted by the Python

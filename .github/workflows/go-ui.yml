@@ -5,9 +5,16 @@ on:
     paths:
       - "cmd/archive-keeper-ui/**"
       - "archive_keeper/ui_bridge.py"
+      - "archive_keeper/cli.py"
+      - "archive_keeper/bin/**"
       - "tests/test_ui_bridge.py"
+      - "tests/test_archive_keeper.py"
       - "go.mod"
       - "go.sum"
+      - "pyproject.toml"
+      - "setup.py"
+      - "install.sh"
+      - "scripts/build-combined-package.sh"
       - ".github/workflows/go-ui.yml"
   push:
     branches: ["feature/v2-storage-galaxy"]
@@ -23,8 +30,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Test read-only bridge
-        run: python -m unittest tests.test_ui_bridge -v
+      - name: Test Python engine and bridge
+        run: python -m unittest discover -s tests -v
 
   build:
     runs-on: ubuntu-latest
@@ -41,4 +48,18 @@ jobs:
       - name: Test
         run: go test ./...
       - name: Build Storage Galaxy
-        run: go build -o archive-keeper-ui ./cmd/archive-keeper-ui
+        run: |
+          mkdir -p archive_keeper/bin
+          go build -trimpath -o archive_keeper/bin/archive-keeper-ui ./cmd/archive-keeper-ui
+          chmod 755 archive_keeper/bin/archive-keeper-ui
+      - name: Build combined Python and Storage Galaxy wheel
+        run: |
+          python -m pip wheel --no-deps --wheel-dir dist .
+          ls dist/*-linux_x86_64.whl
+      - name: Verify isolated combined installation
+        run: |
+          python -m venv /tmp/archive-keeper-install
+          /tmp/archive-keeper-install/bin/pip install --no-deps dist/*.whl
+          /tmp/archive-keeper-install/bin/archive-keeper --version
+          /tmp/archive-keeper-install/bin/archive-keeper ui --print-binary
+          /tmp/archive-keeper-install/bin/archive-keeper ui --health-check

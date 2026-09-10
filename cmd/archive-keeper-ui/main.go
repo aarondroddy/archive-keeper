@@ -2958,6 +2958,10 @@ func (m model) View() tea.View {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--health-check" {
+		fmt.Println("archive-keeper-ui ready")
+		return
+	}
 	p := tea.NewProgram(initialModel())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "archive-keeper-ui:", err)

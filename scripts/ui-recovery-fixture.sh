@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-UI_BINARY="${1:-/tmp/archive-keeper-ui}"
-if [[ ! -x "$UI_BINARY" ]]; then
-  echo "UI binary is not executable: $UI_BINARY" >&2
-  echo "Build it first: go build -o /tmp/archive-keeper-ui ./cmd/archive-keeper-ui" >&2
+if [[ $# -gt 0 ]]; then
+  [[ -x "$1" ]] || { echo "UI binary is not executable: $1" >&2; exit 1; }
+  UI_COMMAND=("$1")
+elif command -v archive-keeper >/dev/null 2>&1; then
+  UI_COMMAND=(archive-keeper ui)
+elif [[ -x /tmp/archive-keeper-ui ]]; then
+  UI_COMMAND=(/tmp/archive-keeper-ui)
+else
+  echo "Archive Keeper UI not found. Install the combined package or build /tmp/archive-keeper-ui." >&2
   exit 1
 fi
 
@@ -61,4 +66,4 @@ PY
 
 echo "Temporary recovery fixture: $FIXTURE_DIR"
 echo "In the UI: press 6, Enter, select an action, then T or C. A opens the typed apply gate."
-"$UI_BINARY"
+"${UI_COMMAND[@]}"

@@ -941,6 +941,34 @@ class ArchiveKeeperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "archive-keeper 1.6.8")
 
+    def test_ui_subcommand_launches_configured_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "archive-keeper-ui"
+            binary.write_text("#!/bin/sh\nprintf 'bundled UI ready: %s\\n' \"$ARCHIVE_KEEPER_PYTHON\"\n")
+            binary.chmod(0o700)
+            env = os.environ.copy()
+            env["ARCHIVE_KEEPER_UI_BINARY"] = str(binary)
+            result = subprocess.run(
+                [sys.executable, "-m", "archive_keeper", "ui", "--health-check"],
+                env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), f"bundled UI ready: {sys.executable}")
+
+    def test_ui_subcommand_can_report_resolved_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "archive-keeper-ui"
+            binary.write_text("fixture")
+            binary.chmod(0o700)
+            env = os.environ.copy()
+            env["ARCHIVE_KEEPER_UI_BINARY"] = str(binary)
+            result = subprocess.run(
+                [sys.executable, "-m", "archive_keeper", "ui", "--print-binary"],
+                env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(binary))
+
 
     def test_sampled_sha256_match_detects_match_and_sample_mismatch(self):
         from archive_keeper.core import sampled_sha256_match

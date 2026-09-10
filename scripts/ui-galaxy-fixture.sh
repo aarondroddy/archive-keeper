@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ui_binary="${1:-/tmp/archive-keeper-ui}"
-if [[ ! -x "$ui_binary" ]]; then
-    if command -v archive-keeper-ui >/dev/null 2>&1; then
-        ui_binary="$(command -v archive-keeper-ui)"
-    else
-        printf 'Archive Keeper UI binary not found.\nBuild it first with:\n  go build -o /tmp/archive-keeper-ui ./cmd/archive-keeper-ui\n' >&2
-        exit 1
-    fi
+if [[ $# -gt 0 ]]; then
+    [[ -x "$1" ]] || { printf 'Archive Keeper UI binary is not executable: %s\n' "$1" >&2; exit 1; }
+    ui_command=("$1")
+elif command -v archive-keeper >/dev/null 2>&1; then
+    ui_command=(archive-keeper ui)
+elif [[ -x /tmp/archive-keeper-ui ]]; then
+    ui_command=(/tmp/archive-keeper-ui)
+elif command -v archive-keeper-ui >/dev/null 2>&1; then
+    ui_command=("$(command -v archive-keeper-ui)")
+else
+    printf 'Archive Keeper UI not found. Install the combined package or build it with:\n  go build -o /tmp/archive-keeper-ui ./cmd/archive-keeper-ui\n' >&2
+    exit 1
 fi
 if ! command -v rmlint >/dev/null 2>&1; then
     printf 'rmlint is not installed or is not on PATH.\n' >&2
@@ -49,6 +53,6 @@ printf 'Expected intensity legend: · faint, ✦ low, ✦✦ medium, ✦✦✦ h
 ARCHIVE_KEEPER_MOUNT_ROOTS="$orion:$lyra:$draco" \
 ARCHIVE_KEEPER_REPORT="$fixture_root/rmlint.json" \
 ARCHIVE_KEEPER_UI_CONFIG="$fixture_root/ui.json" \
-"$ui_binary"
+"${ui_command[@]}"
 
 printf '\nFixture retained for inspection: %s\n' "$fixture_root"
