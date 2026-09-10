@@ -240,12 +240,11 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             start = len(terminal.output)
             terminal.resize(86, 28)
             rendered = terminal.wait_for("FILES UNTOUCHED", start=start)
-            self.assertIn("MISSION CONTROL", rendered)
-            self.assertIn("ARCHIVE KEEPER", rendered)
+            self.assertIn("MOUNT ARRAY", rendered)
             start = len(terminal.output)
             terminal.resize(168, 52)
             rendered = terminal.wait_for("FILES UNTOUCHED", start=start)
-            self.assertIn("MISSION CONTROL", rendered)
+            self.assertIn("BASIC GUIDE", rendered)
         finally:
             terminal.close()
             fixture.close()
@@ -282,10 +281,18 @@ class StorageGalaxyPTYTests(unittest.TestCase):
                 112, 34,
             )
             second.wait_for("DUPLICATE CONSTELLATIONS")
-            start = len(second.output)
             second.resize(160, 48)
-            rendered = second.wait_for("FILES UNTOUCHED", start=start)
-            self.assertIn("DUPLICATE CONSTELLATIONS", rendered)
+            second.wait_for("FILES UNTOUCHED", start=len(second.output))
+            captured = subprocess.run(
+                [tmux, "-L", socket, "capture-pane", "-p", "-t", session],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=True,
+                timeout=5,
+            ).stdout
+            self.assertIn("DUPLICATE CONSTELLATIONS", captured)
+            self.assertIn("FILES UNTOUCHED", captured)
             second.send(b"q")
             self.assertEqual(second.wait(), 0)
         finally:
@@ -310,7 +317,7 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.send(b"2")
             terminal.wait_for("DUPLICATE CONSTELLATIONS", timeout=45)
             terminal.send(b"/")
-            terminal.wait_for("SEARCH ALL DUPLICATE PATHS")
+            terminal.wait_for("SEARCH FILE PATHS")
             terminal.send(b"group-50000\r")
             rendered = terminal.wait_for("G50000", timeout=45)
             if "49.83 KiB" not in rendered:
