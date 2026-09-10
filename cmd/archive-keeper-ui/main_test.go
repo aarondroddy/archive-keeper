@@ -187,7 +187,7 @@ func TestParseMountCandidatesCoversSupportedStorageKinds(t *testing.T) {
 		"41 20 8:1 / /mnt/LocalDisk rw,relatime - ext4 /dev/sdb1 rw",
 		"42 20 0:51 / /mnt/TeamShare rw,relatime - cifs //server/share rw",
 		"43 20 0:52 / /mnt/Research rw,relatime - nfs4 server:/exports/research rw",
-		"44 20 8:17 / /media/aaron/USB\040ARCHIVE rw,nosuid - exfat /dev/sdc1 rw",
+		"44 20 8:17 / /media/aaron/USB\\040ARCHIVE rw,nosuid - exfat /dev/sdc1 rw",
 	}, "\n")
 
 	got := parseMountCandidates(mountInfo)
