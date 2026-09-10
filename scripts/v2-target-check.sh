@@ -46,8 +46,17 @@ git archive HEAD | tar -x -C "$stage"
 mkdir -p "$stage/archive_keeper/bin"
 cp "$ui_binary" "$stage/archive_keeper/bin/archive-keeper-ui"
 chmod 755 "$stage/archive_keeper/bin/archive-keeper-ui"
+wheelhouse="$check_root/wheelhouse"
+mkdir -p "$wheelhouse"
+if ! python3 -c 'import setuptools.build_meta' >/dev/null 2>&1; then
+    printf 'Target check stopped: the system Python needs setuptools to build the isolated wheel.\n' >&2
+    printf 'On Kali, install it with: sudo apt install python3-setuptools\n' >&2
+    exit 1
+fi
+python3 -m pip wheel --quiet --no-deps --no-build-isolation \
+    --wheel-dir "$wheelhouse" "$stage"
 python3 -m venv "$check_root/venv"
-"$check_root/venv/bin/pip" install --quiet --no-deps --no-build-isolation "$stage"
+"$check_root/venv/bin/pip" install --quiet --no-deps "$wheelhouse"/*.whl
 "$check_root/venv/bin/archive-keeper" --version
 "$check_root/venv/bin/archive-keeper" ui --health-check
 
