@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 func TestStructuredErrorLogIsJSONLinesAndOwnerOnly(t *testing.T) {
