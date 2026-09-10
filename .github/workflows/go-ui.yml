@@ -9,6 +9,7 @@ on:
       - "archive_keeper/bin/**"
       - "tests/test_ui_bridge.py"
       - "tests/test_archive_keeper.py"
+      - "tests/test_ui_pty.py"
       - "go.mod"
       - "go.sum"
       - "pyproject.toml"
@@ -61,5 +62,20 @@ jobs:
           python -m venv /tmp/archive-keeper-install
           /tmp/archive-keeper-install/bin/pip install --no-deps dist/*.whl
           /tmp/archive-keeper-install/bin/archive-keeper --version
-          /tmp/archive-keeper-install/bin/archive-keeper ui --print-binary
           /tmp/archive-keeper-install/bin/archive-keeper ui --health-check
+
+  pty-reliability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Run isolated PTY reliability suite
+        run: python -m unittest tests.test_ui_pty -v

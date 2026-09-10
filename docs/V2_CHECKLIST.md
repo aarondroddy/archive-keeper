@@ -107,10 +107,12 @@ path to a production-ready v2.
   and an installation health check.
 - [x] Add CI checks for Go vet/tests, Python bridge tests, and the Go build.
 - [ ] Add an explicit Go formatting check to CI.
-- [ ] Add PTY end-to-end tests for keyboard input, tmux, resize, reconnect, and
-  redraw.
+- [x] Add isolated PTY end-to-end tests for keyboard input, tmux detach/reattach,
+  resize, reconnect, and full redraw without accessing configured NAS paths.
 - [ ] Test Setup on local disks, CIFS, NFS, removable media, and offline mounts.
-- [ ] Test long scans and very large reports.
+- [ ] Test long scans.
+- [x] Test a very large synthetic report (50,000 groups / 100,000 duplicate
+  records) through the live PTY UI without invoking rmlint or reading NAS data.
 - [ ] Complete accessibility and low-color terminal review.
 - [ ] Add structured logging for bridge and scan failures.
 

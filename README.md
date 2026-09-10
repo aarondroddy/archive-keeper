@@ -397,6 +397,21 @@ Advanced deployments may continue to use `ARCHIVE_KEEPER_MOUNT_ROOTS`,
 `ARCHIVE_KEEPER_EXCLUDED_ROOTS`; environment variables override saved UI
 settings.
 
+### Automated terminal reliability tests
+
+Maintainers can exercise the real Bubble Tea application through a Linux PTY:
+
+```bash
+python -m unittest tests.test_ui_pty -v
+```
+
+The suite verifies arrow-key and help input, clean exit, narrow/wide terminal
+redraws, tmux detach and reattach, and a searchable synthetic report containing
+50,000 duplicate groups. It generates rmlint-compatible JSON directly beneath
+the operating system temporary directory. It does not invoke rmlint, run an
+apply operation, or access `/mnt/MyCloud1`, `/mnt/MyCloud2`, or `/mnt/MyCloud3`.
+Go and tmux are required; CI installs both before running the suite.
+
 ## Documentation
 
 - [Installation](docs/INSTALL.md)
