@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestStructuredErrorLogIsJSONLinesAndOwnerOnly(t *testing.T) {
