@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unittest
 from pathlib import Path
@@ -32,8 +33,14 @@ REAL_STORAGE_PREFIXES = ("/mnt/MyCloud1", "/mnt/MyCloud2", "/mnt/MyCloud3")
 
 
 def _set_window_size(fd: int, columns: int, rows: int) -> None:
-    fcntl.ioctl(fd, getattr(__import__("termios"), "TIOCSWINSZ"),
+    fcntl.ioctl(fd, termios.TIOCSWINSZ,
                 struct.pack("HHHH", rows, columns, 0, 0))
+
+
+def _claim_controlling_terminal(slave: int) -> None:
+    """Start a new session and make the PTY slave available as /dev/tty."""
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
 
 class TerminalProcess:
@@ -50,7 +57,7 @@ class TerminalProcess:
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            start_new_session=True,
+            preexec_fn=lambda: _claim_controlling_terminal(slave),
             close_fds=True,
         )
         os.close(slave)
@@ -232,12 +239,13 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.wait_for("MISSION CONTROL")
             start = len(terminal.output)
             terminal.resize(86, 28)
-            rendered = terminal.wait_for("MISSION CONTROL", start=start)
+            rendered = terminal.wait_for("FILES UNTOUCHED", start=start)
+            self.assertIn("MISSION CONTROL", rendered)
             self.assertIn("ARCHIVE KEEPER", rendered)
             start = len(terminal.output)
             terminal.resize(168, 52)
-            rendered = terminal.wait_for("MISSION CONTROL", start=start)
-            self.assertIn("FILES UNTOUCHED", rendered)
+            rendered = terminal.wait_for("FILES UNTOUCHED", start=start)
+            self.assertIn("MISSION CONTROL", rendered)
         finally:
             terminal.close()
             fixture.close()
@@ -276,8 +284,8 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             second.wait_for("DUPLICATE CONSTELLATIONS")
             start = len(second.output)
             second.resize(160, 48)
-            rendered = second.wait_for("DUPLICATE CONSTELLATIONS", start=start)
-            self.assertIn("FILES UNTOUCHED", rendered)
+            rendered = second.wait_for("FILES UNTOUCHED", start=start)
+            self.assertIn("DUPLICATE CONSTELLATIONS", rendered)
             second.send(b"q")
             self.assertEqual(second.wait(), 0)
         finally:
@@ -305,6 +313,8 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.wait_for("SEARCH ALL DUPLICATE PATHS")
             terminal.send(b"group-50000\r")
             rendered = terminal.wait_for("G50000", timeout=45)
+            if "49.83 KiB" not in rendered:
+                rendered = terminal.wait_for("49.83 KiB", timeout=5)
             self.assertIn("49.83 KiB", rendered)
         finally:
             terminal.close()
