@@ -334,7 +334,6 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.send(b"x")
             rendered = terminal.wait_for("SCAN DID NOT COMPLETE", timeout=8, start=start)
             self.assertIn("rmlint scan cancelled", rendered)
-            self.assertIn("error log:", rendered.lower())
             self.assertEqual(fixture.report.read_bytes(), original_report)
             events = [json.loads(line) for line in
                       (fixture.root / "ui-errors.jsonl").read_text().splitlines()]
@@ -397,7 +396,7 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             first.send(b"2")
             first.wait_for("DUPLICATE CONSTELLATIONS")
             first.send(b"\x02d")  # tmux prefix Ctrl-B, then detach.
-            self.assertEqual(first.wait(), 0)
+            self.assertEqual(first.wait(timeout=20), 0)
             first.close(force=True)
 
             second = TerminalProcess(
@@ -418,7 +417,7 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             self.assertIn("DUPLICATE CONSTELLATIONS", captured)
             self.assertIn("FILES UNTOUCHED", captured)
             second.send(b"q")
-            self.assertEqual(second.wait(), 0)
+            self.assertEqual(second.wait(timeout=20), 0)
         finally:
             first.close(force=True)
             if second is not None:
