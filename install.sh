@@ -21,9 +21,22 @@ python3 -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install .
 installed_version="$(python -c 'from archive_keeper import __version__; print(__version__)')"
+
+# Install a stable command outside the virtual environment. The launcher is a
+# symlink to the venv entry point, so it always uses the Python interpreter and
+# packages belonging to this installation.
+launcher_dir="${ARCHIVE_KEEPER_LAUNCHER_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+mkdir -p "$launcher_dir"
+ln -sfn "$PWD/.venv/bin/archive-keeper" "$launcher_dir/archive-keeper"
+
 printf '\nArchive Keeper %s installed.\n' "$installed_version"
-printf 'Activate with:\n  source %q/.venv/bin/activate\n' "$PWD"
-printf 'Verify with:\n  archive-keeper --version\n'
+printf 'Command installed at:\n  %s/archive-keeper\n' "$launcher_dir"
+if [[ ":$PATH:" != *":$launcher_dir:"* ]]; then
+    printf '\nAdd this directory to PATH once, then open a new terminal:\n'
+    printf '  export PATH=%q:$PATH\n' "$launcher_dir"
+fi
+printf '\nNo virtual-environment activation is required.\n'
+printf 'Verify from any directory with:\n  archive-keeper --version\n'
 printf 'Start Storage Galaxy with:\n  archive-keeper ui\n'
 printf 'Verify the bundled interface with:\n  archive-keeper ui --health-check\n'
 printf 'Start the visual reviewer with:\n  archive-keeper --prefer /mnt/MyCloud1 --prefer /mnt/MyCloud2 --prefer /mnt/MyCloud3 review\n'

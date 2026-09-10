@@ -109,6 +109,8 @@ path to a production-ready v2.
   combined archives and wheels.
 - [x] Add the stable `archive-keeper ui` launcher with bundled-binary discovery
   and an installation health check.
+- [x] Install a stable `~/.local/bin/archive-keeper` command that uses the
+  private virtual environment without requiring manual activation.
 - [x] Add CI checks for Go vet/tests, Python bridge tests, and the Go build.
 - [x] Add an explicit Go formatting check to CI.
 - [x] Add isolated PTY end-to-end tests for keyboard input, tmux detach/reattach,
@@ -140,8 +142,9 @@ path to a production-ready v2.
 - [ ] Review and merge the feature branch.
 - [x] Update version/changelog and prepare release notes.
 - [x] Configure CI to produce checksummed release-candidate artifacts.
-- [ ] Install the CI-built 2.0.0 release candidate on the target machine and
-  rerun health checks before merge, tag, and publication.
+- [ ] Install the final CI-built 2.0.0 release candidate on the target machine,
+  verify the global launcher without activation, and rerun health checks before
+  merge, tag, and publication.
 
 ## Intentional safety boundaries
 

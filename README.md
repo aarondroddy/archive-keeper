@@ -95,11 +95,12 @@ source .venv/bin/activate
 archive-keeper --help
 ```
 
-The installer creates an isolated Python virtual environment and installs the
-complete safety engine plus the bundled Storage Galaxy executable. Official
-combined release archives do not require Go on the user's machine. A raw
-development checkout can build the interface during installation when Go is
-available.
+The installer creates an isolated Python virtual environment and a stable
+`~/.local/bin/archive-keeper` launcher, so users do not activate the virtual
+environment manually. It installs the complete safety engine plus the bundled
+Storage Galaxy executable. Official combined release archives do not require
+Go on the user's machine. A raw development checkout can build the interface
+during installation when Go is available.
 
 Optional system helpers for richer previews:
 

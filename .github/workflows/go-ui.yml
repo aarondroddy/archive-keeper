@@ -70,6 +70,15 @@ jobs:
           /tmp/archive-keeper-install/bin/pip install --no-deps dist/*.whl
           /tmp/archive-keeper-install/bin/archive-keeper --version
           /tmp/archive-keeper-install/bin/archive-keeper ui --health-check
+      - name: Verify installer launcher without activation
+        run: |
+          mkdir -p /tmp/archive-keeper-unpack /tmp/archive-keeper-launchers
+          tar -xzf dist/archive-keeper-2.0.0-linux-amd64.tar.gz -C /tmp/archive-keeper-unpack
+          cd /tmp/archive-keeper-unpack/archive-keeper-2.0.0-linux-amd64
+          ARCHIVE_KEEPER_LAUNCHER_DIR=/tmp/archive-keeper-launchers ./install.sh
+          cd /tmp
+          /tmp/archive-keeper-launchers/archive-keeper --version
+          /tmp/archive-keeper-launchers/archive-keeper ui --health-check
       - name: Retain release-candidate artifacts
         uses: actions/upload-artifact@v4
         with:

@@ -33,7 +33,6 @@ sha256sum -c archive-keeper-2.0.0-linux-amd64.tar.gz.sha256
 tar -xzf archive-keeper-2.0.0-linux-amd64.tar.gz
 cd archive-keeper
 ./install.sh
-source .venv/bin/activate
 archive-keeper --version
 archive-keeper --help
 archive-keeper ui --health-check
@@ -42,9 +41,12 @@ archive-keeper ui
 
 The architecture suffix may differ on a non-amd64 system.
 
-The single installation contains the complete Python safety engine and the
-Storage Galaxy interface. `archive-keeper ui` locates the packaged interface;
-users do not compile or install a second program.
+The installer creates `~/.local/bin/archive-keeper`, which launches the
+installation's private virtual environment automatically. No activation is
+required. If `~/.local/bin` is not already in `PATH`, the installer prints the
+one-time command needed to add it. The single installation contains the
+complete Python safety engine and Storage Galaxy interface; users do not
+compile or install a second program.
 
 ## Build a combined package (maintainers)
 

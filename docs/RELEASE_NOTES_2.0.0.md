@@ -50,11 +50,13 @@ sha256sum -c archive-keeper-2.0.0-linux-amd64.tar.gz.sha256
 tar -xzf archive-keeper-2.0.0-linux-amd64.tar.gz
 cd archive-keeper-2.0.0-linux-amd64
 ./install.sh
-source .venv/bin/activate
 archive-keeper --version
 archive-keeper ui --health-check
 archive-keeper ui
 ```
+
+The installer creates `~/.local/bin/archive-keeper`; the command can be used
+from any directory without manually activating the private virtual environment.
 
 ## Deliberately deferred
 

@@ -22,6 +22,8 @@ _No changes yet._
 - Added combined platform packages and extensive Python, Go, PTY, tmux,
   reconnect, resize, simulated long-scan, large-report, mount-matrix, and
   target-machine validation.
+- Added a stable per-user launcher so `archive-keeper` uses its private virtual
+  environment from any directory without manual activation.
 - Persistent boot-time mounts and mergerfs pooling are deliberately deferred;
   Archive Keeper 2.0 manages storage roots separately and temporary mounts are
   the default.
