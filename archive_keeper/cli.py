@@ -4,10 +4,12 @@ import argparse
 import datetime as dt
 import json
 import os
+import platform
 import shutil
 import sqlite3
 import sys
 import secrets
+import tempfile
 from pathlib import Path
 
 from . import __version__
@@ -185,6 +187,10 @@ def build_parser():
         "--verify-timeout", type=float, default=300.0,
         help="Maximum seconds for each SHA-256 comparison (default: 300).",
     )
+    reconcile_parser.add_argument(
+        "--action-id", type=int,
+        help="Reconcile exactly one journal action id from this run.",
+    )
 
     retry_parser = sub.add_parser(
         "retry",
@@ -237,7 +243,68 @@ def build_parser():
     status = sub.add_parser("status", help="Show journaled runs.")
     status.add_argument("--run-id")
 
+    ui = sub.add_parser("ui", help="Open the bundled Storage Galaxy interface.")
+    ui.add_argument(
+        "--health-check", action="store_true", help=argparse.SUPPRESS,
+    )
+    ui.add_argument(
+        "--print-binary", action="store_true",
+        help="Print the resolved Storage Galaxy executable and exit.",
+    )
+
     return parser
+
+
+def bundled_ui_binary() -> Path:
+    override = os.environ.get("ARCHIVE_KEEPER_UI_BINARY")
+    if override:
+        candidates = [Path(override).expanduser()]
+    else:
+        candidates = [Path(__file__).resolve().parent / "bin" / "archive-keeper-ui"]
+        path_binary = shutil.which("archive-keeper-ui")
+        if path_binary:
+            candidates.append(Path(path_binary))
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        if os.access(candidate, os.X_OK):
+            return candidate
+
+        # Some wheel installers do not preserve executable mode bits. Materialize
+        # an owner-only executable copy rather than trying to modify site-packages.
+        cache_dir = Path("~/.cache/archive-keeper/bin").expanduser()
+        cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cache_path = cache_dir / f"archive-keeper-ui-{__version__}-{platform.machine()}"
+        with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as handle:
+            temporary = Path(handle.name)
+        try:
+            shutil.copyfile(candidate, temporary)
+            temporary.chmod(0o700)
+            os.replace(temporary, cache_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return cache_path
+
+    raise ArchiveKeeperError(
+        "Storage Galaxy is not bundled with this installation. Reinstall from "
+        "an official combined Archive Keeper package, or set "
+        "ARCHIVE_KEEPER_UI_BINARY to a trusted archive-keeper-ui executable."
+    )
+
+
+def launch_ui(args):
+    binary = bundled_ui_binary()
+    if args.print_binary:
+        print(binary)
+        return 0
+    command = [str(binary)]
+    if args.health_check:
+        command.append("--health-check")
+    environment = os.environ.copy()
+    environment.setdefault("ARCHIVE_KEEPER_PYTHON", sys.executable)
+    os.execve(str(binary), command, environment)
+    raise ArchiveKeeperError("Storage Galaxy exited before it could start")
 
 
 def configured(args):
@@ -893,6 +960,13 @@ def reconcile(args):
     applied = 0
     try:
         rows = list(journal.iter_actions(args.run_id, ("failed", "timeout")))
+        if getattr(args, "action_id", None) is not None:
+            if args.action_id <= 0:
+                raise ArchiveKeeperError("--action-id must be a positive integer")
+            rows = [
+                row for row in rows
+                if journal.action_id(args.run_id, normalize_path(row[2])) == args.action_id
+            ]
         if not rows:
             print(f"No failed/timeout actions found for run {args.run_id}")
             return 0
@@ -1020,6 +1094,8 @@ def main(argv=None):
             return retry(args)
         if args.command == "status":
             return status(args)
+        if args.command == "ui":
+            return launch_ui(args)
         if args.command == "review":
             from .rich_tui import run_rich_tui
             return run_rich_tui(args, configured)

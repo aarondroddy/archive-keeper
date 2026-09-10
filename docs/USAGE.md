@@ -41,7 +41,18 @@ archive-keeper quarantine --help
 archive-keeper restore --help
 archive-keeper reconcile --help
 archive-keeper retry --help
+archive-keeper ui --health-check
 ```
+
+Open the packaged Storage Galaxy interface with:
+
+```bash
+archive-keeper ui
+```
+
+This launches the UI shipped with the same installation; all quarantine,
+restore, retry, and reconciliation work continues to use the Python safety
+engine in that package.
 
 
 ## Restore collision verification

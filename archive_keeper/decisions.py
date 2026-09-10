@@ -68,6 +68,24 @@ class DecisionStore:
         )
         self.conn.commit()
 
+    def stage_all_nonkeepers(
+        self, group_id: int, paths: list[Path], keeper: Path
+    ) -> int:
+        """Atomically stage every member except the validated keeper."""
+        members = [normalize_path(path) for path in paths]
+        keeper = normalize_path(keeper)
+        if keeper not in members:
+            raise ValueError("keeper must be a member of the duplicate group")
+        nonkeepers = [path for path in members if path != keeper]
+        now = time.time()
+        with self.conn:
+            self.conn.execute("DELETE FROM file_decisions WHERE group_id=?", (group_id,))
+            self.conn.executemany(
+                "INSERT INTO file_decisions(group_id,path,action,updated_at) VALUES(?,?,?,?)",
+                [(group_id, str(path), "QUARANTINE", now) for path in nonkeepers],
+            )
+        return len(nonkeepers)
+
     def get_action(self, group_id: int, path: Path) -> str | None:
         row = self.conn.execute(
             "SELECT action FROM file_decisions WHERE group_id=? AND path=?",

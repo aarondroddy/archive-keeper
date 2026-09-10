@@ -15,12 +15,17 @@ Follow [INSTALL.md](INSTALL.md), activate the virtual environment, and confirm
 the installed release:
 
 ```bash
-source ~/archive-keeper/.venv/bin/activate
 archive-keeper --version
 archive-keeper --help
+archive-keeper ui --health-check
 ```
 
-The expected release output is `archive-keeper 1.6.8`.
+The expected release output is `archive-keeper 2.0.0`. The installer creates a
+launcher in `~/.local/bin`, so virtual-environment activation is not required.
+
+Start the guided Storage Galaxy interface with `archive-keeper ui`. It is part
+of the same installation as the command-line engine; no separate Go setup is
+required when using an official combined package.
 
 ## 2. Confirm the inputs
 
@@ -37,6 +42,24 @@ The default NAS roots are:
 /mnt/MyCloud2
 /mnt/MyCloud3
 ```
+
+### Mount Storage Assistant
+
+From Storage Setup, press `M` to connect a local disk, removable USB drive,
+CIFS/SMB share, or NFS export. Choose the storage type, edit each explained
+field, and press `A` to review the complete command. Nothing runs until the
+final Enter confirmation.
+
+Local and network mount locations must be beneath `/mnt`, `/media`, or
+`/run/media`. Removable devices use `udisksctl`, which chooses the normal
+desktop mount location. CIFS authentication must use either the `guest` option
+or an external `credentials=/absolute/path` file. The assistant rejects inline
+passwords and never saves authentication secrets.
+
+The UI attempts privileged commands without opening a password prompt. If sudo
+authorization is required, it stops and shows the equivalent command to run in
+a separate terminal. Return to Storage Setup and press `R` afterward. The
+assistant creates temporary mounts only and never edits `/etc/fstab`.
 
 Before any applied operation, verify that each configured root is a real mounted
 filesystem:

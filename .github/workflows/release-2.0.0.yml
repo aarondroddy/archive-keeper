@@ -1,0 +1,50 @@
+name: Publish Archive Keeper 2.0.0
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'aarondroddy/archive-keeper' &&
+      startsWith(github.event.head_commit.message, 'Release Archive Keeper 2.0.0 Storage Galaxy')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Verify release version
+        run: |
+          test "$(python -c 'from archive_keeper import __version__; print(__version__)')" = "2.0.0"
+          grep -q '^version = "2.0.0"$' pyproject.toml
+      - name: Build official artifacts
+        run: bash scripts/build-combined-package.sh
+      - name: Verify checksum and package installation
+        run: |
+          sha256sum -c dist/archive-keeper-2.0.0-linux-amd64.tar.gz.sha256
+          python -m venv /tmp/archive-keeper-release-check
+          /tmp/archive-keeper-release-check/bin/pip install --no-deps dist/archive_keeper-2.0.0-*.whl
+          /tmp/archive-keeper-release-check/bin/archive-keeper --version
+          /tmp/archive-keeper-release-check/bin/archive-keeper ui --health-check
+      - name: Create tag, GitHub release, and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v2.0.0 \
+            --target "$GITHUB_SHA" \
+            --title "Archive Keeper 2.0.0 — Storage Galaxy" \
+            --notes-file docs/RELEASE_NOTES_2.0.0.md \
+            dist/archive-keeper-2.0.0-linux-amd64.tar.gz \
+            dist/archive-keeper-2.0.0-linux-amd64.tar.gz.sha256 \
+            dist/archive_keeper-2.0.0-*.whl

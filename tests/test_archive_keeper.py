@@ -929,9 +929,9 @@ class ArchiveKeeperTests(unittest.TestCase):
             self.assertIn("Failed        : 1", result.stdout)
             self.assertIn("keeper size mismatch", result.stdout)
 
-    def test_version_is_1_6_8(self):
+    def test_version_is_2_0_0(self):
         from archive_keeper import __version__
-        self.assertEqual(__version__, "1.6.8")
+        self.assertEqual(__version__, "2.0.0")
 
     def test_cli_version_does_not_require_a_command(self):
         result = subprocess.run(
@@ -939,7 +939,35 @@ class ArchiveKeeperTests(unittest.TestCase):
             text=True, capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "archive-keeper 1.6.8")
+        self.assertEqual(result.stdout.strip(), "archive-keeper 2.0.0")
+
+    def test_ui_subcommand_launches_configured_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "archive-keeper-ui"
+            binary.write_text("#!/bin/sh\nprintf 'bundled UI ready\\n'\n")
+            binary.chmod(0o700)
+            env = os.environ.copy()
+            env["ARCHIVE_KEEPER_UI_BINARY"] = str(binary)
+            result = subprocess.run(
+                [sys.executable, "-m", "archive_keeper", "ui", "--health-check"],
+                env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "bundled UI ready")
+
+    def test_ui_subcommand_can_report_resolved_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "archive-keeper-ui"
+            binary.write_text("fixture")
+            binary.chmod(0o700)
+            env = os.environ.copy()
+            env["ARCHIVE_KEEPER_UI_BINARY"] = str(binary)
+            result = subprocess.run(
+                [sys.executable, "-m", "archive_keeper", "ui", "--print-binary"],
+                env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(binary))
 
 
     def test_sampled_sha256_match_detects_match_and_sample_mismatch(self):

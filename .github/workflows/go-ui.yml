@@ -1,0 +1,106 @@
+name: Go UI
+
+on:
+  pull_request:
+    paths:
+      - "cmd/archive-keeper-ui/**"
+      - "archive_keeper/ui_bridge.py"
+      - "archive_keeper/cli.py"
+      - "archive_keeper/bin/**"
+      - "tests/test_ui_bridge.py"
+      - "tests/test_archive_keeper.py"
+      - "tests/test_ui_pty.py"
+      - "go.mod"
+      - "go.sum"
+      - "pyproject.toml"
+      - "setup.py"
+      - "install.sh"
+      - "scripts/build-combined-package.sh"
+      - ".github/workflows/go-ui.yml"
+  push:
+    branches: ["feature/v2-storage-galaxy"]
+
+permissions:
+  contents: read
+
+jobs:
+  python-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Test Python engine and bridge
+        run: python -m unittest tests.test_archive_keeper tests.test_ui_bridge -v
+      - name: Validate target-check script syntax
+        run: bash -n scripts/v2-target-check.sh
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Resolve modules
+        run: go mod download
+      - name: Go formatting
+        run: |
+          unformatted="$(gofmt -l cmd/archive-keeper-ui)"
+          if [ -n "$unformatted" ]; then
+            printf 'The following Go files require gofmt:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Build Storage Galaxy
+        run: |
+          mkdir -p archive_keeper/bin
+          go build -trimpath -o archive_keeper/bin/archive-keeper-ui ./cmd/archive-keeper-ui
+          chmod 755 archive_keeper/bin/archive-keeper-ui
+      - name: Build checksummed combined release candidate
+        run: bash scripts/build-combined-package.sh
+      - name: Verify isolated combined installation
+        run: |
+          python -m venv /tmp/archive-keeper-install
+          /tmp/archive-keeper-install/bin/pip install --no-deps dist/*.whl
+          /tmp/archive-keeper-install/bin/archive-keeper --version
+          /tmp/archive-keeper-install/bin/archive-keeper ui --health-check
+      - name: Verify installer launcher without activation
+        run: |
+          mkdir -p /tmp/archive-keeper-unpack /tmp/archive-keeper-launchers
+          tar -xzf dist/archive-keeper-2.0.0-linux-amd64.tar.gz -C /tmp/archive-keeper-unpack
+          cd /tmp/archive-keeper-unpack/archive-keeper-2.0.0-linux-amd64
+          ARCHIVE_KEEPER_LAUNCHER_DIR=/tmp/archive-keeper-launchers ./install.sh
+          cd /tmp
+          /tmp/archive-keeper-launchers/archive-keeper --version
+          /tmp/archive-keeper-launchers/archive-keeper ui --health-check
+      - name: Retain release-candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-keeper-2.0.0-linux-amd64
+          path: |
+            dist/archive-keeper-2.0.0-linux-amd64.tar.gz
+            dist/archive-keeper-2.0.0-linux-amd64.tar.gz.sha256
+            dist/archive_keeper-2.0.0-*.whl
+          if-no-files-found: error
+
+  pty-reliability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Run isolated PTY reliability suite
+        run: python -m unittest tests.test_ui_pty -v
