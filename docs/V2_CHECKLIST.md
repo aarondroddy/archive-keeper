@@ -95,10 +95,13 @@ path to a production-ready v2.
 - [x] Add a beginner-friendly post-scan summary with duration, scanned roots,
   result counts, active/backup report paths, empty results, errors, and direct
   navigation to Duplicate Groups.
-- [ ] Add a guided Mount Storage wizard for local/removable disks, SMB/CIFS,
-  and NFS. Start with previewed temporary mounts; keep persistent boot-time
-  mount changes behind a separate explicit confirmation and never store sudo
-  or share passwords in the UI configuration.
+- [x] Add a guided temporary Mount Storage wizard for local/removable disks,
+  SMB/CIFS, and NFS with validation, exact command preview, noninteractive
+  authorization, and a safe copyable fallback. Never store sudo or share
+  passwords in UI configuration.
+- [ ] Add optional persistent boot-time mount configuration behind a separate
+  explicit confirmation and backup workflow; temporary mounts remain the
+  default.
 
 ### Packaging and reliability
 

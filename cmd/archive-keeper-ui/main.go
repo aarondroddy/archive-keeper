@@ -56,6 +56,33 @@ type mountCandidate struct {
 	Source     string
 }
 
+type mountKind int
+
+const (
+	mountLocal mountKind = iota
+	mountRemovable
+	mountCIFS
+	mountNFS
+)
+
+type mountPlan struct {
+	Kind       mountKind
+	Source     string
+	Target     string
+	Filesystem string
+	Options    string
+	Program    string
+	Args       []string
+	Display    string
+	Manual     string
+}
+
+type mountFinishedMsg struct {
+	plan   mountPlan
+	output string
+	err    error
+}
+
 type uiConfig struct {
 	Version         int      `json:"version"`
 	MountRoots      []string `json:"mount_roots"`
@@ -169,6 +196,22 @@ type model struct {
 	advancedCursor        int
 	advancedEditing       bool
 	advancedInput         string
+	mountWizard           bool
+	mountKind             mountKind
+	mountKindChosen       bool
+	mountCursor           int
+	mountEditing          bool
+	mountInput            string
+	mountSource           string
+	mountTarget           string
+	mountFilesystem       string
+	mountOptions          string
+	mountConfirm          bool
+	mountRunning          bool
+	mountCommand          string
+	mountManual           string
+	mountOutput           string
+	mountErr              error
 	confirmScan           bool
 	scanRunning           bool
 	scanStartedAt         time.Time
@@ -553,6 +596,216 @@ func discoverMountCandidates() ([]mountCandidate, error) {
 		return nil, err
 	}
 	return parseMountCandidates(string(data)), nil
+}
+
+func mountKindName(kind mountKind) string {
+	return []string{"Local disk", "Removable drive", "CIFS / SMB share", "NFS share"}[kind]
+}
+
+func shellQuote(value string) string {
+	if value != "" && regexp.MustCompile(`^[A-Za-z0-9_./,:=+-]+$`).MatchString(value) {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func safeMountTarget(value string) (string, error) {
+	value = filepath.Clean(strings.TrimSpace(value))
+	if !filepath.IsAbs(value) {
+		return "", fmt.Errorf("mount location must be an absolute path")
+	}
+	allowed := false
+	for _, base := range []string{"/mnt", "/media", "/run/media"} {
+		rel, err := filepath.Rel(base, value)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			allowed = true
+		}
+	}
+	if !allowed {
+		return "", fmt.Errorf("mount location must be inside /mnt, /media, or /run/media")
+	}
+	return value, nil
+}
+
+func validateMountOptions(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9_./,:=+-]+$`).MatchString(value) {
+		return "", fmt.Errorf("options contain unsupported characters")
+	}
+	lower := strings.ToLower(value)
+	if strings.Contains(lower, "password=") || strings.Contains(lower, "passwd=") || strings.Contains(lower, "pass=") {
+		return "", fmt.Errorf("passwords are never accepted here; use credentials=/absolute/file")
+	}
+	for _, option := range strings.Split(value, ",") {
+		if strings.HasPrefix(strings.ToLower(option), "credentials=") {
+			path := strings.TrimPrefix(option, "credentials=")
+			if !filepath.IsAbs(path) {
+				return "", fmt.Errorf("credentials file path must be absolute")
+			}
+		}
+	}
+	return value, nil
+}
+
+func buildMountPlan(kind mountKind, source, target, filesystem, options string) (mountPlan, error) {
+	source = strings.TrimSpace(source)
+	if source == "" || strings.ContainsAny(source, "\r\n\x00") {
+		return mountPlan{}, fmt.Errorf("enter a valid storage source")
+	}
+	plan := mountPlan{Kind: kind, Source: source}
+	if kind == mountRemovable {
+		if !strings.HasPrefix(source, "/dev/") || filepath.Clean(source) != source {
+			return mountPlan{}, fmt.Errorf("removable source must look like /dev/sdb1")
+		}
+		plan.Program = "udisksctl"
+		plan.Args = []string{"mount", "-b", source}
+		plan.Display = "udisksctl " + strings.Join([]string{"mount", "-b", shellQuote(source)}, " ")
+		plan.Manual = plan.Display
+		return plan, nil
+	}
+	cleanTarget, err := safeMountTarget(target)
+	if err != nil {
+		return mountPlan{}, err
+	}
+	plan.Target = cleanTarget
+	options, err = validateMountOptions(options)
+	if err != nil {
+		return mountPlan{}, err
+	}
+	plan.Options = options
+	filesystem = strings.TrimSpace(filesystem)
+	switch kind {
+	case mountLocal:
+		if !strings.HasPrefix(source, "/dev/") || filepath.Clean(source) != source {
+			return mountPlan{}, fmt.Errorf("local source must look like /dev/sdb1")
+		}
+		if filesystem == "" {
+			filesystem = "auto"
+		}
+	case mountCIFS:
+		if !strings.HasPrefix(source, "//") || len(strings.Split(strings.TrimPrefix(source, "//"), "/")) < 2 {
+			return mountPlan{}, fmt.Errorf("CIFS source must look like //server/share")
+		}
+		lowerOptions := strings.ToLower(options)
+		if !strings.Contains(lowerOptions, "credentials=") && !strings.Contains(","+lowerOptions+",", ",guest,") {
+			return mountPlan{}, fmt.Errorf("CIFS requires credentials=/absolute/file or the guest option")
+		}
+		filesystem = "cifs"
+	case mountNFS:
+		if !regexp.MustCompile(`^[A-Za-z0-9_.-]+:/[^\r\n\x00]*$`).MatchString(source) || strings.HasPrefix(source, "-") {
+			return mountPlan{}, fmt.Errorf("NFS source must look like server:/export")
+		}
+		filesystem = "nfs"
+	default:
+		return mountPlan{}, fmt.Errorf("unknown storage type")
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9_.+-]+$`).MatchString(filesystem) {
+		return mountPlan{}, fmt.Errorf("filesystem name contains unsupported characters")
+	}
+	plan.Filesystem = filesystem
+	plan.Program = "sudo"
+	plan.Args = []string{"-n", "mount", "-t", filesystem}
+	if options != "" {
+		plan.Args = append(plan.Args, "-o", options)
+	}
+	plan.Args = append(plan.Args, "--", source, cleanTarget)
+	mountWords := []string{"sudo", "mount", "-t", shellQuote(filesystem)}
+	if options != "" {
+		mountWords = append(mountWords, "-o", shellQuote(options))
+	}
+	mountWords = append(mountWords, "--", shellQuote(source), shellQuote(cleanTarget))
+	plan.Manual = "sudo mkdir -p -- " + shellQuote(cleanTarget) + " && " + strings.Join(mountWords, " ")
+	plan.Display = strings.ReplaceAll(plan.Manual, "sudo ", "sudo -n ")
+	return plan, nil
+}
+
+func executeMountPlan(plan mountPlan) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		if plan.Kind != mountRemovable {
+			mkdir := exec.CommandContext(ctx, "sudo", "-n", "mkdir", "-p", "--", plan.Target)
+			if output, err := mkdir.CombinedOutput(); err != nil {
+				return mountFinishedMsg{plan: plan, output: string(output), err: fmt.Errorf("authorization needed; run the shown command in a terminal: %w", err)}
+			}
+		}
+		command := exec.CommandContext(ctx, plan.Program, plan.Args...)
+		output, err := command.CombinedOutput()
+		if ctx.Err() == context.DeadlineExceeded {
+			err = fmt.Errorf("mount attempt timed out after 45 seconds")
+		}
+		return mountFinishedMsg{plan: plan, output: strings.TrimSpace(string(output)), err: err}
+	}
+}
+
+func (m *model) resetMountWizard() {
+	m.mountWizard = true
+	m.mountKind = mountLocal
+	m.mountKindChosen = false
+	m.mountCursor = 0
+	m.mountEditing = false
+	m.mountInput = ""
+	m.mountSource = ""
+	m.mountTarget = ""
+	m.mountFilesystem = ""
+	m.mountOptions = ""
+	m.mountConfirm = false
+	m.mountRunning = false
+	m.mountCommand = ""
+	m.mountManual = ""
+	m.mountOutput = ""
+	m.mountErr = nil
+}
+
+func (m *model) chooseMountKind() {
+	m.mountKindChosen = true
+	m.mountCursor = 0
+	switch m.mountKind {
+	case mountLocal:
+		m.mountSource, m.mountTarget, m.mountFilesystem, m.mountOptions = "", "/mnt/archive-disk", "auto", "rw,nosuid,nodev"
+	case mountRemovable:
+		m.mountSource = ""
+	case mountCIFS:
+		m.mountSource, m.mountTarget, m.mountOptions = "", "/mnt/archive-share", "rw,nosuid,nodev"
+	case mountNFS:
+		m.mountSource, m.mountTarget, m.mountOptions = "", "/mnt/archive-nfs", "rw,nosuid,nodev"
+	}
+}
+
+func (m model) mountFields() []advancedSetting {
+	fields := []advancedSetting{{"Source", "Device or network share to mount.", m.mountSource}}
+	if m.mountKind != mountRemovable {
+		fields = append(fields, advancedSetting{"Mount location", "New directory inside /mnt, /media, or /run/media.", m.mountTarget})
+	}
+	if m.mountKind == mountLocal {
+		fields = append(fields, advancedSetting{"Filesystem", "Use auto unless you know the filesystem, such as ext4 or exfat.", m.mountFilesystem})
+	}
+	if m.mountKind != mountRemovable {
+		fields = append(fields, advancedSetting{"Options", "Comma-separated mount options. Passwords are refused; CIFS should use credentials=/absolute/file.", m.mountOptions})
+	}
+	return fields
+}
+
+func (m *model) setMountField(index int, value string) {
+	if index == 0 {
+		m.mountSource = strings.TrimSpace(value)
+		return
+	}
+	if m.mountKind == mountRemovable {
+		return
+	}
+	if index == 1 {
+		m.mountTarget = strings.TrimSpace(value)
+		return
+	}
+	if m.mountKind == mountLocal && index == 2 {
+		m.mountFilesystem = strings.TrimSpace(value)
+		return
+	}
+	m.mountOptions = strings.TrimSpace(value)
 }
 
 func uiConfigPath() (string, error) {
@@ -1807,11 +2060,56 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recordFailure("python_bridge", "restore_apply", msg.err, nil)
 		m.restorePlanLoading = true
 		return m, loadRestorePlan(m.restorePlan.RunID)
+	case mountFinishedMsg:
+		m.mountRunning = false
+		m.mountConfirm = false
+		m.mountOutput = msg.output
+		m.mountErr = msg.err
+		if msg.err != nil {
+			m.recordFailure("storage_setup", "mount", msg.err, map[string]any{
+				"kind": mountKindName(msg.plan.Kind), "source": msg.plan.Source, "target": msg.plan.Target,
+			})
+			return m, nil
+		}
+		m.setupMessage = "STORAGE MOUNTED · rescanning detected drives"
+		m.mountWizard = false
+		m.rescanSetupCandidates()
+		if msg.plan.Target != "" {
+			m.setupSelected[msg.plan.Target] = true
+		}
+		m.loading = true
+		m.loadErr = nil
+		return m, loadDashboard
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.compact = msg.Width < 96
 	case tea.KeyPressMsg:
 		shortcut := strings.ToLower(msg.String())
+		if m.mountEditing {
+			key := msg.String()
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				m.setMountField(m.mountCursor, m.mountInput)
+				m.mountEditing = false
+				m.mountErr = nil
+			case "esc", "ctrl+g":
+				m.mountEditing = false
+			case "backspace", "ctrl+h":
+				runes := []rune(m.mountInput)
+				if len(runes) > 0 {
+					m.mountInput = string(runes[:len(runes)-1])
+				}
+			default:
+				if key == "space" {
+					m.mountInput += " "
+				} else if runes := []rune(key); len(runes) == 1 {
+					m.mountInput += key
+				}
+			}
+			return m, nil
+		}
 		if m.groupSearch {
 			key := msg.String()
 			switch key {
@@ -2006,6 +2304,80 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.page == settings && m.contentFocus {
+			if m.mountWizard {
+				if m.mountRunning {
+					return m, nil
+				}
+				if m.mountConfirm {
+					switch shortcut {
+					case "enter":
+						plan, err := buildMountPlan(m.mountKind, m.mountSource, m.mountTarget, m.mountFilesystem, m.mountOptions)
+						if err != nil {
+							m.mountErr = err
+							m.mountConfirm = false
+							return m, nil
+						}
+						m.mountRunning = true
+						m.mountErr = nil
+						return m, executeMountPlan(plan)
+					case "esc", "left", "h":
+						m.mountConfirm = false
+					}
+					return m, nil
+				}
+				if !m.mountKindChosen {
+					switch shortcut {
+					case "up", "k":
+						if m.mountKind > mountLocal {
+							m.mountKind--
+						}
+					case "down", "j":
+						if m.mountKind < mountNFS {
+							m.mountKind++
+						}
+					case "enter", "right", "l":
+						m.chooseMountKind()
+					case "esc", "left", "h", "m":
+						m.mountWizard = false
+						m.setupMessage = "Mount Assistant closed · no system changes made"
+					}
+					return m, nil
+				}
+				fields := m.mountFields()
+				switch shortcut {
+				case "up", "k":
+					if m.mountCursor > 0 {
+						m.mountCursor--
+					}
+				case "down", "j":
+					if m.mountCursor < len(fields)-1 {
+						m.mountCursor++
+					}
+				case "enter", "right", "l":
+					if m.mountCursor >= 0 && m.mountCursor < len(fields) {
+						m.mountInput = fields[m.mountCursor].value
+						m.mountEditing = true
+					}
+				case "a":
+					plan, err := buildMountPlan(m.mountKind, m.mountSource, m.mountTarget, m.mountFilesystem, m.mountOptions)
+					if err != nil {
+						m.mountErr = err
+						return m, nil
+					}
+					m.mountCommand = plan.Display
+					m.mountManual = plan.Manual
+					m.mountErr = nil
+					m.mountConfirm = true
+				case "b":
+					m.mountKindChosen = false
+					m.mountCursor = 0
+					m.mountErr = nil
+				case "esc", "left", "h", "m":
+					m.mountWizard = false
+					m.setupMessage = "Mount Assistant closed · no system changes made"
+				}
+				return m, nil
+			}
 			if m.scanRunning {
 				switch shortcut {
 				case "x", "esc", "left", "h":
@@ -2161,6 +2533,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.advancedMode = true
 				m.advancedCursor = 0
 				m.setupMessage = "Advanced settings · Enter edits the selected value"
+			case "m":
+				m.resetMountWizard()
+				m.setupMessage = "Mount Assistant · choose the kind of storage to connect"
 			case "esc", "left", "h":
 				if !m.setupFirstRun {
 					m.contentFocus = false
@@ -2753,6 +3128,9 @@ func (m model) storageSetupView(width int) string {
 	if m.scanSummaryVisible {
 		return m.scanSummaryView(width)
 	}
+	if m.mountWizard {
+		return m.mountWizardView(width)
+	}
 	if m.advancedMode {
 		lines := []string{
 			lipgloss.NewStyle().Bold(true).Foreground(pink).Render("ADVANCED CONFIGURATION"),
@@ -2797,14 +3175,14 @@ func (m model) storageSetupView(width int) string {
 		lines = append(lines,
 			lipgloss.NewStyle().Bold(true).Foreground(pink).Render("WELCOME ABOARD"),
 			"Choose the mounted storage roots Archive Keeper may manage.",
-			"Setup records configuration only; it never mounts drives or moves files.",
+			"Select an existing mount, or press M for guided mounting.",
 			"",
 		)
 	}
 	if len(m.setupCandidates) == 0 {
 		lines = append(lines,
 			lipgloss.NewStyle().Bold(true).Foreground(gold).Render("NO STORAGE MOUNTS DETECTED"),
-			"Mount a drive under /mnt, /media, or /run/media, then press R to rescan.",
+			"Press M for guided mounting, or mount storage elsewhere and press R to rescan.",
 		)
 	} else {
 		for i, candidate := range m.setupCandidates {
@@ -2868,11 +3246,76 @@ func (m model) storageSetupView(width int) string {
 		lines = append(lines, "", mutedText.Render("Configuration source: "+m.configSource))
 	}
 	if !m.scanRunning && !m.confirmScan {
-		lines = append(lines, "", "↑↓ choose · Space/Enter toggle · A all · N none · R rescan · S save · F scan · E advanced")
+		lines = append(lines, "", "↑↓ choose · Space/Enter toggle · A all · N none · R rescan · S save · F scan · M mount · E advanced")
 	}
 	if !m.setupFirstRun && !m.scanRunning {
 		lines = append(lines, "H/← return home")
 	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) mountWizardView(width int) string {
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(pink).Render("MOUNT STORAGE ASSISTANT"),
+		"Connect storage first; selecting it for Archive Keeper happens after a successful mount.",
+		"This assistant never stores passwords and never edits /etc/fstab.",
+		"",
+	}
+	if !m.mountKindChosen {
+		lines = append(lines, "What kind of storage are you connecting?", "")
+		kinds := []string{"Local disk — internal or permanently attached device", "Removable drive — USB disk through udisksctl", "CIFS / SMB — Windows, Samba, or WD network share", "NFS — Unix/Linux network export"}
+		for i, label := range kinds {
+			prefix := "  "
+			style := lipgloss.NewStyle().Foreground(cyan)
+			if mountKind(i) == m.mountKind {
+				prefix = "▶ "
+				style = style.Bold(true).Foreground(void).Background(purple)
+			}
+			lines = append(lines, style.Render(prefix+label))
+		}
+		lines = append(lines, "", "↑↓ choose · Enter continue · M/H/← cancel")
+		return strings.Join(lines, "\n")
+	}
+	lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(cyan).Render(mountKindName(m.mountKind)), "")
+	fields := m.mountFields()
+	for i, field := range fields {
+		prefix := "  "
+		style := lipgloss.NewStyle().Foreground(cyan)
+		if i == m.mountCursor {
+			prefix = "▶ "
+			style = style.Bold(true).Foreground(void).Background(purple)
+		}
+		value := field.value
+		if value == "" {
+			value = "(required)"
+		}
+		lines = append(lines, style.Render(fmt.Sprintf("%s%-17s %s", prefix, field.label, compactPath(value, max(22, width-24)))))
+		if i == m.mountCursor {
+			lines = append(lines, "    "+mutedText.Render(field.help))
+		}
+	}
+	if m.mountEditing {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("EDIT VALUE"),
+			m.mountInput+"█", "Enter accepts · Ctrl-G cancels")
+	} else if m.mountRunning {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("MOUNTING STORAGE…"), "Please wait; the attempt times out safely after 45 seconds.")
+	} else if m.mountConfirm {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(danger).Render("FINAL MOUNT CONFIRMATION"),
+			"The following system command will run:", m.mountCommand,
+			"", "Enter runs it · H/← cancels")
+	} else {
+		lines = append(lines, "", "↑↓ choose field · Enter edit · A review mount command · B storage type · M/H/← cancel")
+	}
+	if m.mountErr != nil {
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(danger).Render("MOUNT NOT COMPLETED"), m.mountErr.Error())
+		if m.mountManual != "" {
+			lines = append(lines, "Run this in a separate terminal if authorization is required:", m.mountManual)
+		}
+	}
+	if m.mountOutput != "" {
+		lines = append(lines, "", mutedText.Render("System response: "+compactPath(m.mountOutput, max(24, width-18))))
+	}
+	lines = append(lines, "", mutedText.Render("CIFS tip: put credentials in a chmod 600 file and use credentials=/absolute/path. Never type a password into this UI."))
 	return strings.Join(lines, "\n")
 }
 
@@ -3234,7 +3677,7 @@ func basicInstructions(page screen) string {
 		quarantine: "First press D for the safe dry pilot. If every check passes, press A and type the exact phrase shown.\nOnly the final confirmed A step can move staged files into quarantine; nothing is deleted.",
 		restore:    "Choose a quarantine run, press Enter to preview it, then A to open the exact-phrase restore gate.\nRestore never overwrites an existing file; collisions are blocked.",
 		history:    "Choose a run and press Enter to inspect its actions. T previews retry; C previews reconcile; A applies that clean preview.\nBrowsing is read-only. Recovery changes require their own exact confirmation phrase.",
-		settings:   "Use ↑↓ and Space/Enter to choose mounted roots, then S to save. Press E for explained advanced paths and safety rules. Press F only when you want an rmlint scan.\nA scan reads filenames/content to find duplicates but never runs rmlint's cleanup script or moves files.",
+		settings:   "Press M to mount local, removable, CIFS, or NFS storage with a guided preview. Then use ↑↓ and Space/Enter to choose managed roots and S to save. Press E for advanced safety rules.\nMounting changes system storage state; scanning reads files but never runs rmlint's cleanup script or moves files.",
 	}
 	if guide := guides[page]; guide != "" {
 		return header + "\n" + guide
@@ -3250,7 +3693,7 @@ func (m model) pageView(page screen, width int) string {
 		restore:    {"RESTORE BEACON", "Bring a quarantined file home without overwriting data", "Select a run from history, preview destinations, inspect collisions, then confirm restoration.\n\nDifferent-content collisions fail closed."},
 		history:    {"FLIGHT RECORDER", "Journaled actions, outcomes, retries, and recovery", "Runs will appear here with moved, reconciled, stale, timeout, failed, and restored counts.\n\nOperational source: journal.sqlite3"},
 		settings:   {"STORAGE ARRAY SETUP", "Choose drives, configure safety rules, and run a safe duplicate scan", ""},
-		help:       {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\n/           search duplicate paths\nF           filter groups by storage root\nS           change group sort order\n[ and ]     previous / next group page\nX           stage one copy for quarantine\nB           review/stage every nonkeeper\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\n8           storage setup / rmlint scan\nE           advanced setup fields\n1–8         jump to screen\nShift+/ (?) open this guide\nq           quit\n\nBulk staging requires a saved keeper and never stages it. Protected and excluded roots are hard safety rules. A clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
+		help:       {"GALACTIC FIELD GUIDE", "Navigation and non-negotiable safety rules", "↑↓ or j/k  navigate\nEnter       open / choose keeper\n/           search duplicate paths\nF           filter groups by storage root\nS           change group sort order\n[ and ]     previous / next group page\nX           stage one copy for quarantine\nB           review/stage every nonkeeper\nU           mark undecided\nC           clear staged choice\nD           run bounded dry pilot\nA           open controlled apply gate\nH or ←      back / cancel gate\nG           galaxy / list view\n6           history / run drill-down\n8           storage setup / rmlint scan\nM           guided Mount Storage assistant\nE           advanced setup fields\n1–8         jump to screen\nShift+/ (?) open this guide\nq           quit\n\nMount Assistant previews the exact system command, never stores passwords, and never edits /etc/fstab. Bulk staging requires a saved keeper and never stages it. Protected and excluded roots are hard safety rules. A clean dry pilot unlocks apply. Apply moves at most 10 explicitly staged files and requires the exact confirmation phrase. Choices and every move are journaled for recovery."},
 	}
 	v := spec[page]
 	if page == settings {

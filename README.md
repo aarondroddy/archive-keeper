@@ -317,6 +317,22 @@ On first launch, Storage Setup detects mounted drives beneath `/mnt`,
 `/media`, and `/run/media`. Select the roots Archive Keeper may manage,
 then press `S` to save. Press `8` to reopen setup later.
 
+Press `M` in Storage Setup to open the guided Mount Storage Assistant. It
+supports local block devices, removable drives through `udisksctl`, CIFS/SMB
+shares, and NFS exports. The assistant explains every field, validates device
+and network-source syntax, restricts explicit mount locations to `/mnt`,
+`/media`, or `/run/media`, and previews the exact command before it runs.
+
+Archive Keeper never accepts or stores a sudo or share password. CIFS mounts
+must use either `guest` or `credentials=/absolute/path`; protect that external
+credentials file with mode `0600`. The UI first attempts local/CIFS/NFS mounts
+with `sudo -n`, so cached or passwordless authorization works without placing
+a password prompt inside the terminal interface. When authorization is needed,
+the assistant stops safely and displays a copyable `sudo` command to run in a
+separate terminal. It does not edit `/etc/fstab`, and persistent boot-time
+mount configuration remains a separate administrative task. A successful
+mount is rescanned and selected automatically when it has an explicit target.
+
 Press `E` in Storage Setup for Advanced Configuration. Each field includes a
 plain-language explanation and validates before it is accepted. You can set
 the rmlint report, journal database, decisions database, quarantine folder

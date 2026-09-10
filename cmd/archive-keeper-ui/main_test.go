@@ -213,6 +213,79 @@ func TestParseMountCandidatesCoversSupportedStorageKinds(t *testing.T) {
 	}
 }
 
+func TestMountAssistantBuildsSafePlansForEveryStorageKind(t *testing.T) {
+	tests := []struct {
+		kind       mountKind
+		source     string
+		target     string
+		filesystem string
+		options    string
+		program    string
+		contains   string
+	}{
+		{mountLocal, "/dev/sdb1", "/mnt/Archive Disk", "ext4", "rw,nosuid,nodev", "sudo", "mount -t ext4"},
+		{mountRemovable, "/dev/sdc1", "", "", "", "udisksctl", "udisksctl mount -b /dev/sdc1"},
+		{mountCIFS, "//nas/Archive", "/mnt/NAS", "", "rw,credentials=/home/user/.nas", "sudo", "mount -t cifs"},
+		{mountNFS, "nas:/exports/archive", "/mnt/NFS", "", "rw,nosuid,nodev", "sudo", "mount -t nfs"},
+	}
+	for _, test := range tests {
+		plan, err := buildMountPlan(test.kind, test.source, test.target, test.filesystem, test.options)
+		if err != nil {
+			t.Fatalf("%s plan rejected: %v", mountKindName(test.kind), err)
+		}
+		if plan.Program != test.program || !strings.Contains(plan.Manual, test.contains) {
+			t.Fatalf("unexpected %s plan: %#v", mountKindName(test.kind), plan)
+		}
+		if strings.Contains(plan.Display, "password=") || strings.Contains(plan.Manual, "password=") {
+			t.Fatalf("mount plan exposed a password: %#v", plan)
+		}
+	}
+}
+
+func TestMountAssistantRejectsUnsafeInputs(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       mountKind
+		source     string
+		target     string
+		filesystem string
+		options    string
+	}{
+		{"local non-device", mountLocal, "/tmp/disk.img", "/mnt/disk", "auto", "rw"},
+		{"broad target", mountLocal, "/dev/sdb1", "/mnt", "auto", "rw"},
+		{"outside target", mountNFS, "nas:/archive", "/tmp/archive", "", "rw"},
+		{"bad CIFS source", mountCIFS, "nas/share", "/mnt/nas", "", "guest"},
+		{"CIFS without credentials", mountCIFS, "//nas/share", "/mnt/nas", "", "rw"},
+		{"inline password", mountCIFS, "//nas/share", "/mnt/nas", "", "rw,password=secret"},
+		{"relative credentials", mountCIFS, "//nas/share", "/mnt/nas", "", "rw,credentials=secret.txt"},
+		{"NFS option-shaped host", mountNFS, "-o:/archive", "/mnt/nfs", "", "rw"},
+	}
+	for _, test := range tests {
+		if _, err := buildMountPlan(test.kind, test.source, test.target, test.filesystem, test.options); err == nil {
+			t.Fatalf("%s was accepted", test.name)
+		}
+	}
+}
+
+func TestMountWizardViewExplainsSafetyAndAuthorization(t *testing.T) {
+	var m model
+	m.mountWizard = true
+	if got := m.mountWizardView(100); !strings.Contains(got, "never stores passwords") || !strings.Contains(got, "CIFS / SMB") {
+		t.Fatalf("mount kind guide is incomplete: %q", got)
+	}
+	m.chooseMountKind()
+	m.mountSource = "/dev/sdb1"
+	m.mountCommand = "sudo -n mount -- /dev/sdb1 /mnt/archive-disk"
+	m.mountManual = "sudo mount -- /dev/sdb1 /mnt/archive-disk"
+	m.mountErr = fmt.Errorf("authorization needed")
+	got := m.mountWizardView(100)
+	for _, want := range []string{"Local disk", "MOUNT NOT COMPLETED", "separate terminal", "sudo mount"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("mount form missing %q: %q", want, got)
+		}
+	}
+}
+
 func TestThemeColorSupportsLowAndNoColorModes(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	if _, ok := themeColor("#FFFFFF", 15).(lipgloss.NoColor); !ok {
