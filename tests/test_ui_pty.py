@@ -274,11 +274,11 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.wait_for("MISSION CONTROL")
             start = len(terminal.output)
             terminal.resize(86, 28)
-            rendered = terminal.wait_for("FILES UNTOUCHED", start=start)
+            rendered = terminal.wait_for("MOUNT ARRAY", start=start)
             self.assertIn("MOUNT ARRAY", rendered)
             start = len(terminal.output)
             terminal.resize(168, 52)
-            rendered = terminal.wait_for("FILES UNTOUCHED", start=start)
+            rendered = terminal.wait_for("BASIC GUIDE", start=start)
             self.assertIn("BASIC GUIDE", rendered)
         finally:
             terminal.close()
@@ -300,7 +300,9 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.wait_for("START RMLINT DUPLICATE SCAN?")
             terminal.send(b"\r")
             terminal.wait_for("RMLINT SCAN RUNNING")
-            rendered = terminal.wait_for("Elapsed 1s", timeout=5)
+            # Bubble Tea may optimize the redraw to only the changed suffix
+            # ("1s") rather than repainting the unchanged "Elapsed" label.
+            rendered = terminal.wait_for("1s", timeout=5)
             self.assertIn("X/H/← cancel", rendered)
             start = len(terminal.output)
             terminal.send(b"x")
