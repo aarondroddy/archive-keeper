@@ -32,7 +32,7 @@ jobs:
         run: bash scripts/build-combined-package.sh
       - name: Verify checksum and package installation
         run: |
-          sha256sum -c dist/archive-keeper-2.0.0-linux-amd64.tar.gz.sha256
+          (cd dist && sha256sum -c archive-keeper-2.0.0-linux-amd64.tar.gz.sha256)
           python -m venv /tmp/archive-keeper-release-check
           /tmp/archive-keeper-release-check/bin/pip install --no-deps dist/archive_keeper-2.0.0-*.whl
           /tmp/archive-keeper-release-check/bin/archive-keeper --version
