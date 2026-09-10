@@ -1,11 +1,25 @@
-# Archive Keeper 1.6.8
+# Archive Keeper 2.0.0
 
 Archive Keeper turns an existing `rmlint.json` scan into a safe, reviewable,
 resumable deduplication workflow. It never runs `rmlint.sh` and never deletes
 files directly: duplicates are moved into a per-NAS quarantine tree and every
 action is journaled for restoration.
 
-## 1.6.8 highlights
+## 2.0.0 highlights
+
+- Adds Storage Galaxy, a responsive guided terminal interface bundled with the
+  Python safety engine and launched with `archive-keeper ui`.
+- Adds portable Storage Setup, safe duplicate-only rmlint scanning, post-scan
+  summaries, duplicate visualization, keeper decisions, controlled quarantine,
+  restore, retry/reconcile, and journal History drill-down.
+- Adds a temporary Mount Storage Assistant for local disks, removable media,
+  CIFS/SMB, and NFS. It previews every command, never stores passwords, and
+  never edits `/etc/fstab`.
+- Adds plain-language guides, low-color support, structured error logs, and PTY
+  reliability coverage for keyboard input, resizing, reconnects, tmux, long
+  fake scans, and very large synthetic reports.
+
+The proven 1.6.8 safety-engine improvements remain included:
 
 - New quarantine runs use a visible `ArchiveKeeper Quarantine` directory on each NAS root so quarantined files can be browsed in NAS/mobile file apps that hide dot-directories.
 - Existing runs automatically reuse their journaled quarantine directory (including legacy `.ArchiveKeeper`) when resumed; nothing is renamed or migrated.

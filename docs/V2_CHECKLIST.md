@@ -74,7 +74,7 @@ path to a production-ready v2.
 - [x] Return to an empty Restore catalog after restoration.
 - [x] Add an isolated recovery fixture for retry and reconciliation without a NAS scan.
 
-## Still to do
+## Feature completion
 
 ### Workflow depth
 
@@ -99,9 +99,9 @@ path to a production-ready v2.
   SMB/CIFS, and NFS with validation, exact command preview, noninteractive
   authorization, and a safe copyable fallback. Never store sudo or share
   passwords in UI configuration.
-- [ ] Add optional persistent boot-time mount configuration behind a separate
-  explicit confirmation and backup workflow; temporary mounts remain the
-  default.
+- [ ] **Deferred until after 2.0:** optional persistent boot-time mount
+  configuration and mergerfs pooling. Temporary, separately managed mounts
+  remain the deliberate 2.0 default.
 
 ### Packaging and reliability
 
@@ -133,16 +133,21 @@ path to a production-ready v2.
 
 ### Release work
 
-- [ ] Run all Python and Go tests on the target machine.
-- [ ] Perform a fresh-install test without environment variables or old config.
-- [ ] Perform a controlled real-data pilot on one tiny group.
+- [x] Run all Python and Go tests on the target machine.
+- [x] Perform a fresh-install test without environment variables or old config.
+- [x] Perform a controlled real-data pilot on one tiny group, including
+  quarantine and restore verification.
 - [ ] Review and merge the feature branch.
-- [ ] Update version/changelog and publish release notes.
-- [ ] Produce checksummed release artifacts.
+- [x] Update version/changelog and prepare release notes.
+- [x] Configure CI to produce checksummed release-candidate artifacts.
+- [ ] Install the CI-built 2.0.0 release candidate on the target machine and
+  rerun health checks before merge, tag, and publication.
 
 ## Intentional safety boundaries
 
-- [x] Setup does not mount or unmount drives.
+- [x] Storage Setup itself does not mount or unmount drives; the separate Mount
+  Storage Assistant performs only an explicitly previewed and confirmed
+  temporary mount action.
 - [x] Scanning does not move, quarantine, restore, or delete archive files.
 - [x] A failed/cancelled scan cannot replace the active report.
 - [x] Decisions alone do not move files.

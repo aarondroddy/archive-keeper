@@ -4,6 +4,28 @@
 
 _No changes yet._
 
+## 2.0.0 — 2026-09-10
+
+- Added Storage Galaxy, a responsive guided terminal UI bundled with the
+  Python safety engine and available through `archive-keeper ui`.
+- Added portable storage discovery and configuration, temporary guided mounts
+  for local/removable disks, CIFS/SMB, and NFS, plus safe duplicate-only rmlint
+  scans with progress, cancellation, report backup, and post-scan summaries.
+- Added galaxy/list duplicate browsing, search, filtering, sorting, pagination,
+  keeper selection, atomic bulk staging, protected/excluded roots, and preferred
+  root guidance.
+- Added bounded preview-first quarantine, restore, retry, and reconcile flows
+  with exact confirmation gates and journal-backed History drill-down.
+- Added beginner guidance on every workflow screen, keyboard alternatives,
+  16-color and `NO_COLOR` accessibility modes, and owner-only structured error
+  logging.
+- Added combined platform packages and extensive Python, Go, PTY, tmux,
+  reconnect, resize, simulated long-scan, large-report, mount-matrix, and
+  target-machine validation.
+- Persistent boot-time mounts and mergerfs pooling are deliberately deferred;
+  Archive Keeper 2.0 manages storage roots separately and temporary mounts are
+  the default.
+
 ## 1.6.8 — 2026-08-30
 
 - Add explicit sampled SHA-256 verification for very large retry candidates, with mutation gated by `--allow-sample-verified` and journaled verification provenance.

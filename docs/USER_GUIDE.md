@@ -21,7 +21,7 @@ archive-keeper --help
 archive-keeper ui --health-check
 ```
 
-The expected release output is `archive-keeper 1.6.8`.
+The expected release output is `archive-keeper 2.0.0`.
 
 Start the guided Storage Galaxy interface with `archive-keeper ui`. It is part
 of the same installation as the command-line engine; no separate Go setup is

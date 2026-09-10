@@ -29,8 +29,8 @@ sudo apt install python3-venv ffmpeg chafa imagemagick poppler-utils
 Run these commands from the directory containing the release files:
 
 ```bash
-sha256sum -c archive-keeper-1.6.8.tar.gz.sha256
-tar -xzf archive-keeper-1.6.8.tar.gz
+sha256sum -c archive-keeper-2.0.0-linux-amd64.tar.gz.sha256
+tar -xzf archive-keeper-2.0.0-linux-amd64.tar.gz
 cd archive-keeper
 ./install.sh
 source .venv/bin/activate
@@ -39,6 +39,8 @@ archive-keeper --help
 archive-keeper ui --health-check
 archive-keeper ui
 ```
+
+The architecture suffix may differ on a non-amd64 system.
 
 The single installation contains the complete Python safety engine and the
 Storage Galaxy interface. `archive-keeper ui` locates the packaged interface;

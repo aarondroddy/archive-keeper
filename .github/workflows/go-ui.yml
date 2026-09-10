@@ -62,16 +62,23 @@ jobs:
           mkdir -p archive_keeper/bin
           go build -trimpath -o archive_keeper/bin/archive-keeper-ui ./cmd/archive-keeper-ui
           chmod 755 archive_keeper/bin/archive-keeper-ui
-      - name: Build combined Python and Storage Galaxy wheel
-        run: |
-          python -m pip wheel --no-deps --wheel-dir dist .
-          ls dist/*-linux_x86_64.whl
+      - name: Build checksummed combined release candidate
+        run: bash scripts/build-combined-package.sh
       - name: Verify isolated combined installation
         run: |
           python -m venv /tmp/archive-keeper-install
           /tmp/archive-keeper-install/bin/pip install --no-deps dist/*.whl
           /tmp/archive-keeper-install/bin/archive-keeper --version
           /tmp/archive-keeper-install/bin/archive-keeper ui --health-check
+      - name: Retain release-candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-keeper-2.0.0-linux-amd64
+          path: |
+            dist/archive-keeper-2.0.0-linux-amd64.tar.gz
+            dist/archive-keeper-2.0.0-linux-amd64.tar.gz.sha256
+            dist/archive_keeper-2.0.0-*.whl
+          if-no-files-found: error
 
   pty-reliability:
     runs-on: ubuntu-latest
