@@ -192,6 +192,41 @@ class DisposableGalaxyFixture:
                 raise AssertionError("real MyCloud path leaked into PTY test environment")
         return env
 
+    def install_slow_fake_rmlint(self, delay_seconds: float = 2.0) -> Path:
+        """Install a disposable rmlint stand-in that writes one valid group."""
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir(exist_ok=True)
+        executable = fake_bin / "rmlint"
+        program = f"""#!{sys.executable}
+import json
+import os
+import sys
+import time
+
+delay = float(os.environ.get("ARCHIVE_KEEPER_FAKE_SCAN_DELAY", {delay_seconds!r}))
+steps = max(2, int(delay / 0.2))
+for step in range(steps):
+    print(f"fake scan progress {{step + 1}}/{{steps}}", flush=True)
+    time.sleep(delay / steps)
+
+output = next((arg[5:] for arg in sys.argv[1:] if arg.startswith("json:")), "")
+if not output:
+    raise SystemExit("missing json output path")
+roots = [arg for arg in sys.argv[1:] if arg.startswith(os.sep)]
+first, second = roots[0], roots[1] if len(roots) > 1 else roots[0]
+records = [
+    {{"type": "header", "generator": "archive-keeper-slow-fixture"}},
+    {{"type": "duplicate_file", "path": first + "/slow-a.bin", "size": 4096, "group": 1, "is_original": True}},
+    {{"type": "duplicate_file", "path": second + "/slow-b.bin", "size": 4096, "group": 1, "is_original": False}},
+    {{"type": "footer"}},
+]
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump(records, handle)
+"""
+        executable.write_text(program, encoding="utf-8")
+        executable.chmod(0o700)
+        return fake_bin
+
     def close(self) -> None:
         self._temporary.cleanup()
 
@@ -245,6 +280,67 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.resize(168, 52)
             rendered = terminal.wait_for("FILES UNTOUCHED", start=start)
             self.assertIn("BASIC GUIDE", rendered)
+        finally:
+            terminal.close()
+            fixture.close()
+
+    def test_slow_fake_scan_shows_elapsed_time_and_can_be_cancelled(self) -> None:
+        fixture = DisposableGalaxyFixture(group_count=2)
+        original_report = fixture.report.read_bytes()
+        fake_bin = fixture.install_slow_fake_rmlint(delay_seconds=8.0)
+        environment = fixture.environment()
+        environment["PATH"] = str(fake_bin) + os.pathsep + environment["PATH"]
+        environment["ARCHIVE_KEEPER_UI_LOG"] = str(fixture.root / "ui-errors.jsonl")
+        terminal = TerminalProcess([str(self.binary)], environment, 150, 46)
+        try:
+            terminal.wait_for("MISSION CONTROL")
+            terminal.send(b"8")
+            terminal.wait_for("STORAGE ARRAY SETUP")
+            terminal.send(b"f")
+            terminal.wait_for("START RMLINT DUPLICATE SCAN?")
+            terminal.send(b"\r")
+            terminal.wait_for("RMLINT SCAN RUNNING")
+            rendered = terminal.wait_for("Elapsed 1s", timeout=5)
+            self.assertIn("X/H/← cancel", rendered)
+            start = len(terminal.output)
+            terminal.send(b"x")
+            rendered = terminal.wait_for("SCAN DID NOT COMPLETE", timeout=8, start=start)
+            self.assertIn("rmlint scan cancelled", rendered)
+            self.assertIn("Error log:", rendered)
+            self.assertEqual(fixture.report.read_bytes(), original_report)
+            events = [json.loads(line) for line in
+                      (fixture.root / "ui-errors.jsonl").read_text().splitlines()]
+            cancelled = [event for event in events
+                         if event["operation"] == "rmlint_scan_cancelled"]
+            self.assertEqual(len(cancelled), 1)
+            self.assertEqual(cancelled[0]["level"], "warning")
+            self.assertTrue(all(str(root).startswith(str(fixture.root))
+                                for root in cancelled[0]["details"]["roots"]))
+        finally:
+            terminal.close()
+            fixture.close()
+
+    def test_slow_fake_scan_completes_and_activates_only_its_temp_report(self) -> None:
+        fixture = DisposableGalaxyFixture(group_count=2)
+        fake_bin = fixture.install_slow_fake_rmlint(delay_seconds=1.6)
+        environment = fixture.environment()
+        environment["PATH"] = str(fake_bin) + os.pathsep + environment["PATH"]
+        terminal = TerminalProcess([str(self.binary)], environment, 150, 46)
+        try:
+            terminal.wait_for("MISSION CONTROL")
+            terminal.send(b"8")
+            terminal.wait_for("STORAGE ARRAY SETUP")
+            terminal.send(b"f")
+            terminal.wait_for("START RMLINT DUPLICATE SCAN?")
+            terminal.send(b"\r")
+            terminal.wait_for("RMLINT SCAN RUNNING")
+            rendered = terminal.wait_for("Duplicate groups: 1", timeout=12)
+            self.assertIn("SCAN COMPLETE", rendered)
+            self.assertIn("No files were moved or deleted", rendered)
+            report = json.loads(fixture.report.read_text())
+            self.assertEqual(report[0]["generator"], "archive-keeper-slow-fixture")
+            backups = list(fixture.root.glob("rmlint.json.previous-*"))
+            self.assertEqual(len(backups), 1)
         finally:
             terminal.close()
             fixture.close()

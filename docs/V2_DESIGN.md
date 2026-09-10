@@ -65,6 +65,13 @@ runs `python3 -m archive_keeper.ui_bridge dashboard` asynchronously and accepts
 only protocol-versioned JSON. Existing SQLite state is opened with SQLite
 `mode=ro` and `query_only`; absent databases are reported but never created.
 
+Operational UI failures are written as timestamped JSON-lines events to an
+owner-only state file. Events identify the component and operation and may add
+bounded diagnostic details. Scan cancellation is recorded as a warning, while
+scan, bridge, and terminal failures are errors. The post-scan failure screen
+shows the log path so users can provide a precise diagnostic without copying a
+full terminal session.
+
 Optional environment variables let a development build use non-default inputs:
 
 - `ARCHIVE_KEEPER_PYTHON`
@@ -76,6 +83,7 @@ Optional environment variables let a development build use non-default inputs:
 - `ARCHIVE_KEEPER_PREFERRED_ROOTS`
 - `ARCHIVE_KEEPER_PROTECTED_ROOTS`
 - `ARCHIVE_KEEPER_EXCLUDED_ROOTS`
+- `ARCHIVE_KEEPER_UI_LOG`
 - `ARCHIVE_KEEPER_VERIFY_TIMEOUT`
 - `ARCHIVE_KEEPER_APPLY_LIMIT` (1–10; invalid values fall back to 10)
 

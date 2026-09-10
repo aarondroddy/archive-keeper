@@ -342,7 +342,11 @@ When the scan ends, a dedicated summary explains what happened before you
 leave Storage Setup. It shows the elapsed time, roots checked, duplicate-group
 and file counts, potentially recoverable space, active report, and any backup.
 An empty scan says explicitly that no duplicates were found. A failed scan
-explains the error and confirms that the previous report remains active.
+explains the error, confirms that the previous report remains active, and
+shows the owner-only structured error-log path. Scan and Python-bridge failures
+are appended as one JSON object per line to
+`~/.local/state/archive-keeper/ui-errors.jsonl`. Set
+`ARCHIVE_KEEPER_UI_LOG` to use another path.
 Press Enter, `G`, or `2` to review discovered groups; press `H`, Left Arrow,
 or `R` to return to Storage Setup. The summary never moves or deletes files.
 
@@ -406,11 +410,14 @@ python -m unittest tests.test_ui_pty -v
 ```
 
 The suite verifies arrow-key and help input, clean exit, narrow/wide terminal
-redraws, tmux detach and reattach, and a searchable synthetic report containing
-50,000 duplicate groups. It generates rmlint-compatible JSON directly beneath
-the operating system temporary directory. It does not invoke rmlint, run an
-apply operation, or access `/mnt/MyCloud1`, `/mnt/MyCloud2`, or `/mnt/MyCloud3`.
-Go and tmux are required; CI installs both before running the suite.
+redraws, tmux detach and reattach, a searchable synthetic report containing
+50,000 duplicate groups, and a simulated long-running scan. The slow-scan tests
+put a disposable `rmlint` stand-in first on `PATH`, prove elapsed-time redraws,
+cancellation, prior-report preservation, successful temporary activation, and
+structured cancellation logging. Everything is generated beneath the operating
+system temporary directory. The suite does not invoke the installed rmlint,
+run an apply operation, or access `/mnt/MyCloud1`, `/mnt/MyCloud2`, or
+`/mnt/MyCloud3`. Go and tmux are required; CI installs both before running it.
 
 ## Documentation
 

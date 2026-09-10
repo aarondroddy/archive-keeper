@@ -1,13 +1,48 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStructuredErrorLogIsJSONLinesAndOwnerOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "logs", "ui-errors.jsonl")
+	t.Setenv("ARCHIVE_KEEPER_UI_LOG", path)
+	loggedPath, err := writeStructuredLog("error", "python_bridge", "dashboard", fmt.Errorf("bridge unavailable"), map[string]any{"attempt": 2})
+	if err != nil {
+		t.Fatalf("write structured log: %v", err)
+	}
+	if loggedPath != path {
+		t.Fatalf("unexpected log path: %q", loggedPath)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat structured log: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("structured log mode = %o, want 600", info.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read structured log: %v", err)
+	}
+	var event structuredLogEvent
+	if err := json.Unmarshal(data, &event); err != nil {
+		t.Fatalf("log is not one JSON object: %v", err)
+	}
+	if event.Level != "error" || event.Component != "python_bridge" || event.Operation != "dashboard" || event.Message != "bridge unavailable" {
+		t.Fatalf("unexpected structured event: %#v", event)
+	}
+	if event.Details["attempt"] != float64(2) {
+		t.Fatalf("structured details missing attempt: %#v", event.Details)
+	}
+}
 
 func TestCompactPathLeavesShortPathsAlone(t *testing.T) {
 	path := "/mnt/MyCloud1/movie.mp4"

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -68,8 +69,20 @@ type scanFinishedMsg struct {
 	reportPath string
 	backupPath string
 	output     string
+	cancelled  bool
 	err        error
 }
+
+type structuredLogEvent struct {
+	Timestamp string         `json:"timestamp"`
+	Level     string         `json:"level"`
+	Component string         `json:"component"`
+	Operation string         `json:"operation"`
+	Message   string         `json:"message"`
+	Details   map[string]any `json:"details,omitempty"`
+}
+
+var structuredLogMu sync.Mutex
 
 type duplicateFile struct {
 	Path         string `json:"path"`
@@ -158,6 +171,8 @@ type model struct {
 	scanReportPath     string
 	scanBackupPath     string
 	scanOutput         string
+	errorLogPath       string
+	errorLogErr        error
 	fileCursor    int
 	inspecting    bool
 	confirmKeeper bool
@@ -556,6 +571,63 @@ func defaultDecisionsDBPath() string {
 	return filepath.Join(".", "decisions.sqlite3")
 }
 
+func defaultErrorLogPath() string {
+	if value := os.Getenv("ARCHIVE_KEEPER_UI_LOG"); value != "" {
+		return filepath.Clean(value)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "state", "archive-keeper", "ui-errors.jsonl")
+	}
+	return filepath.Join(".", "ui-errors.jsonl")
+}
+
+func writeStructuredLog(level, component, operation string, failure error, details map[string]any) (string, error) {
+	if failure == nil {
+		return "", nil
+	}
+	path := defaultErrorLogPath()
+	if !filepath.IsAbs(path) {
+		if absolute, err := filepath.Abs(path); err == nil {
+			path = absolute
+		}
+	}
+	structuredLogMu.Lock()
+	defer structuredLogMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return path, err
+	}
+	handle, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return path, err
+	}
+	defer handle.Close()
+	if err := handle.Chmod(0600); err != nil {
+		return path, err
+	}
+	event := structuredLogEvent{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Level: level,
+		Component: component, Operation: operation, Message: failure.Error(), Details: details,
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return path, err
+	}
+	encoded = append(encoded, '\n')
+	if _, err := handle.Write(encoded); err != nil {
+		return path, err
+	}
+	return path, nil
+}
+
+func (m *model) recordFailure(component, operation string, failure error, details map[string]any) {
+	if failure == nil {
+		return
+	}
+	path, err := writeStructuredLog("error", component, operation, failure, details)
+	m.errorLogPath = path
+	m.errorLogErr = err
+}
+
 func normalizeAbsolutePaths(values []string) ([]string, error) {
 	clean := make([]string, 0, len(values))
 	seen := map[string]bool{}
@@ -805,7 +877,7 @@ func runRmlintScan(ctx context.Context, roots []string, reportPath string) tea.C
 		if runErr != nil {
 			_ = os.Remove(tempPath)
 			if ctx.Err() != nil {
-				return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint scan cancelled")}
+				return scanFinishedMsg{output: summary, cancelled: true, err: fmt.Errorf("rmlint scan cancelled")}
 			}
 			return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint scan failed: %w", runErr)}
 		}
@@ -1297,6 +1369,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scanOutput = msg.output
 		m.scanSummaryVisible = true
 		if msg.err != nil {
+			level := "error"
+			operation := "rmlint_scan"
+			if msg.cancelled {
+				level, operation = "warning", "rmlint_scan_cancelled"
+			}
+			path, logErr := writeStructuredLog(level, "storage_setup", operation, msg.err, map[string]any{
+				"roots": m.scanRoots, "report_path": m.reportPath,
+				"elapsed_ms": time.Since(m.scanStartedAt).Milliseconds(), "output": msg.output,
+			})
+			m.errorLogPath, m.errorLogErr = path, logErr
 			m.scanMessage = "SCAN FAILED · " + msg.err.Error()
 			if msg.output != "" {
 				m.scanMessage += " · " + strings.ReplaceAll(msg.output, "\n", " ")
@@ -1314,10 +1396,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.dashboard = msg.snapshot
 		m.loadErr = msg.err
+		m.recordFailure("python_bridge", "dashboard", msg.err, nil)
 	case groupCatalogLoadedMsg:
 		m.groupLoading = false
 		m.groupCatalog = msg.catalog
 		m.groupErr = msg.err
+		m.recordFailure("python_bridge", "group_catalog", msg.err, nil)
 		if m.groupCursor >= len(m.groupCatalog.Items) {
 			m.groupCursor = max(0, len(m.groupCatalog.Items)-1)
 		}
@@ -1325,6 +1409,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.savingKeeper = false
 		m.confirmKeeper = false
 		if msg.err != nil {
+			m.recordFailure("python_bridge", "save_keeper", msg.err, map[string]any{"group_id": msg.groupID})
 			m.statusMessage = "SAVE FAILED · " + msg.err.Error()
 			return m, nil
 		}
@@ -1334,6 +1419,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.savingAction = false
 		m.confirmAction = ""
 		if msg.err != nil {
+			m.recordFailure("python_bridge", "save_action", msg.err, map[string]any{"action": msg.action})
 			m.statusMessage = "STAGING FAILED · " + msg.err.Error()
 			return m, nil
 		}
@@ -1347,6 +1433,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.savingBulk = false
 		m.confirmBulk = false
 		if msg.err != nil {
+			m.recordFailure("python_bridge", "bulk_stage", msg.err, map[string]any{"group_id": msg.groupID})
 			m.statusMessage = "BULK STAGING BLOCKED · " + msg.err.Error()
 			return m, nil
 		}
@@ -1356,6 +1443,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.planLoading = false
 		m.plan = msg.plan
 		m.planErr = msg.err
+		m.recordFailure("python_bridge", "quarantine_plan", msg.err, nil)
 		if m.planCursor >= len(m.plan.Items) {
 			m.planCursor = max(0, len(m.plan.Items)-1)
 		}
@@ -1364,18 +1452,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirmDryRun = false
 		m.dryRun = msg.result
 		m.dryRunErr = msg.err
+		m.recordFailure("python_bridge", "quarantine_dry_run", msg.err, nil)
 	case controlledApplyFinishedMsg:
 		m.applying = false
 		m.confirmApply = false
 		m.applyInput = ""
 		m.applyResult = msg.result
 		m.applyErr = msg.err
+		m.recordFailure("python_bridge", "quarantine_apply", msg.err, nil)
 		m.planLoading = true
 		return m, loadQuarantinePlan
 	case historyRunLoadedMsg:
 		m.historyLoading = false
 		m.historyDetail = msg.detail
 		m.historyErr = msg.err
+		m.recordFailure("python_bridge", "history_run", msg.err, nil)
 		if m.historyActionCursor >= len(m.historyDetail.Actions) {
 			m.historyActionCursor = max(0, len(m.historyDetail.Actions)-1)
 		}
@@ -1385,18 +1476,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recoveryInput = ""
 		m.recoveryResult = msg.result
 		m.recoveryErr = msg.err
+		m.recordFailure("python_bridge", "recovery", msg.err, map[string]any{"kind": m.recoveryKind})
 		if msg.result.Mode == "apply" && m.historyDetail.Run.RunID != "" {
 			m.historyLoading = true
 			return m, tea.Batch(loadDashboard, loadHistoryRun(m.historyDetail.Run.RunID))
 		}
 	case restoreCatalogLoadedMsg:
 		m.restoreCatalogLoading = false; m.restoreCatalog = msg.catalog; m.restoreCatalogErr = msg.err
+		m.recordFailure("python_bridge", "restore_catalog", msg.err, nil)
 		if m.restoreCursor >= len(m.restoreCatalog.Runs) { m.restoreCursor = max(0, len(m.restoreCatalog.Runs)-1) }
 	case restorePlanLoadedMsg:
 		m.restorePlanLoading = false; m.restorePlan = msg.plan; m.restorePlanErr = msg.err
+		m.recordFailure("python_bridge", "restore_plan", msg.err, nil)
 		if m.restorePlanCursor >= len(m.restorePlan.Items) { m.restorePlanCursor = max(0, len(m.restorePlan.Items)-1) }
 	case controlledRestoreFinishedMsg:
 		m.restoring = false; m.confirmRestore = false; m.restoreInput = ""; m.restoreResult = msg.result; m.restoreErr = msg.err
+		m.recordFailure("python_bridge", "restore_apply", msg.err, nil)
 		m.restorePlanLoading = true
 		return m, loadRestorePlan(m.restorePlan.RunID)
 	case tea.WindowSizeMsg:
@@ -2340,6 +2435,11 @@ func (m model) scanSummaryView(width int) string {
 		if detail := strings.TrimSpace(strings.ReplaceAll(m.scanOutput, "\n", " ")); detail != "" {
 			lines = append(lines, mutedText.Render("Technical detail: "+compactPath(detail, max(28, width-20))))
 		}
+		if m.errorLogErr != nil {
+			lines = append(lines, mutedText.Render("Structured logging unavailable: "+m.errorLogErr.Error()))
+		} else if m.errorLogPath != "" {
+			lines = append(lines, "Error log: "+compactPath(m.errorLogPath, max(24, width-13)))
+		}
 		lines = append(lines, "", "R/H/← return to Storage Setup · F can start a new scan after returning")
 		return strings.Join(lines, "\n")
 	}
@@ -2964,6 +3064,7 @@ func main() {
 	}
 	p := tea.NewProgram(initialModel())
 	if _, err := p.Run(); err != nil {
+		_, _ = writeStructuredLog("error", "terminal_ui", "program_run", err, nil)
 		fmt.Fprintln(os.Stderr, "archive-keeper-ui:", err)
 		os.Exit(1)
 	}

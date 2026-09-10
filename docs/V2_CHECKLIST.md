@@ -110,11 +110,15 @@ path to a production-ready v2.
 - [x] Add isolated PTY end-to-end tests for keyboard input, tmux detach/reattach,
   resize, reconnect, and full redraw without accessing configured NAS paths.
 - [ ] Test Setup on local disks, CIFS, NFS, removable media, and offline mounts.
-- [ ] Test long scans.
+- [x] Test simulated long scans through the real PTY UI, including elapsed-time
+  redraw, cancellation, prior-report preservation, and successful activation,
+  using only a disposable fake rmlint beneath the system temporary directory.
 - [x] Test a very large synthetic report (50,000 groups / 100,000 duplicate
   records) through the live PTY UI without invoking rmlint or reading NAS data.
 - [ ] Complete accessibility and low-color terminal review.
-- [ ] Add structured logging for bridge and scan failures.
+- [x] Add owner-only JSON-lines structured logging for bridge failures, scan
+  failures/cancellation, and terminal startup failures, with the log path shown
+  on the post-scan failure screen.
 
 ### Release work
 
