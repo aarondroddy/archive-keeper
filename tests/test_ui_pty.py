@@ -301,7 +301,7 @@ class StorageGalaxyPTYTests(unittest.TestCase):
         environment["ARCHIVE_KEEPER_LOW_COLOR"] = "1"
         terminal = TerminalProcess([str(self.binary)], environment, 140, 44)
         try:
-            rendered = terminal.wait_for("BASIC GUIDE")
+            rendered = terminal.wait_for("FILES UNTOUCHED")
             self.assertIn("FILES UNTOUCHED", rendered)
             self.assertIn("OFFLINE", rendered)
             self.assertIn("BASIC GUIDE", rendered)
