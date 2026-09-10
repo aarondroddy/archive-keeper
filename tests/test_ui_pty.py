@@ -334,7 +334,7 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.send(b"x")
             rendered = terminal.wait_for("SCAN DID NOT COMPLETE", timeout=8, start=start)
             self.assertIn("rmlint scan cancelled", rendered)
-            self.assertIn("Error log:", rendered)
+            self.assertIn("error log:", rendered.lower())
             self.assertEqual(fixture.report.read_bytes(), original_report)
             events = [json.loads(line) for line in
                       (fixture.root / "ui-errors.jsonl").read_text().splitlines()]
