@@ -85,8 +85,12 @@ func TestApplyConfirmationInputAcceptsNamedSpaceKey(t *testing.T) {
 
 func TestControlledRestoreConfirmationUsesBoundedLimit(t *testing.T) {
 	t.Setenv("ARCHIVE_KEEPER_RESTORE_LIMIT", "2")
-	if got := controlledRestoreLimit(); got != 2 { t.Fatalf("unexpected restore limit: %d", got) }
-	if got := expectedRestoreConfirmation(); got != "RESTORE UP TO 2 FILES" { t.Fatalf("unexpected restore phrase: %q", got) }
+	if got := controlledRestoreLimit(); got != 2 {
+		t.Fatalf("unexpected restore limit: %d", got)
+	}
+	if got := expectedRestoreConfirmation(); got != "RESTORE UP TO 2 FILES" {
+		t.Fatalf("unexpected restore phrase: %q", got)
+	}
 }
 
 func TestGalaxyGlyphEncodesDensityAndSelectionPulse(t *testing.T) {
@@ -136,7 +140,9 @@ func TestGroupSortCyclesThroughEveryMode(t *testing.T) {
 	want := []string{"space-asc", "copies-desc", "path-asc", "group-asc", "space-desc"}
 	for _, expected := range want {
 		mode = nextGroupSort(mode)
-		if mode != expected { t.Fatalf("next sort = %q, want %q", mode, expected) }
+		if mode != expected {
+			t.Fatalf("next sort = %q, want %q", mode, expected)
+		}
 	}
 }
 
@@ -154,7 +160,6 @@ func TestBulkStageResultIsDecisionOnly(t *testing.T) {
 		t.Fatalf("unexpected bulk stage result: %#v", result)
 	}
 }
-
 
 func TestParseMountCandidatesFiltersPseudoAndDecodesPaths(t *testing.T) {
 	mountInfo := strings.Join([]string{
@@ -223,15 +228,15 @@ func TestUIConfigRoundTrip(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "archive-keeper", "ui.json")
 	t.Setenv("ARCHIVE_KEEPER_UI_CONFIG", configPath)
 	want := uiConfig{
-		Version: 1,
-		MountRoots: []string{"/mnt/Zeta", "/mnt/Alpha", "/mnt/Zeta"},
-		ReportPath: filepath.Join(t.TempDir(), "rmlint.json"),
-		StateDBPath: filepath.Join(t.TempDir(), "journal.sqlite3"),
+		Version:         1,
+		MountRoots:      []string{"/mnt/Zeta", "/mnt/Alpha", "/mnt/Zeta"},
+		ReportPath:      filepath.Join(t.TempDir(), "rmlint.json"),
+		StateDBPath:     filepath.Join(t.TempDir(), "journal.sqlite3"),
 		DecisionsDBPath: filepath.Join(t.TempDir(), "decisions.sqlite3"),
-		QuarantineName: "ArchiveKeeper Safe Hold",
-		PreferredRoots: []string{"/mnt/Zeta/Favorites"},
-		ProtectedRoots: []string{"/mnt/Alpha/Originals"},
-		ExcludedRoots: []string{"/mnt/Alpha/Cache"},
+		QuarantineName:  "ArchiveKeeper Safe Hold",
+		PreferredRoots:  []string{"/mnt/Zeta/Favorites"},
+		ProtectedRoots:  []string{"/mnt/Alpha/Originals"},
+		ExcludedRoots:   []string{"/mnt/Alpha/Cache"},
 	}
 	if err := saveUIConfig(want); err != nil {
 		t.Fatalf("saveUIConfig: %v", err)

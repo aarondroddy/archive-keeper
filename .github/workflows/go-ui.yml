@@ -48,14 +48,11 @@ jobs:
         run: go mod download
       - name: Go formatting
         run: |
-          gofmt -w cmd/archive-keeper-ui
-      - name: Preserve formatted sources for verification
-        uses: actions/upload-artifact@v4
-        with:
-          name: gofmt-sources
-          path: cmd/archive-keeper-ui
-      - name: Reject unformatted Go sources
-        run: git diff --exit-code -- cmd/archive-keeper-ui
+          unformatted="$(gofmt -l cmd/archive-keeper-ui)"
+          if [ -n "$unformatted" ]; then
+            printf 'The following Go files require gofmt:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
       - name: Vet
         run: go vet ./...
       - name: Test
