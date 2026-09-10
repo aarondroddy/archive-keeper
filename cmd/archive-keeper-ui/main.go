@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"image/color"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,6 +74,13 @@ type scanFinishedMsg struct {
 	output     string
 	cancelled  bool
 	err        error
+}
+
+type scanProgressMsg struct {
+	phase   string
+	detail  string
+	percent int
+	known   bool
 }
 
 type structuredLogEvent struct {
@@ -163,7 +173,12 @@ type model struct {
 	scanRunning     bool
 	scanStartedAt   time.Time
 	scanCancel      context.CancelFunc
+	scanEvents      <-chan tea.Msg
 	scanMessage     string
+	scanProgressPhase   string
+	scanProgressDetail  string
+	scanProgressPercent int
+	scanProgressKnown   bool
 	scanErr         error
 	scanSummaryVisible bool
 	scanDuration       time.Duration
@@ -840,73 +855,159 @@ func initialModel() model {
 
 func rmlintScanArgs(roots []string, tempPath string) []string {
 	args := append([]string{}, roots...)
-	return append(args, "-", "-T", "duplicates", "-o", "json:"+tempPath)
+	// -g enables rmlint's own progress formatter while the explicit JSON
+	// formatter remains the only file output. No cleanup script is generated.
+	return append(args, "-", "-T", "duplicates", "-g", "-o", "json:"+tempPath)
 }
 
-func runRmlintScan(ctx context.Context, roots []string, reportPath string) tea.Cmd {
-	return func() tea.Msg {
-		if len(roots) == 0 {
-			return scanFinishedMsg{err: fmt.Errorf("select at least one mounted storage root")}
-		}
-		if _, err := exec.LookPath("rmlint"); err != nil {
-			return scanFinishedMsg{err: fmt.Errorf("rmlint is not installed or not on PATH")}
-		}
-		reportPath = filepath.Clean(reportPath)
-		if !filepath.IsAbs(reportPath) {
-			return scanFinishedMsg{err: fmt.Errorf("report path must be absolute")}
-		}
-		reportDir := filepath.Dir(reportPath)
-		if err := os.MkdirAll(reportDir, 0700); err != nil {
-			return scanFinishedMsg{err: fmt.Errorf("create report directory: %w", err)}
-		}
-		temp, err := os.CreateTemp(reportDir, ".rmlint-scan-*.json")
-		if err != nil {
-			return scanFinishedMsg{err: fmt.Errorf("create temporary report: %w", err)}
-		}
-		tempPath := temp.Name()
-		if err := temp.Close(); err != nil {
-			_ = os.Remove(tempPath)
-			return scanFinishedMsg{err: fmt.Errorf("close temporary report: %w", err)}
-		}
-		_ = os.Remove(tempPath)
-		output, runErr := exec.CommandContext(ctx, "rmlint", rmlintScanArgs(roots, tempPath)...).CombinedOutput()
-		summary := strings.TrimSpace(string(output))
-		if len(summary) > 600 {
-			summary = summary[len(summary)-600:]
-		}
-		if runErr != nil {
-			_ = os.Remove(tempPath)
-			if ctx.Err() != nil {
-				return scanFinishedMsg{output: summary, cancelled: true, err: fmt.Errorf("rmlint scan cancelled")}
-			}
-			return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint scan failed: %w", runErr)}
-		}
-		info, err := os.Stat(tempPath)
-		if err != nil || info.Size() == 0 {
-			_ = os.Remove(tempPath)
-			return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint did not produce a usable JSON report")}
-		}
-		if err := os.Chmod(tempPath, 0600); err != nil {
-			_ = os.Remove(tempPath)
-			return scanFinishedMsg{output: summary, err: fmt.Errorf("secure temporary report: %w", err)}
-		}
-		backupPath := ""
-		if _, err := os.Stat(reportPath); err == nil {
-			backupPath = reportPath + ".previous-" + time.Now().UTC().Format("20060102T150405Z")
-			if err := os.Rename(reportPath, backupPath); err != nil {
-				_ = os.Remove(tempPath)
-				return scanFinishedMsg{output: summary, err: fmt.Errorf("preserve previous report: %w", err)}
-			}
-		}
-		if err := os.Rename(tempPath, reportPath); err != nil {
-			if backupPath != "" {
-				_ = os.Rename(backupPath, reportPath)
-			}
-			_ = os.Remove(tempPath)
-			return scanFinishedMsg{output: summary, err: fmt.Errorf("activate new report: %w", err)}
-		}
-		return scanFinishedMsg{reportPath: reportPath, backupPath: backupPath, output: summary}
+var (
+	scanANSI      = regexp.MustCompile("\\x1b\\[[0-?]*[ -/]*[@-~]")
+	scanPercent   = regexp.MustCompile(`(?i)([0-9]{1,3}(?:\.[0-9]+)?)\s*%`)
+	scanFraction  = regexp.MustCompile(`(?i)([0-9]+)\s*/\s*([0-9]+)`)
+)
+
+type boundedScanOutput struct {
+	mu   sync.Mutex
+	text string
+}
+
+func (output *boundedScanOutput) add(line string) {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	output.text += line + "\n"
+	if len(output.text) > 4096 {
+		output.text = output.text[len(output.text)-4096:]
 	}
+}
+
+func (output *boundedScanOutput) summary() string {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	summary := strings.TrimSpace(output.text)
+	if len(summary) > 600 { summary = summary[len(summary)-600:] }
+	return summary
+}
+
+func splitScanFrames(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for index, value := range data {
+		if value == '\r' || value == '\n' {
+			advance = index + 1
+			for advance < len(data) && (data[advance] == '\r' || data[advance] == '\n') { advance++ }
+			return advance, data[:index], nil
+		}
+	}
+	if atEOF && len(data) > 0 { return len(data), data, nil }
+	return 0, nil, nil
+}
+
+func parseScanProgress(raw string) (scanProgressMsg, bool) {
+	line := strings.TrimSpace(scanANSI.ReplaceAllString(raw, ""))
+	if line == "" { return scanProgressMsg{}, false }
+	lower := strings.ToLower(line)
+	phase := "SCANNING"
+	switch {
+	case strings.Contains(lower, "traversing"):
+		phase = "DISCOVERING FILES"
+	case strings.Contains(lower, "preprocessing"):
+		phase = "PREPARING CANDIDATES"
+	case strings.Contains(lower, "matching"):
+		phase = "MATCHING CONTENT"
+	case strings.Contains(lower, "merging"):
+		phase = "FINALIZING RESULTS"
+	}
+	progress := scanProgressMsg{phase: phase, detail: line}
+	if match := scanPercent.FindStringSubmatch(line); len(match) == 2 {
+		if value, err := strconv.ParseFloat(match[1], 64); err == nil {
+			progress.percent = min(100, max(0, int(value+0.5)))
+			progress.known = true
+		}
+	} else if match := scanFraction.FindStringSubmatch(line); len(match) == 3 {
+		current, currentErr := strconv.Atoi(match[1])
+		total, totalErr := strconv.Atoi(match[2])
+		if currentErr == nil && totalErr == nil && total > 0 && current <= total {
+			progress.percent = min(100, max(0, current*100/total))
+			progress.known = true
+		}
+	}
+	if len(progress.detail) > 180 { progress.detail = progress.detail[len(progress.detail)-180:] }
+	return progress, true
+}
+
+func consumeScanOutput(reader io.Reader, output *boundedScanOutput, events chan<- tea.Msg, done *sync.WaitGroup) {
+	defer done.Done()
+	scanner := bufio.NewScanner(reader)
+	scanner.Split(splitScanFrames)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		output.add(scanANSI.ReplaceAllString(line, ""))
+		if progress, ok := parseScanProgress(line); ok { events <- progress }
+	}
+}
+
+func waitScanEvent(events <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		message, ok := <-events
+		if !ok { return nil }
+		return message
+	}
+}
+
+func startRmlintScan(ctx context.Context, roots []string, reportPath string) (<-chan tea.Msg, tea.Cmd) {
+	events := make(chan tea.Msg, 32)
+	go func() {
+		events <- runRmlintScanWorker(ctx, roots, reportPath, events)
+		close(events)
+	}()
+	return events, waitScanEvent(events)
+}
+
+func runRmlintScanWorker(ctx context.Context, roots []string, reportPath string, events chan<- tea.Msg) scanFinishedMsg {
+	if len(roots) == 0 { return scanFinishedMsg{err: fmt.Errorf("select at least one mounted storage root")} }
+	if _, err := exec.LookPath("rmlint"); err != nil { return scanFinishedMsg{err: fmt.Errorf("rmlint is not installed or not on PATH")} }
+	reportPath = filepath.Clean(reportPath)
+	if !filepath.IsAbs(reportPath) { return scanFinishedMsg{err: fmt.Errorf("report path must be absolute")} }
+	reportDir := filepath.Dir(reportPath)
+	if err := os.MkdirAll(reportDir, 0700); err != nil { return scanFinishedMsg{err: fmt.Errorf("create report directory: %w", err)} }
+	temp, err := os.CreateTemp(reportDir, ".rmlint-scan-*.json")
+	if err != nil { return scanFinishedMsg{err: fmt.Errorf("create temporary report: %w", err)} }
+	tempPath := temp.Name()
+	if err := temp.Close(); err != nil { _ = os.Remove(tempPath); return scanFinishedMsg{err: fmt.Errorf("close temporary report: %w", err)} }
+	_ = os.Remove(tempPath)
+
+	command := exec.CommandContext(ctx, "rmlint", rmlintScanArgs(roots, tempPath)...)
+	stdout, err := command.StdoutPipe()
+	if err != nil { return scanFinishedMsg{err: fmt.Errorf("open rmlint output: %w", err)} }
+	stderr, err := command.StderrPipe()
+	if err != nil { return scanFinishedMsg{err: fmt.Errorf("open rmlint diagnostics: %w", err)} }
+	output := &boundedScanOutput{}
+	if err := command.Start(); err != nil { return scanFinishedMsg{err: fmt.Errorf("start rmlint scan: %w", err)} }
+	var readers sync.WaitGroup
+	readers.Add(2)
+	go consumeScanOutput(stdout, output, events, &readers)
+	go consumeScanOutput(stderr, output, events, &readers)
+	readers.Wait()
+	runErr := command.Wait()
+	summary := output.summary()
+	if runErr != nil {
+		_ = os.Remove(tempPath)
+		if ctx.Err() != nil { return scanFinishedMsg{output: summary, cancelled: true, err: fmt.Errorf("rmlint scan cancelled")} }
+		return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint scan failed: %w", runErr)}
+	}
+	info, err := os.Stat(tempPath)
+	if err != nil || info.Size() == 0 { _ = os.Remove(tempPath); return scanFinishedMsg{output: summary, err: fmt.Errorf("rmlint did not produce a usable JSON report")} }
+	if err := os.Chmod(tempPath, 0600); err != nil { _ = os.Remove(tempPath); return scanFinishedMsg{output: summary, err: fmt.Errorf("secure temporary report: %w", err)} }
+	backupPath := ""
+	if _, err := os.Stat(reportPath); err == nil {
+		backupPath = reportPath + ".previous-" + time.Now().UTC().Format("20060102T150405Z")
+		if err := os.Rename(reportPath, backupPath); err != nil { _ = os.Remove(tempPath); return scanFinishedMsg{output: summary, err: fmt.Errorf("preserve previous report: %w", err)} }
+	}
+	if err := os.Rename(tempPath, reportPath); err != nil {
+		if backupPath != "" { _ = os.Rename(backupPath, reportPath) }
+		_ = os.Remove(tempPath)
+		return scanFinishedMsg{output: summary, err: fmt.Errorf("activate new report: %w", err)}
+	}
+	return scanFinishedMsg{reportPath: reportPath, backupPath: backupPath, output: summary}
 }
 
 var (
@@ -1358,9 +1459,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scanTickMsg:
 		m.scanPhase = (m.scanPhase + 1) % 4
 		return m, scanTick()
+	case scanProgressMsg:
+		m.scanProgressPhase = msg.phase
+		m.scanProgressDetail = msg.detail
+		m.scanProgressPercent = msg.percent
+		m.scanProgressKnown = msg.known
+		if m.scanEvents != nil { return m, waitScanEvent(m.scanEvents) }
+		return m, nil
 	case scanFinishedMsg:
 		m.scanRunning = false
 		m.scanCancel = nil
+		m.scanEvents = nil
 		m.confirmScan = false
 		m.scanErr = msg.err
 		m.scanDuration = time.Since(m.scanStartedAt).Round(time.Second)
@@ -1698,9 +1807,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.scanSummaryVisible = false
 					m.scanErr = nil
 					m.scanMessage = ""
+					m.scanProgressPhase = "STARTING"
+					m.scanProgressDetail = "Waiting for rmlint telemetry…"
+					m.scanProgressPercent = 0
+					m.scanProgressKnown = false
 					ctx, cancel := context.WithCancel(context.Background())
 					m.scanCancel = cancel
-					return m, runRmlintScan(ctx, roots, m.reportPath)
+					events, scanCmd := startRmlintScan(ctx, roots, m.reportPath)
+					m.scanEvents = events
+					return m, scanCmd
 				case "esc", "left", "h":
 					m.confirmScan = false
 				}
@@ -2398,8 +2513,20 @@ func (m model) storageSetupView(width int) string {
 	}
 	if m.scanRunning {
 		elapsed := time.Since(m.scanStartedAt).Round(time.Second)
+		phase := m.scanProgressPhase
+		if phase == "" {
+			phase = "STARTING"
+		}
+		phaseLine := phase + " · activity detected"
+		if m.scanProgressKnown {
+			phaseLine = fmt.Sprintf("%s · %d%%  %s", phase, m.scanProgressPercent, scanProgressBar(m.scanProgressPercent, 18))
+		}
 		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("RMLINT SCAN RUNNING "+[]string{"◐", "◓", "◑", "◒"}[m.scanPhase%4]),
-			fmt.Sprintf("Elapsed %s · Archive files remain untouched · X/H/← cancel", elapsed))
+			lipgloss.NewStyle().Bold(true).Foreground(lime).Render(phaseLine))
+		if detail := strings.TrimSpace(m.scanProgressDetail); detail != "" {
+			lines = append(lines, mutedText.Render(compactPath(detail, max(24, width-4))))
+		}
+		lines = append(lines, fmt.Sprintf("Elapsed %s · files remain untouched · X/H/← cancel", elapsed))
 	} else if m.confirmScan {
 		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("START RMLINT DUPLICATE SCAN?"),
 			"Enter confirms · H/← cancels · existing report is backed up after success")
@@ -2414,6 +2541,15 @@ func (m model) storageSetupView(width int) string {
 		lines = append(lines, "H/← return home")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func scanProgressBar(percent, width int) string {
+	if width < 1 {
+		return ""
+	}
+	percent = min(100, max(0, percent))
+	filled := percent * width / 100
+	return "[" + strings.Repeat("█", filled) + strings.Repeat("·", width-filled) + "]"
 }
 
 func (m model) scanSummaryView(width int) string {

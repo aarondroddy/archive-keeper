@@ -40,6 +40,12 @@ failure keeps the previous report active. Successful non-empty results link
 directly to Duplicate Groups. This state is informational and never moves or
 deletes files.
 
+While a scan is running, stdout and stderr are consumed concurrently and
+rmlint's progress formatter is translated into beginner-readable phases. The
+UI displays exact percentages when available and otherwise uses phase detail,
+elapsed time, and an activity indicator. Diagnostic output is bounded, and a
+new JSON report becomes active only after the scanner exits successfully.
+
 Every workflow screen carries a plain-language basic guide. The guide states
 what the screen is for, the next keys to press, and whether the current step is
 read-only, decision-only, or capable of a confirmed file move.

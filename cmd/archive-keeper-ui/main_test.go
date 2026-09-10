@@ -311,7 +311,7 @@ func TestRecoveryConfirmationInputAcceptsNamedSpaceKey(t *testing.T) {
 
 func TestRmlintScanArgsProduceJSONOnly(t *testing.T) {
 	got := rmlintScanArgs([]string{"/mnt/One", "/mnt/Two"}, "/tmp/report.json")
-	want := []string{"/mnt/One", "/mnt/Two", "-", "-T", "duplicates", "-o", "json:/tmp/report.json"}
+	want := []string{"/mnt/One", "/mnt/Two", "-", "-T", "duplicates", "-g", "-o", "json:/tmp/report.json"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected rmlint arguments: %#v", got)
 	}
@@ -319,6 +319,32 @@ func TestRmlintScanArgsProduceJSONOnly(t *testing.T) {
 		if strings.Contains(arg, "rmlint.sh") || arg == "sh" {
 			t.Fatalf("scan arguments must not produce or run a cleanup script: %#v", got)
 		}
+	}
+}
+
+func TestParseScanProgressRecognizesRmlintPhasesAndExactPercent(t *testing.T) {
+	progress, ok := parseScanProgress("\x1b[32mMatching (1 dupes of 2 originals; ETA: 3s) 42%\x1b[0m")
+	if !ok || progress.phase != "MATCHING CONTENT" || !progress.known || progress.percent != 42 {
+		t.Fatalf("unexpected matching progress: %#v, ok=%v", progress, ok)
+	}
+
+	progress, ok = parseScanProgress("Traversing (17 usable files / 2 ignored files / folders)")
+	if !ok || progress.phase != "DISCOVERING FILES" || progress.known {
+		t.Fatalf("unexpected traversal progress: %#v, ok=%v", progress, ok)
+	}
+
+	progress, ok = parseScanProgress("Merging files into directories")
+	if !ok || progress.phase != "FINALIZING RESULTS" {
+		t.Fatalf("unexpected finalizing progress: %#v, ok=%v", progress, ok)
+	}
+}
+
+func TestScanProgressBarClampsInput(t *testing.T) {
+	if got := scanProgressBar(50, 4); got != "[██··]" {
+		t.Fatalf("unexpected progress bar: %q", got)
+	}
+	if got := scanProgressBar(150, 2); got != "[██]" {
+		t.Fatalf("progress bar did not clamp: %q", got)
 	}
 }
 

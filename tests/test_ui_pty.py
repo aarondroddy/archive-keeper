@@ -1,8 +1,9 @@
 """End-to-end terminal reliability tests for Storage Galaxy.
 
 Every fixture lives under the operating system's temporary directory.  The
-suite writes rmlint-compatible JSON itself and never invokes rmlint, scans a
-mounted filesystem, or performs an Archive Keeper apply operation.
+suite writes rmlint-compatible JSON itself and never invokes the installed
+rmlint, scans a mounted filesystem, or performs an Archive Keeper apply
+operation.
 """
 
 from __future__ import annotations
@@ -206,7 +207,16 @@ import time
 delay = float(os.environ.get("ARCHIVE_KEEPER_FAKE_SCAN_DELAY", {delay_seconds!r}))
 steps = max(2, int(delay / 0.2))
 for step in range(steps):
-    print(f"fake scan progress {{step + 1}}/{{steps}}", flush=True)
+    percent = int((step + 1) * 100 / steps)
+    if percent < 25:
+        message = f"Traversing ({{step + 1}} usable files / 0 ignored files / folders)"
+    elif percent < 50:
+        message = "Preprocessing (reduces files to 2 / found 0 other lint)"
+    elif percent < 90:
+        message = f"Matching (1 dupes of 1 originals; 4 KiB in 2 files, ETA: 1s) {{percent}}%"
+    else:
+        message = "Merging files into directories"
+    print(message, flush=True)
     time.sleep(delay / steps)
 
 output = next((arg[5:] for arg in sys.argv[1:] if arg.startswith("json:")), "")
@@ -300,10 +310,10 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.wait_for("START RMLINT DUPLICATE SCAN?")
             terminal.send(b"\r")
             terminal.wait_for("RMLINT SCAN RUNNING")
-            # Bubble Tea may optimize the redraw to only the changed suffix
-            # ("1s") rather than repainting the unchanged "Elapsed" label.
-            rendered = terminal.wait_for("1s", timeout=5)
-            self.assertIn("X/H/← cancel", rendered)
+            start = len(terminal.output)
+            rendered = terminal.wait_for("MATCHING CONTENT", timeout=6, start=start)
+            self.assertIn("%", rendered)
+            self.assertIn("X/H/← cancel", terminal.plain_output())
             start = len(terminal.output)
             terminal.send(b"x")
             rendered = terminal.wait_for("SCAN DID NOT COMPLETE", timeout=8, start=start)

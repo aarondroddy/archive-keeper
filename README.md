@@ -336,7 +336,11 @@ With `rmlint` installed, press `F` from Storage Setup and confirm with Enter
 to run a duplicate-only scan. The UI requests JSON output only; it never
 creates or runs rmlint's cleanup script. A successful report loads
 automatically, while an existing report is kept as a timestamped backup.
-A long scan can be cancelled with `X`, `H`, or Left Arrow.
+A long scan shows rmlint's live discovery, preparation, matching, and
+finalization phases, including the scanner's current counts or ETA. When the
+installed rmlint exposes an exact percentage, the UI also draws a percentage
+bar; otherwise it keeps showing elapsed time and activity so it never appears
+frozen. Cancel safely with `X`, `H`, or Left Arrow.
 
 When the scan ends, a dedicated summary explains what happened before you
 leave Storage Setup. It shows the elapsed time, roots checked, duplicate-group

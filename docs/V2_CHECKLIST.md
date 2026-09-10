@@ -89,8 +89,9 @@ path to a production-ready v2.
   staging, quarantine preview, dry pilot, and controlled apply boundaries.
 - [x] Highlight preferred copies and open group review on the first matching
   preferred root without automatically changing the saved keeper.
-- [ ] Add richer live rmlint progress when the installed version exposes
-  machine-readable progress.
+- [x] Stream rmlint's progress formatter into the UI, show live scan phases and
+  details, use exact percentages when exposed, and retain elapsed/activity
+  feedback when the installed version does not expose a percentage.
 - [x] Add a beginner-friendly post-scan summary with duration, scanned roots,
   result counts, active/backup report paths, empty results, errors, and direct
   navigation to Duplicate Groups.
