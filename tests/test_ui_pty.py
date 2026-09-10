@@ -299,10 +299,9 @@ class StorageGalaxyPTYTests(unittest.TestCase):
         fixture = DisposableGalaxyFixture(group_count=2)
         environment = fixture.environment()
         environment["ARCHIVE_KEEPER_LOW_COLOR"] = "1"
-        terminal = TerminalProcess([str(self.binary)], environment, 100, 32)
+        terminal = TerminalProcess([str(self.binary)], environment, 140, 44)
         try:
-            terminal.wait_for("MISSION CONTROL")
-            rendered = terminal.plain_output()
+            rendered = terminal.wait_for("BASIC GUIDE")
             self.assertIn("FILES UNTOUCHED", rendered)
             self.assertIn("OFFLINE", rendered)
             self.assertIn("BASIC GUIDE", rendered)
