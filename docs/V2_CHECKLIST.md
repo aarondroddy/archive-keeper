@@ -142,7 +142,7 @@ path to a production-ready v2.
 - [ ] Review and merge the feature branch.
 - [x] Update version/changelog and prepare release notes.
 - [x] Configure CI to produce checksummed release-candidate artifacts.
-- [ ] Install the final CI-built 2.0.0 release candidate on the target machine,
+- [x] Install the final CI-built 2.0.0 release candidate on the target machine,
   verify the global launcher without activation, and rerun health checks before
   merge, tag, and publication.
 
