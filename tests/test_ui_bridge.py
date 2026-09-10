@@ -713,6 +713,30 @@ class UIBridgeTests(unittest.TestCase):
         self.assertEqual(result["roots"][0]["filesystem"], "cifs")
         self.assertEqual(result["roots"][1]["status"], "OFFLINE")
 
+    def test_mount_summary_classifies_local_cifs_nfs_removable_and_offline(self):
+        roots = [
+            Path("/mnt/LocalDisk"),
+            Path("/mnt/TeamShare"),
+            Path("/mnt/Research"),
+            Path("/media/aaron/USB ARCHIVE"),
+            Path("/mnt/OfflineVault"),
+        ]
+        mountinfo = "\n".join([
+            "41 20 8:1 / /mnt/LocalDisk rw,relatime - ext4 /dev/sdb1 rw",
+            "42 20 0:51 / /mnt/TeamShare rw,relatime - cifs //server/share rw",
+            "43 20 0:52 / /mnt/Research rw,relatime - nfs4 server:/exports/research rw",
+            "44 20 8:17 / /media/aaron/USB\\040ARCHIVE rw - exfat /dev/sdc1 rw",
+        ])
+
+        result = _mount_summary(roots, mountinfo)
+        self.assertFalse(result["all_ready"])
+        by_path = {entry["path"]: entry for entry in result["roots"]}
+        self.assertEqual(by_path["/mnt/LocalDisk"]["filesystem"], "ext4")
+        self.assertEqual(by_path["/mnt/TeamShare"]["filesystem"], "cifs")
+        self.assertEqual(by_path["/mnt/Research"]["filesystem"], "nfs4")
+        self.assertEqual(by_path["/media/aaron/USB ARCHIVE"]["filesystem"], "exfat")
+        self.assertEqual(by_path["/mnt/OfflineVault"]["status"], "OFFLINE")
+
 
     def test_history_run_snapshot_returns_read_only_action_details(self):
         with tempfile.TemporaryDirectory() as td:

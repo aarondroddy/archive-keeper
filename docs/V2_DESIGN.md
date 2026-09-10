@@ -50,6 +50,12 @@ Every workflow screen carries a plain-language basic guide. The guide states
 what the screen is for, the next keys to press, and whether the current step is
 read-only, decision-only, or capable of a confirmed file move.
 
+Color is an enhancement rather than the only state carrier. Every online,
+offline, ready, blocked, warning, selected, and safety state also has text or a
+focus marker. `ARCHIVE_KEEPER_LOW_COLOR=1` selects a 16-color palette and the
+standard `NO_COLOR` variable removes foreground/background colors while
+retaining layout, labels, icons, and emphasis.
+
 ## Combined installation
 
 Archive Keeper is distributed as one platform-specific package containing the

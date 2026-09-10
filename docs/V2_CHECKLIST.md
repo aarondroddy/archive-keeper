@@ -107,19 +107,26 @@ path to a production-ready v2.
 - [x] Add the stable `archive-keeper ui` launcher with bundled-binary discovery
   and an installation health check.
 - [x] Add CI checks for Go vet/tests, Python bridge tests, and the Go build.
-- [ ] Add an explicit Go formatting check to CI.
+- [x] Add an explicit Go formatting check to CI.
 - [x] Add isolated PTY end-to-end tests for keyboard input, tmux detach/reattach,
   resize, reconnect, and full redraw without accessing configured NAS paths.
-- [ ] Test Setup on local disks, CIFS, NFS, removable media, and offline mounts.
+- [x] Test Setup parsing and status behavior with synthetic kernel mount tables
+  covering local disks, CIFS, NFS, removable media, and offline mounts without
+  mounting or scanning storage in CI.
 - [x] Test simulated long scans through the real PTY UI, including elapsed-time
   redraw, cancellation, prior-report preservation, and successful activation,
   using only a disposable fake rmlint beneath the system temporary directory.
 - [x] Test a very large synthetic report (50,000 groups / 100,000 duplicate
   records) through the live PTY UI without invoking rmlint or reading NAS data.
-- [ ] Complete accessibility and low-color terminal review.
+- [x] Complete accessibility and low-color terminal review: preserve textual
+  status/focus/safety cues, support 16-color and `NO_COLOR` modes, and exercise
+  low-color rendering through the PTY suite.
 - [x] Add owner-only JSON-lines structured logging for bridge failures, scan
   failures/cancellation, and terminal startup failures, with the log path shown
   on the post-scan failure screen.
+- [x] Add a one-command, read-only target-machine validation suite covering
+  formatting, Go/Python/PTY tests, tmux, packaging, health checks, and kernel
+  mount inventory without scanning or moving archive files.
 
 ### Release work
 

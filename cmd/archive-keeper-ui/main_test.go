@@ -175,6 +175,50 @@ func TestParseMountCandidatesFiltersPseudoAndDecodesPaths(t *testing.T) {
 	}
 }
 
+func TestParseMountCandidatesCoversSupportedStorageKinds(t *testing.T) {
+	mountInfo := strings.Join([]string{
+		"41 20 8:1 / /mnt/LocalDisk rw,relatime - ext4 /dev/sdb1 rw",
+		"42 20 0:51 / /mnt/TeamShare rw,relatime - cifs //server/share rw",
+		"43 20 0:52 / /mnt/Research rw,relatime - nfs4 server:/exports/research rw",
+		"44 20 8:17 / /media/aaron/USB\040ARCHIVE rw,nosuid - exfat /dev/sdc1 rw",
+	}, "\n")
+
+	got := parseMountCandidates(mountInfo)
+	want := []mountCandidate{
+		{Path: "/media/aaron/USB ARCHIVE", Filesystem: "exfat", Source: "/dev/sdc1"},
+		{Path: "/mnt/LocalDisk", Filesystem: "ext4", Source: "/dev/sdb1"},
+		{Path: "/mnt/Research", Filesystem: "nfs4", Source: "server:/exports/research"},
+		{Path: "/mnt/TeamShare", Filesystem: "cifs", Source: "//server/share"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("storage matrix mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+
+	merged := mergeConfiguredCandidates(got, []string{"/mnt/TeamShare", "/mnt/OfflineVault"})
+	foundOffline := false
+	for _, candidate := range merged {
+		if candidate.Path == "/mnt/OfflineVault" {
+			foundOffline = candidate.Filesystem == "configured"
+		}
+	}
+	if !foundOffline {
+		t.Fatalf("configured offline storage was not retained: %#v", merged)
+	}
+}
+
+func TestThemeColorSupportsLowAndNoColorModes(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	if _, ok := themeColor("#FFFFFF", 15).(lipgloss.NoColor); !ok {
+		t.Fatalf("NO_COLOR did not disable color")
+	}
+
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("ARCHIVE_KEEPER_LOW_COLOR", "1")
+	if reflect.TypeOf(themeColor("#FFFFFF", 15)) != reflect.TypeOf(lipgloss.ANSIColor(15)) {
+		t.Fatalf("low-color mode did not select an ANSI indexed color")
+	}
+}
+
 func TestUIConfigRoundTrip(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "archive-keeper", "ui.json")
 	t.Setenv("ARCHIVE_KEEPER_UI_CONFIG", configPath)

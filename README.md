@@ -423,6 +423,26 @@ system temporary directory. The suite does not invoke the installed rmlint,
 run an apply operation, or access `/mnt/MyCloud1`, `/mnt/MyCloud2`, or
 `/mnt/MyCloud3`. Go and tmux are required; CI installs both before running it.
 
+### Final target-machine validation
+
+Before releasing 2.0, run the complete read-only validation from the repository
+on the target Linux machine:
+
+```bash
+bash scripts/v2-target-check.sh
+```
+
+It enforces Go formatting; runs Go, Python, PTY, tmux, resize, reconnect,
+large-report, and fake-scan tests; builds the UI; verifies a clean combined
+installation; and reports storage types from the kernel mount table. It does
+not invoke rmlint, scan archive contents, mount or unmount storage, or perform
+quarantine/restore operations.
+
+Set `ARCHIVE_KEEPER_LOW_COLOR=1` for a 16-color-compatible palette, or set the
+standard `NO_COLOR` variable to remove UI colors. Status words, icons, focus
+markers, instructions, and safety results remain visible without relying on
+color alone.
+
 ## Documentation
 
 - [Installation](docs/INSTALL.md)

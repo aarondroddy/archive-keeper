@@ -1011,20 +1011,30 @@ func runRmlintScanWorker(ctx context.Context, roots []string, reportPath string,
 }
 
 var (
-	ink       = lipgloss.Color("#EDE9FF")
-	muted     = lipgloss.Color("#918AAE")
-	void      = lipgloss.Color("#090715")
-	panel     = lipgloss.Color("#17112B")
-	purple    = lipgloss.Color("#A855F7")
-	cyan      = lipgloss.Color("#22D3EE")
-	pink      = lipgloss.Color("#FF4FD8")
-	lime      = lipgloss.Color("#B8FF65")
-	gold      = lipgloss.Color("#FFD166")
-	danger    = lipgloss.Color("#FF5C7A")
+	ink       = themeColor("#EDE9FF", 15)
+	muted     = themeColor("#918AAE", 8)
+	void      = themeColor("#090715", 0)
+	panel     = themeColor("#17112B", 0)
+	purple    = themeColor("#A855F7", 5)
+	cyan      = themeColor("#22D3EE", 6)
+	pink      = themeColor("#FF4FD8", 13)
+	lime      = themeColor("#B8FF65", 10)
+	gold      = themeColor("#FFD166", 11)
+	danger    = themeColor("#FF5C7A", 9)
 	logoStyle = lipgloss.NewStyle().Bold(true).Foreground(pink)
 	mutedText = lipgloss.NewStyle().Foreground(muted)
 	keyStyle  = lipgloss.NewStyle().Bold(true).Foreground(void).Background(cyan).Padding(0, 1)
 )
+
+func themeColor(full string, ansi uint) color.Color {
+	if os.Getenv("NO_COLOR") != "" {
+		return lipgloss.NoColor{}
+	}
+	if os.Getenv("ARCHIVE_KEEPER_LOW_COLOR") != "" {
+		return lipgloss.ANSIColor(ansi)
+	}
+	return lipgloss.Color(full)
+}
 
 func loadDashboard() tea.Msg {
 	python := os.Getenv("ARCHIVE_KEEPER_PYTHON")

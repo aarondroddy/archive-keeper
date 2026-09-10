@@ -30,6 +30,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 ANSI_ESCAPE = re.compile(
     rb"(?:\x1B[@-_][0-?]*[ -/]*[@-~]|\x1B\][^\x07]*(?:\x07|\x1B\\))"
 )
+TRUECOLOR_ESCAPE = re.compile(rb"\x1b\[(?:38|48);2;")
 REAL_STORAGE_PREFIXES = ("/mnt/MyCloud1", "/mnt/MyCloud2", "/mnt/MyCloud3")
 
 
@@ -290,6 +291,22 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.resize(168, 52)
             rendered = terminal.wait_for("BASIC GUIDE", start=start)
             self.assertIn("BASIC GUIDE", rendered)
+        finally:
+            terminal.close()
+            fixture.close()
+
+    def test_low_color_mode_keeps_textual_status_and_avoids_truecolor(self) -> None:
+        fixture = DisposableGalaxyFixture(group_count=2)
+        environment = fixture.environment()
+        environment["ARCHIVE_KEEPER_LOW_COLOR"] = "1"
+        terminal = TerminalProcess([str(self.binary)], environment, 100, 32)
+        try:
+            terminal.wait_for("MISSION CONTROL")
+            rendered = terminal.plain_output()
+            self.assertIn("FILES UNTOUCHED", rendered)
+            self.assertIn("OFFLINE", rendered)
+            self.assertIn("BASIC GUIDE", rendered)
+            self.assertIsNone(TRUECOLOR_ESCAPE.search(bytes(terminal.output)))
         finally:
             terminal.close()
             fixture.close()
