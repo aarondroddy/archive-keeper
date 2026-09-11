@@ -332,6 +332,13 @@ On first launch, Storage Setup detects mounted drives beneath `/mnt`,
 `/media`, and `/run/media`. Select the roots Archive Keeper may manage,
 then press `S` to save. Press `8` to reopen setup later.
 
+Storage Setup also offers the current user's home folder as an unselected
+`LOCAL` choice. Select it when you want to scan files stored on Kali's own
+disk. Archive Keeper deliberately does not offer `/`: scanning the filesystem
+root would sweep operating-system paths and could cross into mounted network
+storage. The home-folder choice excludes `/mnt` and `/media` because they are
+outside the home directory.
+
 Press `M` in Storage Setup to open the guided Mount Storage Assistant. It
 supports local block devices, removable drives through `udisksctl`, CIFS/SMB
 shares, and NFS exports. The assistant explains every field, validates device
@@ -370,8 +377,11 @@ automatically, while an existing report is kept as a timestamped backup.
 A long scan shows rmlint's live discovery, preparation, matching, and
 finalization phases, including the scanner's current counts or ETA. When the
 installed rmlint exposes an exact percentage, the UI also draws a percentage
-bar; otherwise it keeps showing elapsed time and activity so it never appears
-frozen. Cancel safely with `X`, `H`, or Left Arrow.
+bar; otherwise it keeps showing elapsed time without claiming that silence is
+activity. If rmlint emits no telemetry, the UI says so explicitly, shows its PID
+and temporary-report status, and warns about a possible storage or network
+stall after prolonged silence. It never cancels automatically. Cancel safely
+with `X`, `H`, or Left Arrow.
 
 When the scan ends, a dedicated summary explains what happened before you
 leave Storage Setup. It shows the elapsed time, roots checked, duplicate-group
@@ -384,6 +394,13 @@ are appended as one JSON object per line to
 `ARCHIVE_KEEPER_UI_LOG` to use another path.
 Press Enter, `G`, or `2` to review discovered groups; press `H`, Left Arrow,
 or `R` to return to Storage Setup. The summary never moves or deletes files.
+
+rmlint cannot resume an interrupted filesystem scan from a checkpoint. After a
+failed or cancelled scan, press `F` to retry the exact same roots from the
+beginning. Archive Keeper deliberately does not enable rmlint's extended-
+attribute cache automatically: that cache writes metadata to scanned files and
+has correctness caveats, which would conflict with the UI's files-untouched
+scan boundary.
 
 Duplicate Groups now browses the complete report in small pages instead of
 stopping at the dashboard's 24 largest groups. Press `/` to search filenames
