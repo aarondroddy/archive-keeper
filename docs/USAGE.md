@@ -50,9 +50,24 @@ Open the packaged Storage Galaxy interface with:
 archive-keeper ui
 ```
 
+Storage Setup lists mounted storage plus an optional `LOCAL` entry for the
+current user's home folder. Choose `LOCAL` to scan files on the Linux system
+disk without scanning the entire `/` filesystem or the separate mounts beneath
+`/mnt` and `/media`.
+
 This launches the UI shipped with the same installation; all quarantine,
 restore, retry, and reconciliation work continues to use the Python safety
 engine in that package.
+
+During a UI-started rmlint scan, Archive Keeper shows elapsed time, the rmlint
+process ID, and whether the temporary report has begun to grow. Missing
+progress output is labeled as missing telemetry rather than activity. A
+possible-stall warning suggests checking storage and network health but does
+not stop the process; `X`, `H`, or Left Arrow cancels safely.
+
+rmlint does not support checkpoint resume. On a failed or cancelled scan, `F`
+offers a confirmed retry of the same roots from the beginning. The previous
+active report remains untouched unless that retry completes successfully.
 
 
 ## Restore collision verification
