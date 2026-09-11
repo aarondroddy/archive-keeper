@@ -54,6 +54,7 @@ type mountCandidate struct {
 	Path       string
 	Filesystem string
 	Source     string
+	Optional   bool
 }
 
 type mountKind int
@@ -103,12 +104,22 @@ type scanFinishedMsg struct {
 	err        error
 }
 
+type scanStartedMsg struct {
+	pid      int
+	tempPath string
+}
+
 type scanProgressMsg struct {
 	phase   string
 	detail  string
 	percent int
 	known   bool
 }
+
+const (
+	scanNoTelemetryWarningAfter = 30 * time.Second
+	scanPossibleStallAfter      = 2 * time.Minute
+)
 
 type structuredLogEvent struct {
 	Timestamp string         `json:"timestamp"`
@@ -215,6 +226,12 @@ type model struct {
 	confirmScan           bool
 	scanRunning           bool
 	scanStartedAt         time.Time
+	scanLastTelemetryAt   time.Time
+	scanTelemetrySeen     bool
+	scanStallLogged       bool
+	scanPID               int
+	scanTempPath          string
+	scanRetryPending      bool
 	scanCancel            context.CancelFunc
 	scanEvents            <-chan tea.Msg
 	scanMessage           string
@@ -595,7 +612,28 @@ func discoverMountCandidates() ([]mountCandidate, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseMountCandidates(string(data)), nil
+	candidates := parseMountCandidates(string(data))
+	if home, homeErr := os.UserHomeDir(); homeErr == nil {
+		candidates = addLocalHomeCandidate(candidates, home)
+	}
+	return candidates, nil
+}
+
+func addLocalHomeCandidate(candidates []mountCandidate, home string) []mountCandidate {
+	home = filepath.Clean(strings.TrimSpace(home))
+	if home == "" || home == string(filepath.Separator) || !filepath.IsAbs(home) {
+		return candidates
+	}
+	for _, candidate := range candidates {
+		if candidate.Path == home {
+			return candidates
+		}
+	}
+	candidates = append(candidates, mountCandidate{
+		Path: home, Filesystem: "local", Source: "Kali home folder; excludes /mnt and /media", Optional: true,
+	})
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Path < candidates[j].Path })
+	return candidates
 }
 
 func mountKindName(kind mountKind) string {
@@ -1165,7 +1203,9 @@ func initialModel() model {
 		m.setupFirstRun = true
 		m.configSource = "first-run setup"
 		for _, candidate := range m.setupCandidates {
-			m.setupSelected[candidate.Path] = true
+			if !candidate.Optional {
+				m.setupSelected[candidate.Path] = true
+			}
 		}
 	}
 	return m
@@ -1333,6 +1373,7 @@ func runRmlintScanWorker(ctx context.Context, roots []string, reportPath string,
 	if err := command.Start(); err != nil {
 		return scanFinishedMsg{err: fmt.Errorf("start rmlint scan: %w", err)}
 	}
+	events <- scanStartedMsg{pid: command.Process.Pid, tempPath: tempPath}
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go consumeScanOutput(stdout, output, events, &readers)
@@ -1901,12 +1942,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case scanTickMsg:
 		m.scanPhase = (m.scanPhase + 1) % 4
+		if m.scanRunning && !m.scanStallLogged && m.scanSilence(time.Now()) >= scanPossibleStallAfter {
+			silence := m.scanSilence(time.Now()).Round(time.Second)
+			path, err := writeStructuredLog("warning", "storage_setup", "rmlint_scan_possible_stall",
+				fmt.Errorf("no rmlint telemetry for %s", silence), map[string]any{
+					"roots": m.scanRoots, "report_path": m.reportPath, "temporary_report": m.scanTempPath,
+					"pid": m.scanPID, "elapsed_ms": time.Since(m.scanStartedAt).Milliseconds(),
+				})
+			m.errorLogPath, m.errorLogErr = path, err
+			m.scanStallLogged = true
+		}
 		return m, scanTick()
+	case scanStartedMsg:
+		m.scanPID = msg.pid
+		m.scanTempPath = msg.tempPath
+		if m.scanEvents != nil {
+			return m, waitScanEvent(m.scanEvents)
+		}
+		return m, nil
 	case scanProgressMsg:
 		m.scanProgressPhase = msg.phase
 		m.scanProgressDetail = msg.detail
 		m.scanProgressPercent = msg.percent
 		m.scanProgressKnown = msg.known
+		m.scanTelemetrySeen = true
+		m.scanLastTelemetryAt = time.Now()
 		if m.scanEvents != nil {
 			return m, waitScanEvent(m.scanEvents)
 		}
@@ -1915,7 +1975,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scanRunning = false
 		m.scanCancel = nil
 		m.scanEvents = nil
+		m.scanPID = 0
 		m.confirmScan = false
+		m.scanRetryPending = false
 		m.scanErr = msg.err
 		m.scanDuration = time.Since(m.scanStartedAt).Round(time.Second)
 		m.scanReportPath = msg.reportPath
@@ -2401,9 +2463,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.groupErr = nil
 						return m, loadGroupCatalog(m.groupQuery, m.groupRoot, m.groupSort, 1)
 					}
+				case "f":
+					if m.scanErr != nil && len(m.scanRoots) > 0 {
+						m.scanSummaryVisible = false
+						m.scanMessage = ""
+						m.scanRetryPending = true
+						m.confirmScan = true
+					}
 				case "r", "esc", "left", "h":
 					m.scanSummaryVisible = false
 					m.scanMessage = ""
+					m.scanRetryPending = false
 				}
 				return m, nil
 			}
@@ -2411,6 +2481,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				switch shortcut {
 				case "enter":
 					roots := m.selectedSetupRoots()
+					if m.scanRetryPending {
+						roots = append([]string{}, m.scanRoots...)
+					}
 					if len(roots) == 0 {
 						m.scanErr = fmt.Errorf("select at least one mounted root")
 						m.scanMessage = "SCAN BLOCKED · " + m.scanErr.Error()
@@ -2419,21 +2492,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.scanRunning = true
 					m.scanStartedAt = time.Now()
+					m.scanLastTelemetryAt = time.Time{}
+					m.scanTelemetrySeen = false
+					m.scanStallLogged = false
+					m.scanPID = 0
+					m.scanTempPath = ""
 					m.scanRoots = append([]string{}, roots...)
 					m.scanSummaryVisible = false
 					m.scanErr = nil
 					m.scanMessage = ""
 					m.scanProgressPhase = "STARTING"
-					m.scanProgressDetail = "Waiting for rmlint telemetry…"
+					m.scanProgressDetail = "rmlint has not emitted progress telemetry yet"
 					m.scanProgressPercent = 0
 					m.scanProgressKnown = false
 					ctx, cancel := context.WithCancel(context.Background())
 					m.scanCancel = cancel
+					m.scanRetryPending = false
 					events, scanCmd := startRmlintScan(ctx, roots, m.reportPath)
 					m.scanEvents = events
 					return m, scanCmd
 				case "esc", "left", "h":
 					m.confirmScan = false
+					m.scanRetryPending = false
 				}
 				return m, nil
 			}
@@ -2527,6 +2607,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setupFirstRun = false
 				m.configSource = "saved configuration"
 				m.confirmScan = true
+				m.scanRetryPending = false
 				m.scanMessage = ""
 				m.scanErr = nil
 			case "e":
@@ -3196,6 +3277,10 @@ func (m model) storageSetupView(width int) string {
 			}
 			status := "DETECTED"
 			statusColor := lime
+			if candidate.Optional {
+				status = "LOCAL"
+				statusColor = cyan
+			}
 			if candidate.Filesystem == "configured" {
 				status = "NOT MOUNTED"
 				statusColor = danger
@@ -3223,12 +3308,14 @@ func (m model) storageSetupView(width int) string {
 		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(statusColor).Render(m.scanMessage))
 	}
 	if m.scanRunning {
-		elapsed := time.Since(m.scanStartedAt).Round(time.Second)
+		now := time.Now()
+		elapsed := now.Sub(m.scanStartedAt).Round(time.Second)
+		silence := m.scanSilence(now).Round(time.Second)
 		phase := m.scanProgressPhase
 		if phase == "" {
 			phase = "STARTING"
 		}
-		phaseLine := phase + " · activity detected"
+		phaseLine := phase + " · rmlint has not provided a percentage"
 		if m.scanProgressKnown {
 			phaseLine = fmt.Sprintf("%s · %d%%  %s", phase, m.scanProgressPercent, scanProgressBar(m.scanProgressPercent, 18))
 		}
@@ -3238,15 +3325,39 @@ func (m model) storageSetupView(width int) string {
 			lines = append(lines, mutedText.Render(compactPath(detail, max(24, width-4))))
 		}
 		lines = append(lines, fmt.Sprintf("Elapsed %s · files remain untouched · X/H/← cancel", elapsed))
+		if silence >= scanNoTelemetryWarningAfter {
+			warning := fmt.Sprintf("NO RMLINT TELEMETRY FOR %s · it may still be reading slow or remote storage", silence)
+			color := gold
+			if silence >= scanPossibleStallAfter {
+				warning = "POSSIBLE STALL · check storage/network health; X cancels safely"
+				color = danger
+			}
+			lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(color).Render(warning))
+		}
+		process := "Process: starting rmlint"
+		if m.scanPID > 0 {
+			process = fmt.Sprintf("Process: rmlint PID %d · command is still running", m.scanPID)
+		}
+		lines = append(lines, mutedText.Render(process),
+			mutedText.Render("Temporary report: "+scanTemporaryReportStatus(m.scanTempPath)),
+			mutedText.Render(fmt.Sprintf("Selected roots: %d · no automatic cancellation", len(m.scanRoots))))
 	} else if m.confirmScan {
-		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("START RMLINT DUPLICATE SCAN?"),
-			"Enter confirms · H/← cancels · existing report is backed up after success")
+		title := "START RMLINT DUPLICATE SCAN?"
+		detail := "Enter confirms · H/← cancels · existing report is backed up after success"
+		if m.scanRetryPending {
+			title = "RETRY THE SAME RMLINT SCAN?"
+			detail = "Enter restarts the same roots from the beginning · H/← cancels · this is not checkpoint resume"
+		}
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render(title), detail)
 	}
 	if m.configSource != "" {
 		lines = append(lines, "", mutedText.Render("Configuration source: "+m.configSource))
 	}
 	if !m.scanRunning && !m.confirmScan {
 		lines = append(lines, "", "↑↓ choose · Space/Enter toggle · A all · N none · R rescan · S save · F scan · M mount · E advanced")
+	}
+	if !m.scanRunning {
+		lines = append(lines, mutedText.Render("LOCAL is your home folder on Kali; selecting it does not scan / or mounted MyCloud paths."))
 	}
 	if !m.setupFirstRun && !m.scanRunning {
 		lines = append(lines, "H/← return home")
@@ -3328,6 +3439,31 @@ func scanProgressBar(percent, width int) string {
 	return "[" + strings.Repeat("█", filled) + strings.Repeat("·", width-filled) + "]"
 }
 
+func (m model) scanSilence(now time.Time) time.Duration {
+	start := m.scanStartedAt
+	if m.scanTelemetrySeen && !m.scanLastTelemetryAt.IsZero() {
+		start = m.scanLastTelemetryAt
+	}
+	if start.IsZero() || now.Before(start) {
+		return 0
+	}
+	return now.Sub(start)
+}
+
+func scanTemporaryReportStatus(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return "not assigned yet"
+	}
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return "not written yet"
+	}
+	if err != nil {
+		return "status unavailable: " + err.Error()
+	}
+	return fmt.Sprintf("%d B written", info.Size())
+}
+
 func (m model) scanSummaryView(width int) string {
 	status := lipgloss.NewStyle().Bold(true).Foreground(lime).Render("SCAN COMPLETE")
 	explanation := "rmlint created a new duplicate report. No files were moved or deleted."
@@ -3352,7 +3488,10 @@ func (m model) scanSummaryView(width int) string {
 		} else if m.errorLogPath != "" {
 			lines = append(lines, "Error log: "+compactPath(m.errorLogPath, max(24, width-13)))
 		}
-		lines = append(lines, "", "R/H/← return to Storage Setup · F can start a new scan after returning")
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Foreground(gold).Render("ABOUT RESUMING"),
+			"rmlint cannot continue an interrupted scan from a checkpoint.",
+			"F retries these same roots from the beginning; the previous report stays active until success.",
+			"R/H/← return to Storage Setup")
 		return strings.Join(lines, "\n")
 	}
 	if m.loading {
