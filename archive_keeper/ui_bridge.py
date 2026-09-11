@@ -78,8 +78,23 @@ def _mount_summary(roots: list[Path], mountinfo_text: str | None = None) -> dict
         except (IndexError, ValueError):
             continue
     entries = []
+    home = normalize_path(Path.home())
     for root in roots:
         filesystem, source = mounted.get(str(root), ("", ""))
+        # A user's home folder is a safe, explicit local scan root even when it
+        # is a directory within the system's / mount rather than a mountpoint.
+        # Do not apply this ancestor fallback to /mnt or /media roots: a missing
+        # NAS mount must remain OFFLINE instead of silently falling back to /.
+        if not filesystem and (root == home or home in root.parents):
+            ancestors = [
+                (Path(path), details)
+                for path, details in mounted.items()
+                if Path(path) == root or Path(path) in root.parents
+            ]
+            if ancestors:
+                _, (filesystem, source) = max(
+                    ancestors, key=lambda item: len(item[0].parts)
+                )
         is_mounted = bool(filesystem)
         entries.append({"path": str(root), "mounted": is_mounted, "filesystem": filesystem,
                         "source": source, "status": "ONLINE" if is_mounted else "OFFLINE"})

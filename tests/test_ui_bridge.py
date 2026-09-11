@@ -737,6 +737,19 @@ class UIBridgeTests(unittest.TestCase):
         self.assertEqual(by_path["/media/aaron/USB ARCHIVE"]["filesystem"], "exfat")
         self.assertEqual(by_path["/mnt/OfflineVault"]["status"], "OFFLINE")
 
+    def test_mount_summary_treats_explicit_home_folder_as_local_storage(self):
+        roots = [Path("/home/aaron"), Path("/mnt/OfflineVault")]
+        mountinfo = "40 20 8:1 / / rw,relatime - ext4 /dev/nvme0n1p2 rw"
+
+        with patch("archive_keeper.ui_bridge.Path.home", return_value=Path("/home/aaron")):
+            result = _mount_summary(roots, mountinfo)
+
+        by_path = {entry["path"]: entry for entry in result["roots"]}
+        self.assertEqual(by_path["/home/aaron"]["status"], "ONLINE")
+        self.assertEqual(by_path["/home/aaron"]["filesystem"], "ext4")
+        self.assertEqual(by_path["/mnt/OfflineVault"]["status"], "OFFLINE")
+        self.assertFalse(result["all_ready"])
+
 
     def test_history_run_snapshot_returns_read_only_action_details(self):
         with tempfile.TemporaryDirectory() as td:

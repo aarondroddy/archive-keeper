@@ -213,6 +213,19 @@ func TestParseMountCandidatesCoversSupportedStorageKinds(t *testing.T) {
 	}
 }
 
+func TestLocalHomeCandidateIsOptionalAndNeverUsesFilesystemRoot(t *testing.T) {
+	candidates := addLocalHomeCandidate(nil, "/home/aaron")
+	if len(candidates) != 1 || candidates[0].Path != "/home/aaron" || !candidates[0].Optional || candidates[0].Filesystem != "local" {
+		t.Fatalf("unexpected local home candidate: %#v", candidates)
+	}
+	if got := addLocalHomeCandidate(candidates, "/home/aaron"); len(got) != 1 {
+		t.Fatalf("local home candidate was duplicated: %#v", got)
+	}
+	if got := addLocalHomeCandidate(nil, "/"); len(got) != 0 {
+		t.Fatalf("filesystem root must never be offered as a local scan candidate: %#v", got)
+	}
+}
+
 func TestMountAssistantBuildsSafePlansForEveryStorageKind(t *testing.T) {
 	tests := []struct {
 		kind       mountKind
@@ -472,6 +485,60 @@ func TestScanProgressBarClampsInput(t *testing.T) {
 	}
 }
 
+func TestRunningScanExplainsMissingTelemetryAndShowsDiagnostics(t *testing.T) {
+	var m model
+	m.scanRunning = true
+	m.scanStartedAt = time.Now().Add(-3 * time.Minute)
+	m.scanProgressPhase = "STARTING"
+	m.scanProgressDetail = "rmlint has not emitted progress telemetry yet"
+	m.scanRoots = []string{"/tmp/Orion", "/tmp/Lyra", "/tmp/Draco"}
+	m.scanPID = 4242
+	m.scanTempPath = filepath.Join(t.TempDir(), ".rmlint-scan-test.json")
+
+	got := m.storageSetupView(120)
+	for _, want := range []string{
+		"rmlint has not provided a percentage",
+		"POSSIBLE STALL",
+		"rmlint PID 4242",
+		"Temporary report: not written yet",
+		"Selected roots: 3",
+		"no automatic cancellation",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("running scan diagnostics missing %q: %q", want, got)
+		}
+	}
+}
+
+func TestPossibleScanStallIsLoggedOnlyOnce(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "ui-errors.jsonl")
+	t.Setenv("ARCHIVE_KEEPER_UI_LOG", logPath)
+	m := model{
+		scanRunning:   true,
+		scanStartedAt: time.Now().Add(-3 * time.Minute),
+		scanRoots:     []string{"/tmp/Orion"},
+		scanPID:       4242,
+		reportPath:    "/tmp/rmlint.json",
+		scanTempPath:  "/tmp/.rmlint-scan-test.json",
+	}
+
+	updated, _ := m.Update(scanTickMsg(time.Now()))
+	m = updated.(model)
+	updated, _ = m.Update(scanTickMsg(time.Now()))
+	m = updated.(model)
+	if !m.scanStallLogged {
+		t.Fatal("possible scan stall was not marked as logged")
+	}
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read structured warning log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], "rmlint_scan_possible_stall") {
+		t.Fatalf("expected one structured stall warning, got %q", content)
+	}
+}
+
 func TestPostScanSummaryExplainsSuccessfulResultsAndNextSteps(t *testing.T) {
 	var m model
 	m.scanSummaryVisible = true
@@ -535,6 +602,8 @@ func TestPostScanSummaryExplainsFailureAndPreservesPriorReport(t *testing.T) {
 		"WHAT HAPPENED",
 		"rmlint scan failed",
 		"Technical detail: permission denied exit status 1",
+		"rmlint cannot continue an interrupted scan from a checkpoint",
+		"F retries these same roots from the beginning",
 		"return to Storage Setup",
 	} {
 		if !strings.Contains(got, want) {

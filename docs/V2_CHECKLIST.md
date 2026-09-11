@@ -48,6 +48,8 @@ path to a production-ready v2.
 
 - [x] Open first-run Storage Setup when no managed roots are configured.
 - [x] Detect mounted storage beneath `/mnt`, `/media`, and `/run/media`.
+- [x] Offer the current user's home folder as an explicit, unselected local
+  scan root while refusing to offer the broad filesystem root `/`.
 - [x] Select managed roots and retain configured-but-offline roots visibly.
 - [x] Save `~/.config/archive-keeper/ui.json` with owner-only permissions.
 - [x] Keep environment variables as higher-priority overrides.
@@ -56,6 +58,11 @@ path to a production-ready v2.
 - [x] Invoke rmlint directly with JSON-only output.
 - [x] Never create or run rmlint's cleanup script from the UI.
 - [x] Show elapsed time and allow cancellation with `X`, `H`, or Left Arrow.
+- [x] Distinguish missing rmlint telemetry from confirmed activity, show the
+  running PID and temporary-report status, and warn about a possible stall
+  without cancelling automatically.
+- [x] Offer a same-roots retry after cancellation or failure while explaining
+  that rmlint restarts from the beginning because it has no checkpoint resume.
 - [x] Write the scan to a temporary report first.
 - [x] Activate only a successful, non-empty report.
 - [x] Preserve the previous report as a timestamped backup.

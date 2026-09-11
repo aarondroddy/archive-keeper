@@ -2,7 +2,16 @@
 
 ## Unreleased
 
-_No changes yet._
+- Replaced the misleading no-output scan status with explicit no-telemetry
+  messaging, process ID and temporary-report diagnostics, and a possible-stall
+  warning that never cancels a scan automatically.
+- Added a safe same-roots retry after a failed or cancelled scan. Because
+  rmlint has no checkpoint-resume facility, the UI states clearly that retry
+  starts from the beginning and keeps the previous report active until success.
+- Added owner-only structured warning logs for possible scan stalls.
+- Added the current user's home folder as an optional local-storage scan root;
+  the filesystem root `/` remains excluded to avoid sweeping system paths and
+  nested mounts.
 
 ## 2.0.0 — 2026-09-10
 
