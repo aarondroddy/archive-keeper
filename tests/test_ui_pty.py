@@ -334,6 +334,13 @@ class StorageGalaxyPTYTests(unittest.TestCase):
             terminal.send(b"x")
             rendered = terminal.wait_for("SCAN DID NOT COMPLETE", timeout=8, start=start)
             self.assertIn("rmlint scan cancelled", rendered)
+            self.assertIn("cannot continue an interrupted scan from a checkpoint", rendered)
+            start = len(terminal.output)
+            terminal.send(b"f")
+            rendered = terminal.wait_for("RETRY THE SAME RMLINT SCAN?", timeout=4, start=start)
+            self.assertIn("restarts the same roots from the beginning", rendered)
+            self.assertIn("not checkpoint resume", rendered)
+            terminal.send(b"h")
             self.assertEqual(fixture.report.read_bytes(), original_report)
             events = [json.loads(line) for line in
                       (fixture.root / "ui-errors.jsonl").read_text().splitlines()]
